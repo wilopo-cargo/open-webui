@@ -155,9 +155,6 @@
 				return composioValidationError('Duplicate toolkit slugs are not allowed');
 			}
 			const tools = [...new Set(row.tools.split(/[\n,]/).map((tool) => tool.trim()).filter(Boolean))];
-			if (!tools.length) {
-				return composioValidationError('Each toolkit requires at least one allowed tool slug');
-			}
 			if (tools.some((tool) => !/^[A-Z0-9_]+$/.test(tool))) {
 				return composioValidationError(
 					'Allowed tool slugs must use uppercase ASCII letters, digits, or underscores; wildcards are not allowed'
@@ -216,7 +213,6 @@
 				Array.isArray(value) ||
 				Object.keys(value).some((field) => !['tools', 'auth_config_id'].includes(field)) ||
 				!Array.isArray(value.tools) ||
-				!value.tools.length ||
 				value.tools.some(
 					(tool: unknown) => typeof tool !== 'string' || !/^[A-Z0-9_]+$/.test(tool.trim())
 				) ||
@@ -904,11 +900,10 @@
 											bind:value={row.tools}
 											rows="3"
 											autocomplete="off"
-											required
 										/>
 										<p class="text-xs text-gray-500">
 											{$i18n.t(
-												'One slug per line or comma-separated. Only these exact app tools are enabled; wildcards are not allowed.'
+												'One slug per line or comma-separated. Leave blank to allow all app tools in this toolkit, subject to auth-config permissions and scopes. Otherwise, only these exact app tools are enabled; wildcards are not allowed.'
 											)}
 										</p>
 										<label for={`composio-auth-config-${index}`} class="text-xs text-gray-500">

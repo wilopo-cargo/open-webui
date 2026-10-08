@@ -186,6 +186,9 @@ async def test_composio_dependency_logs_are_scoped_and_native_logs_survive(app_m
     [
         {},
         {'toolkits': {'googledrive': {}}},
+        {'toolkits': {'googledrive': {'tools': None}}},
+        {'toolkits': {'googledrive': {'tools': {}}}},
+        {'toolkits': {'googledrive': {'tools': [None]}}},
         {'toolkits': {'googledrive': {'tools': 'GOOGLEDRIVE_FIND_FILE'}}},
         {'toolkits': {'googledrive': {'tools': ['']}}},
         {'toolkits': {'googledrive': {'tools': ['googledrive_find_file']}}},
@@ -197,16 +200,28 @@ async def test_composio_dependency_logs_are_scoped_and_native_logs_survive(app_m
         {'toolkits': {'googledrive': {'tools': ['GOOGLEDRIVE_FIND_FILE']}, ' googledrive ': {'tools': ['GOOGLEDRIVE_GET_ABOUT']}}},
         {'toolkits': {'googledrive': {'tools': [f'GOOGLEDRIVE_TOOL_{index}' for index in range(1001)]}}},
         {'toolkits': {}},
-        {'toolkits': {'googledrive': {'tools': []}}},
         {'toolkits': {'googledrive': {'tools': ['*']}}},
         {'toolkits': {'googledrive': {'tools': ['GOOGLEDRIVE_*']}}},
         {'toolkits': {'GoogleDrive': {'tools': ['GOOGLEDRIVE_FIND_FILE']}}},
         {'toolkits': {'googledrive': {'tools': ['GOOGLEDRIVE_FIND_FILE', ' GOOGLEDRIVE_FIND_FILE ']}}},
     ],
 )
-def test_policy_rejects_empty_wildcard_and_duplicate_allowlists(app_modules, policy):
+def test_policy_rejects_missing_malformed_wildcard_and_duplicate_allowlists(app_modules, policy):
     with pytest.raises(ValidationError):
         app_modules.composio.ComposioPolicy.model_validate(policy)
+
+
+@pytest.mark.parametrize('auth_fields', [{}, {'auth_config_id': None}, {'auth_config_id': '  '}, {'auth_config_id': ' ac_drive_read '}])
+def test_empty_tools_allow_open_toolkit_without_changing_optional_auth_config(app_modules, auth_fields):
+    policy = app_modules.composio.ComposioPolicy.model_validate({
+        'toolkits': {
+            'googledrive': {'tools': [], **auth_fields},
+            'notion': {'tools': [' NOTION_SEARCH ']},
+        },
+    })
+    assert policy.toolkits['googledrive'].tools == []
+    assert policy.toolkits['googledrive'].auth_config_id == ((auth_fields.get('auth_config_id') or '').strip() or None)
+    assert policy.toolkits['notion'].tools == ['NOTION_SEARCH']
 
 
 def test_composio_connection_validation_is_type_specific(app_modules):
@@ -287,7 +302,10 @@ async def config_import_client(app_modules, monkeypatch):
         pytest.param({}, id='missing-policy'),
         {'composio': None},
         {'composio': {'toolkits': {}}},
-        {'composio': {'toolkits': {'googledrive': {'tools': []}}}},
+        {'composio': {'toolkits': {'googledrive': {}}}},
+        {'composio': {'toolkits': {'googledrive': {'tools': None}}}},
+        {'composio': {'toolkits': {'googledrive': {'tools': 'GOOGLEDRIVE_FIND_FILE'}}}},
+        {'composio': {'toolkits': {'googledrive': {'tools': ['']}}}},
         {'composio': {'toolkits': {'googledrive': {'tools': ['GOOGLEDRIVE_*']}}}},
         {'composio': {'toolkits': {'private-provider-value': {'tools': ['private-tool-value']}}}},
         {'composio': {'toolkits': {}}, 'config': {'enable': False}},
@@ -321,7 +339,7 @@ async def test_full_config_import_rejects_invalid_composio_without_changing_prio
     }})
     assert response.status_code == 400
     detail = response.json()['detail']
-    assert 'Composio' in detail and 'toolkit/tool allowlists' in detail
+    assert 'Composio' in detail and 'toolkit' in detail.lower()
     assert 'No configuration was changed' in detail
     for private_value in (
         'private-import-api-key', 'private-provider-value', 'private-tool-value',
@@ -335,7 +353,7 @@ async def test_full_config_import_rejects_invalid_composio_without_changing_prio
     assert readable.json()['TOOL_SERVER_CONNECTIONS'][0]['info']['id'] == 'previous'
 
 
-@pytest.mark.parametrize('connection_kind', ['composio', 'native', 'empty', 'omitted'])
+@pytest.mark.parametrize('connection_kind', ['composio', 'composio-open', 'native', 'empty', 'omitted'])
 @pytest.mark.asyncio
 async def test_full_config_import_accepts_valid_connections_and_keeps_them_readable(
     app_modules, config_import_client, connection_kind
@@ -347,10 +365,11 @@ async def test_full_config_import_accepts_valid_connections_and_keeps_them_reada
     })
     native = {**_native_connection(), 'legacy_extension': {'preserve': True}}
     imported = {'ui.default_models': 'imported-model'}
-    if connection_kind == 'composio':
+    if connection_kind in ('composio', 'composio-open'):
         connection = _connection({
             ' googledrive ': {
-                'tools': [' GOOGLEDRIVE_FIND_FILE '], 'auth_config_id': ' ac_approved_read_only ',
+                'tools': [] if connection_kind == 'composio-open' else [' GOOGLEDRIVE_FIND_FILE '],
+                'auth_config_id': ' ac_approved_read_only ',
             },
             'github': {'tools': ['GITHUB_GET_THE_AUTHENTICATED_USER']},
         }, server_id=' imported-composio ', grants=_user_read_grant('alice'))
@@ -369,14 +388,15 @@ async def test_full_config_import_accepts_valid_connections_and_keeps_them_reada
     assert readable.status_code == 200
     stored = await Config.get('tool_server.connections')
     assert response.json()['tool_server.connections'] == stored
-    if connection_kind in ('composio', 'native'):
+    if connection_kind in ('composio', 'composio-open', 'native'):
         assert stored[0] == native
         assert readable.json()['TOOL_SERVER_CONNECTIONS'][0]['legacy_extension'] == {'preserve': True}
-    if connection_kind == 'composio':
+    if connection_kind in ('composio', 'composio-open'):
         assert stored[1]['info']['id'] == 'imported-composio'
         assert stored[1]['key'] == 'imported-project-key'
         assert stored[1]['composio']['toolkits']['googledrive'] == {
-            'tools': ['GOOGLEDRIVE_FIND_FILE'], 'auth_config_id': 'ac_approved_read_only',
+            'tools': [] if connection_kind == 'composio-open' else ['GOOGLEDRIVE_FIND_FILE'],
+            'auth_config_id': 'ac_approved_read_only',
         }
         assert readable.json()['TOOL_SERVER_CONNECTIONS'][1] == stored[1]
     elif connection_kind == 'empty':
@@ -780,6 +800,30 @@ _APP_TOOL_SPECS = [
 ]
 
 
+# Deliberately independent of policy/MCP names: only provider toolkit metadata
+# establishes membership, and a toolkit's slug need not prefix its app tools.
+_OPEN_TOOL_CATALOG = [
+    {'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {'slug': 'googledrive'}},
+    {'slug': 'GOOGLEDRIVE_GET_FILE_METADATA', 'toolkit': {'slug': 'googledrive'}},
+    {'slug': 'GOOGLEDRIVE_WRITE_FILE', 'toolkit': {'slug': 'googledrive'}},
+    {'slug': 'WORKSPACE_FIND_FILE', 'toolkit': {'slug': 'googledrive'}},
+    {'slug': 'NOTION_SEARCH', 'toolkit': {'slug': 'notion'}},
+    {'slug': 'NOTION_DELETE_PAGE', 'toolkit': {'slug': 'notion'}},
+    {'slug': 'GOOGLEDRIVE_FOREIGN', 'toolkit': {'slug': 'github'}},
+    {'slug': 'GITHUB_PRIVATE_TOOL', 'toolkit': {'slug': 'github'}},
+    {'slug': 'COMPOSIO_SEARCH_TOOLS', 'toolkit': {'slug': 'googledrive'}},
+    {'slug': 'COMPOSIO_PROXY_EXECUTE', 'toolkit': {'slug': 'googledrive'}},
+    {'slug': 'COMPOSIO_MANAGE_CONNECTIONS', 'toolkit': {'slug': 'googledrive'}},
+]
+_OPEN_TOOL_SPECS = _APP_TOOL_SPECS + [
+    {'name': slug, 'description': slug, 'parameters': {'type': 'object', 'properties': {}}}
+    for slug in (
+        'WORKSPACE_FIND_FILE', 'NOTION_DELETE_PAGE', 'GOOGLEDRIVE_FOREIGN',
+        'GITHUB_PRIVATE_TOOL', 'GOOGLEDRIVE_UNKNOWN_MCP_ONLY', 'COMPOSIO_PROXY_EXECUTE',
+    )
+]
+
+
 _PRIVATE_DOCUMENTS = {
     'alice': [
         {'id': 'alice-board-budget', 'title': 'shared document', 'owner': 'alice', 'content': 'ALICE-PRIVATE-BUDGET'}
@@ -845,7 +889,7 @@ def _in_process_mcp_client_class(
             if consent_status != 'active':
                 raise RuntimeError(f'External account consent is not complete at {self.url}')
             documents = _PRIVATE_DOCUMENTS.get(self.account_id, [])
-            if function_name == 'GOOGLEDRIVE_FIND_FILE':
+            if function_name in ('GOOGLEDRIVE_FIND_FILE', 'WORKSPACE_FIND_FILE'):
                 query = function_args.get('query', '').lower()
                 return {'files': copy.deepcopy([
                     document for document in documents
@@ -869,10 +913,28 @@ def _in_process_mcp_client_class(
     return InProcessMCPClient
 
 
-def _install_user_bound_sessions(monkeypatch, app_modules, client_class):
+def _install_user_bound_sessions(monkeypatch, app_modules, client_class, *, catalog_pages=None, catalog_requests=None):
     requests = []
+    catalog_requests = [] if catalog_requests is None else catalog_requests
+    catalog_pages = {None: {'items': _OPEN_TOOL_CATALOG, 'next_cursor': None}} if catalog_pages is None else catalog_pages
 
     def handler(request):
+        assert request.url.host == 'backend.composio.dev'
+        assert request.headers['x-api-key'] == 'test-project-key'
+        assert 'authorization' not in request.headers and 'cookie' not in request.headers
+        if request.method == 'GET':
+            catalog_requests.append(request)
+            assert request.url.params['limit'] == '500'
+            session_ids = {session['session_id'] for session in client_class.sessions.values()}
+            assert request.url.path in {
+                f'/api/v3.1/tool_router/session/{session_id}/tools' for session_id in session_ids
+            }
+            cursor = request.url.params.get('cursor')
+            assert set(request.url.params) == ({'limit', 'cursor'} if cursor is not None else {'limit'})
+            assert cursor in catalog_pages
+            return httpx.Response(200, json=catalog_pages[cursor], request=request)
+        assert request.method == 'POST'
+        assert request.url.path == '/api/v3.1/tool_router/session'
         requests.append(request)
         payload = json.loads(request.content)
         user_id = payload['user_id'].removeprefix('openwebui:')
@@ -990,11 +1052,12 @@ def _user_read_grant(user_id):
 def _tool_server_enabled(connection):
     return {**connection, 'config': {**connection.get('config', {}), 'enable': True}}
 
+@pytest.mark.parametrize('open_toolkit', [False, True])
 @pytest.mark.asyncio
-async def test_users_get_distinct_bound_callables_not_metadata_selected_accounts(app_modules, monkeypatch):
+async def test_users_get_distinct_bound_callables_not_metadata_selected_accounts(app_modules, monkeypatch, open_toolkit):
     grants = _user_read_grant('alice') + _user_read_grant('bob')
     connection = _connection(
-        {'googledrive': {'tools': ['GOOGLEDRIVE_FIND_FILE', 'GOOGLEDRIVE_GET_FILE_METADATA']}},
+        {'googledrive': {'tools': [] if open_toolkit else ['GOOGLEDRIVE_FIND_FILE', 'GOOGLEDRIVE_GET_FILE_METADATA']}},
         server_id='shared',
         grants=grants,
     )
@@ -1057,10 +1120,12 @@ async def test_users_get_distinct_bound_callables_not_metadata_selected_accounts
     assert link_b['connect_link'] == client_class.sessions[client_class.instances[1].url]['connect_link']
 
 
+@pytest.mark.parametrize('open_toolkit', [False, True])
 @pytest.mark.asyncio
-async def test_disabled_denied_and_forged_composio_ids_make_no_provider_request(app_modules, monkeypatch):
+async def test_disabled_denied_and_forged_composio_ids_make_no_provider_request(app_modules, monkeypatch, open_toolkit):
     client_class = _in_process_mcp_client_class()
-    requests = _install_user_bound_sessions(monkeypatch, app_modules, client_class)
+    catalog_requests = []
+    requests = _install_user_bound_sessions(monkeypatch, app_modules, client_class, catalog_requests=catalog_requests)
     alice = _user('alice')
     bob = _user('bob')
 
@@ -1071,6 +1136,8 @@ async def test_disabled_denied_and_forged_composio_ids_make_no_provider_request(
         (_connection(server_id='shared', grants=[]), 'shared', alice),
     ]
     for connection, server_id, user in cases:
+        if open_toolkit:
+            connection['composio']['toolkits']['googledrive']['tools'] = []
         _request, _form, _metadata, _model = _prepare_chat_payload(
             monkeypatch,
             app_modules,
@@ -1088,6 +1155,7 @@ async def test_disabled_denied_and_forged_composio_ids_make_no_provider_request(
         assert not chat_metadata.get('tools')
 
     assert requests == []
+    assert catalog_requests == []
     assert client_class.instances == []
 
 
@@ -1669,13 +1737,16 @@ async def test_catalog_is_access_filtered_without_sessions_oauth_or_private_fiel
 
 
 @pytest.mark.parametrize('enabled', [True, False])
+@pytest.mark.parametrize('open_toolkit', [False, True])
 @pytest.mark.asyncio
 async def test_admin_verification_returns_only_safe_summary_without_external_consent(
-    app_modules, monkeypatch, enabled
+    app_modules, monkeypatch, enabled, open_toolkit
 ):
-    client_class = _in_process_mcp_client_class(consent_status='pending')
-    requests = _install_user_bound_sessions(monkeypatch, app_modules, client_class)
-    connection = _connection(server_id='shared', enabled=enabled)
+    client_class = _in_process_mcp_client_class(app_specs=_OPEN_TOOL_SPECS, consent_status='pending')
+    catalog_requests = []
+    requests = _install_user_bound_sessions(monkeypatch, app_modules, client_class, catalog_requests=catalog_requests)
+    toolkits = {'googledrive': {'tools': []}, 'notion': {'tools': ['NOTION_SEARCH']}} if open_toolkit else None
+    connection = _connection(toolkits, server_id='shared', enabled=enabled)
     request, _form, _metadata, _model = _prepare_chat_payload(
         monkeypatch, app_modules, [connection], _user('admin', role='admin'), [], client_class=client_class
     )
@@ -1683,8 +1754,9 @@ async def test_admin_verification_returns_only_safe_summary_without_external_con
     result = await app_modules.configs.verify_tool_servers_config(
         request, app_modules.configs.ToolServerConnection.model_validate(connection), _user('admin', role='admin')
     )
-    assert result == {'status': True, 'composio': True, 'tool_count': 2}
+    assert result == {'status': True, 'composio': True, 'tool_count': 6 if open_toolkit else 2}
     assert len(requests) == 1
+    assert len(catalog_requests) == (1 if open_toolkit else 0)
     assert json.loads(requests[0].content)['user_id'] == 'openwebui:admin'
     assert len(client_class.instances) == 1
     client = client_class.instances[0]
@@ -1695,15 +1767,17 @@ async def test_admin_verification_returns_only_safe_summary_without_external_con
 
 
 @pytest.mark.parametrize('failure', ['invalid-callback', 'foreign-user', 'listing', 'missing-manager'])
+@pytest.mark.parametrize('open_toolkit', [False, True])
 @pytest.mark.asyncio
-async def test_admin_verification_fails_closed_and_cleans_up(app_modules, monkeypatch, caplog, failure):
+async def test_admin_verification_fails_closed_and_cleans_up(app_modules, monkeypatch, caplog, failure, open_toolkit):
     from fastapi import HTTPException
 
     client_class = _in_process_mcp_client_class(
         fail_listing=failure == 'listing', app_specs=[_APP_TOOL_SPECS[0]] if failure == 'missing-manager' else None
     )
-    requests = _install_user_bound_sessions(monkeypatch, app_modules, client_class)
-    connection = _connection()
+    catalog_requests = []
+    requests = _install_user_bound_sessions(monkeypatch, app_modules, client_class, catalog_requests=catalog_requests)
+    connection = _connection({'googledrive': {'tools': []}} if open_toolkit else None)
     request, _form, _metadata, _model = _prepare_chat_payload(
         monkeypatch, app_modules, [connection], _user('admin', role='admin'), [], client_class=client_class
     )
@@ -1731,6 +1805,7 @@ async def test_admin_verification_fails_closed_and_cleans_up(app_modules, monkey
     assert error.value.status_code == 400
     assert error.value.detail == expected
     assert len(requests) == (0 if failure == 'invalid-callback' else 1)
+    assert len(catalog_requests) == (1 if open_toolkit and failure in {'listing', 'missing-manager'} else 0)
     assert len(client_class.instances) == (1 if failure in {'listing', 'missing-manager'} else 0)
     assert all(client.closed and not client.calls for client in client_class.instances)
     assert 'test-project-key' not in caplog.text
@@ -2270,3 +2345,308 @@ async def test_composio_scope_suppresses_real_httpx_telemetry_without_suppressin
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+# This provider fixture proves local policy, not live auth-config/scope enforcement.
+@pytest.mark.parametrize('auth_config_id', [None, 'ac_provider_fixture'])
+@pytest.mark.asyncio
+async def test_open_toolkit_catalog_membership_controls_actual_chat_callables(
+    app_modules, monkeypatch, auth_config_id
+):
+    client_class = _in_process_mcp_client_class(app_specs=_OPEN_TOOL_SPECS)
+    catalog_requests = []
+    requests = _install_user_bound_sessions(
+        monkeypatch, app_modules, client_class, catalog_requests=catalog_requests
+    )
+    drive = {'tools': []}
+    if auth_config_id is not None:
+        drive['auth_config_id'] = auth_config_id
+    connection = _connection(
+        {'googledrive': drive, 'notion': {'tools': ['NOTION_SEARCH']}},
+        server_id='shared', grants=_user_read_grant('alice'),
+    )
+    _request, _form, metadata, _ = await _process_chat_with_servers(
+        monkeypatch, app_modules, [connection], _user('alice'), ['server:composio:shared'],
+        client_class=client_class,
+    )
+    body = json.loads(requests[0].content)
+    assert body == {
+        'user_id': 'openwebui:alice',
+        'toolkits': {'enable': ['googledrive', 'notion']},
+        'tools': {'notion': {'enable': ['NOTION_SEARCH']}},
+        'auth_configs': {} if auth_config_id is None else {'googledrive': auth_config_id},
+        'instant': False,
+        'manage_connections': {
+            'enable': True, 'callback_url': 'https://webui.example.test/',
+            'enable_wait_for_connections': False, 'enable_connection_removal': False,
+        },
+        'workbench': {'enable': False}, 'proxy_execute': {'enable': False},
+        'multi_account': {'enable': False}, 'preload': {'tools': 'all'},
+        'search': {'enable': False}, 'execute': {'enable_multi_execute': False},
+    }
+    assert len(requests) == len(catalog_requests) == 1
+    allowed = {
+        'GOOGLEDRIVE_FIND_FILE', 'GOOGLEDRIVE_GET_FILE_METADATA', 'GOOGLEDRIVE_WRITE_FILE',
+        'WORKSPACE_FIND_FILE', 'NOTION_SEARCH', 'COMPOSIO_MANAGE_CONNECTIONS',
+    }
+    assert set(metadata['tools']) == {_composio_function_name('shared', slug) for slug in allowed}
+    # This name has no Drive prefix; the provider membership grants it access.
+    lookup = metadata['tools'][_composio_function_name('shared', 'WORKSPACE_FIND_FILE')]['callable']
+    assert await lookup(query='shared document') == {'files': _PRIVATE_DOCUMENTS['alice']}
+    read = metadata['tools'][_composio_function_name('shared', 'GOOGLEDRIVE_GET_FILE_METADATA')]['callable']
+    assert await read(file_id='alice-board-budget') == _PRIVATE_DOCUMENTS['alice'][0]
+    write = metadata['tools'][_composio_function_name('shared', 'GOOGLEDRIVE_WRITE_FILE')]['callable']
+    assert await write(file_id='alice-board-budget') == {'written_by': 'alice', 'file_id': 'alice-board-budget'}
+    notion = metadata['tools'][_composio_function_name('shared', 'NOTION_SEARCH')]['callable']
+    assert await notion(query='plan') == {'pages': [{'id': 'work-plan', 'title': 'plan'}]}
+    # Foreign tools, a misleading Drive prefix, unknown MCP-only tools, and all
+    # helpers except manager are excluded even when MCP advertises their schemas.
+    assert {call[0] for call in client_class.instances[0].calls} <= allowed
+    await app_modules.middleware.disconnect_mcp_clients(metadata['mcp_clients'])
+    assert client_class.instances[0].closed
+
+
+@pytest.mark.asyncio
+async def test_open_toolkit_catalog_paginates_to_preload_ceiling_and_calls_late_page_tool(app_modules, monkeypatch):
+    first = [
+        {'slug': f'DRIVE_APP_{index}', 'toolkit': {'slug': 'googledrive'}} for index in range(500)
+    ]
+    second = [
+        {'slug': f'DRIVE_APP_{index}', 'toolkit': {'slug': 'googledrive'}} for index in range(500, 999)
+    ] + [{'slug': 'WORKSPACE_FIND_FILE', 'toolkit': {'slug': 'googledrive'}}]
+    cursor = 'opaque+/=&cursor'
+    catalog_requests = []
+    client_class = _in_process_mcp_client_class(app_specs=_OPEN_TOOL_SPECS)
+    requests = _install_user_bound_sessions(
+        monkeypatch, app_modules, client_class, catalog_requests=catalog_requests,
+        catalog_pages={
+            None: {'items': first, 'next_cursor': cursor},
+            cursor: {'items': second},  # Missing next_cursor is a terminal page.
+        },
+    )
+    connection = _connection({'googledrive': {'tools': []}}, server_id='shared', grants=_user_read_grant('alice'))
+    request, _form, _metadata, _model = _prepare_chat_payload(
+        monkeypatch, app_modules, [connection], _user('alice'), [], client_class=client_class
+    )
+    client, specs, session = await app_modules.middleware.connect_composio_server(request, 'shared', _user('alice'))
+    assert json.loads(requests[0].content)['tools'] == {}
+    assert len(requests) == 1 and len(catalog_requests) == 2
+    assert [request.url.params.get('cursor') for request in catalog_requests] == [None, cursor]
+    assert len(session['allowed_tools'] - {'COMPOSIO_MANAGE_CONNECTIONS'}) == 1000
+    assert {spec['name'] for spec in specs} == {'WORKSPACE_FIND_FILE', 'COMPOSIO_MANAGE_CONNECTIONS'}
+    late_tool = app_modules.middleware._make_mcp_tool_function(client, 'WORKSPACE_FIND_FILE', session)
+    assert await late_tool(query='shared document') == {'files': _PRIVATE_DOCUMENTS['alice']}
+    await app_modules.middleware.disconnect_mcp_clients({'server:composio:shared': client})
+    assert client.closed
+
+
+@pytest.mark.parametrize(
+    'catalog',
+    [
+        None, [], {}, {'items': None}, {'items': {}},
+        {'items': [None]}, {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE'}]},
+        {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': None}]},
+        {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': 'googledrive'}]},
+        {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {}}]},
+        {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {'slug': None}}]},
+        {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {'slug': 'GoogleDrive'}}]},
+        {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {'slug': ' googledrive '}}]},
+        {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {'slug': '*'}}]},
+        {'items': [{'slug': None, 'toolkit': {'slug': 'googledrive'}}]},
+        {'items': [{'slug': 'googledrive_find_file', 'toolkit': {'slug': 'googledrive'}}]},
+        {'items': [{'slug': 'GOOGLEDRIVE_*', 'toolkit': {'slug': 'googledrive'}}]},
+        {'items': [{'slug': ' GOOGLEDRIVE_FIND_FILE ', 'toolkit': {'slug': 'googledrive'}}]},
+        {'items': [_OPEN_TOOL_CATALOG[0]], 'next_cursor': 1},
+        {'items': [_OPEN_TOOL_CATALOG[0]], 'next_cursor': ''},
+        {'items': [_OPEN_TOOL_CATALOG[0]], 'next_cursor': '  '},
+        {'items': [], 'next_cursor': 'must-not-be-followed'},
+        {'items': [_OPEN_TOOL_CATALOG[0], _OPEN_TOOL_CATALOG[0]]},
+    ],
+)
+@pytest.mark.parametrize('surface', ['chat', 'admin-verify'])
+@pytest.mark.asyncio
+async def test_malformed_open_catalog_fails_safely_before_mcp_on_chat_and_verify(
+    app_modules, monkeypatch, caplog, catalog, surface
+):
+    from fastapi import HTTPException
+
+    client_class = _in_process_mcp_client_class(app_specs=_OPEN_TOOL_SPECS)
+    catalog_requests = []
+    requests = _install_user_bound_sessions(
+        monkeypatch, app_modules, client_class,
+        catalog_pages={None: catalog}, catalog_requests=catalog_requests,
+    )
+    user = _user('admin', role='admin') if surface == 'admin-verify' else _user('alice')
+    connection = _connection({'googledrive': {'tools': []}}, server_id='shared', grants=_user_read_grant(user.id))
+    request, _form, _metadata, _model = _prepare_chat_payload(
+        monkeypatch, app_modules, [connection], user, [], client_class=client_class
+    )
+    caplog.set_level(logging.DEBUG)
+    if surface == 'admin-verify':
+        monkeypatch.setattr(app_modules.configs, 'MCPClient', client_class)
+        with pytest.raises(HTTPException) as error:
+            await app_modules.configs.verify_tool_servers_config(
+                request, app_modules.configs.ToolServerConnection.model_validate(connection), user
+            )
+        assert error.value.status_code == 400
+        assert error.value.detail == 'Composio is unavailable'
+    else:
+        with pytest.raises(ValueError, match='^Composio is unavailable$'):
+            await app_modules.middleware.connect_composio_server(request, 'shared', user)
+    assert len(requests) == len(catalog_requests) == 1
+    assert client_class.instances == []
+    assert 'test-project-key' not in caplog.text
+    assert str(catalog_requests[0].url) not in caplog.text
+    assert all(session['session_id'] not in caplog.text for session in client_class.sessions.values())
+
+
+@pytest.mark.parametrize(
+    ('failure', 'message'),
+    [
+        (401, 'Composio API rejected credentials'), (403, 'Composio API rejected credentials'),
+        (400, 'Composio tool policy was rejected'), (422, 'Composio tool policy was rejected'),
+        (503, 'Composio is unavailable'), ('redirect', 'Composio is unavailable'),
+        ('transport', 'Composio is unavailable'), ('timeout', 'Composio is unavailable'),
+        ('invalid-json', 'Composio is unavailable'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_open_catalog_errors_never_retry_broaden_or_expose_private_data(
+    app_modules, monkeypatch, caplog, failure, message
+):
+    seen = []
+    client_class = _in_process_mcp_client_class()
+    private = 'private-catalog-session?secret=test-project-key'
+
+    def handler(provider_request):
+        seen.append(provider_request)
+        if provider_request.method == 'POST':
+            response = _session_response('alice')
+            response['session_id'] = private
+            return httpx.Response(200, json=response, request=provider_request)
+        assert provider_request.method == 'GET' and provider_request.url.host == 'backend.composio.dev'
+        assert provider_request.url.raw_path.split(b'?')[0] == (
+            b'/api/v3.1/tool_router/session/private-catalog-session%3Fsecret%3Dtest-project-key/tools'
+        )
+        assert provider_request.headers['x-api-key'] == 'test-project-key'
+        if failure == 'redirect':
+            return httpx.Response(307, headers={'location': 'https://attacker.example/collect'}, request=provider_request)
+        if failure == 'transport':
+            raise httpx.ConnectError(f'{private} at {provider_request.url}', request=provider_request)
+        if failure == 'timeout':
+            raise httpx.ReadTimeout(f'{private} at {provider_request.url}', request=provider_request)
+        if failure == 'invalid-json':
+            return httpx.Response(200, content=f'private malformed response {private}'.encode(), request=provider_request)
+        return httpx.Response(failure, json={'private': private}, request=provider_request)
+
+    _install_composio_transport(monkeypatch, app_modules.composio, handler)
+    connection = _connection(
+        {'googledrive': {'tools': []}, 'notion': {'tools': ['NOTION_SEARCH']}},
+        server_id='shared', grants=_user_read_grant('alice'),
+    )
+    request, _form, _metadata, _model = _prepare_chat_payload(
+        monkeypatch, app_modules, [connection], _user('alice'), [], client_class=client_class
+    )
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ValueError, match=f'^{message}$') as error:
+        await app_modules.middleware.connect_composio_server(request, 'shared', _user('alice'))
+    assert [request.method for request in seen] == ['POST', 'GET']
+    assert client_class.instances == []
+    assert private not in str(error.value) and private not in caplog.text
+    assert 'test-project-key' not in caplog.text
+    assert all(str(request.url) not in caplog.text for request in seen)
+
+
+@pytest.mark.parametrize('failure', ['oversize-page', 'oversize-total', 'ceiling-cursor', 'repeated-cursor', 'duplicate-slug', 'union-ceiling'])
+@pytest.mark.asyncio
+async def test_open_catalog_pagination_is_bounded_and_fail_closed(app_modules, monkeypatch, failure):
+    first = [{'slug': f'DRIVE_APP_{index}', 'toolkit': {'slug': 'googledrive'}} for index in range(500)]
+    second = [{'slug': f'DRIVE_APP_{index}', 'toolkit': {'slug': 'googledrive'}} for index in range(500, 1000)]
+    pages = {None: {'items': first, 'next_cursor': 'page-two'}, 'page-two': {'items': second}}
+    expected_requests = 2
+    if failure == 'oversize-page':
+        pages = {None: {'items': first + [second[0]]}}
+        expected_requests = 1
+    elif failure == 'oversize-total':
+        pages['page-two'] = {'items': second[:499], 'next_cursor': 'page-three'}
+        pages['page-three'] = {'items': [
+            second[-1], {'slug': 'TOOL_1001', 'toolkit': {'slug': 'googledrive'}},
+        ]}
+        expected_requests = 3
+    elif failure == 'ceiling-cursor':
+        pages['page-two']['next_cursor'] = 'page-three'
+    elif failure == 'repeated-cursor':
+        pages = {
+            None: {'items': [first[0]], 'next_cursor': 'page-two'},
+            'page-two': {'items': [first[1]], 'next_cursor': 'page-two'},
+        }
+    elif failure == 'duplicate-slug':
+        pages = {
+            None: {'items': [first[0]], 'next_cursor': 'page-two'},
+            'page-two': {'items': [{'slug': first[0]['slug'], 'toolkit': {'slug': 'github'}}]},
+        }
+    toolkits = {'googledrive': {'tools': []}}
+    if failure == 'union-ceiling':
+        toolkits['notion'] = {'tools': ['NOTION_SEARCH']}
+    client_class = _in_process_mcp_client_class()
+    catalog_requests = []
+    requests = _install_user_bound_sessions(
+        monkeypatch, app_modules, client_class, catalog_pages=pages, catalog_requests=catalog_requests
+    )
+    connection = _connection(toolkits, server_id='shared', grants=_user_read_grant('alice'))
+    request, _form, _metadata, _model = _prepare_chat_payload(
+        monkeypatch, app_modules, [connection], _user('alice'), [], client_class=client_class
+    )
+    with pytest.raises(ValueError, match='^Composio is unavailable$'):
+        await app_modules.middleware.connect_composio_server(request, 'shared', _user('alice'))
+    assert len(requests) == 1 and len(catalog_requests) == expected_requests
+    assert client_class.instances == []
+
+
+@pytest.mark.asyncio
+async def test_resolved_open_callable_snapshot_cannot_be_broadened_or_rebound(app_modules, monkeypatch):
+    catalog = copy.deepcopy(_OPEN_TOOL_CATALOG)
+    client_class = _in_process_mcp_client_class(app_specs=_OPEN_TOOL_SPECS)
+    _install_user_bound_sessions(
+        monkeypatch, app_modules, client_class, catalog_pages={None: {'items': catalog}}
+    )
+    connection = _connection({'googledrive': {'tools': []}}, server_id='shared', grants=_user_read_grant('alice'))
+    connection['config']['function_name_filter_list'] = 'WORKSPACE_FIND_FILE'
+    request, _form, _metadata, _model = _prepare_chat_payload(
+        monkeypatch, app_modules, [connection], _user('alice'), [], client_class=client_class
+    )
+    client, specs, session = await app_modules.middleware.connect_composio_server(request, 'shared', _user('alice'))
+    assert {spec['name'] for spec in specs} == {'WORKSPACE_FIND_FILE', 'COMPOSIO_MANAGE_CONNECTIONS'}
+    make_callable = app_modules.middleware._make_mcp_tool_function
+    lookup = make_callable(client, 'WORKSPACE_FIND_FILE', session)
+    manager = make_callable(client, 'COMPOSIO_MANAGE_CONNECTIONS', session)
+    rejected = {
+        slug: make_callable(client, slug, session)
+        for slug in ('NOTION_SEARCH', 'GOOGLEDRIVE_FOREIGN', 'GOOGLEDRIVE_UNKNOWN_MCP_ONLY', 'COMPOSIO_SEARCH_TOOLS')
+    }
+    session['allowed_tools'].clear()
+    session['allowed_tools'].update(rejected)
+    session['allowed_toolkits'].add('notion')
+    session['session_id'] = 'foreign-session'
+    connection['composio']['toolkits']['notion'] = {'tools': []}
+    catalog.append({'slug': 'GOOGLEDRIVE_UNKNOWN_MCP_ONLY', 'toolkit': {'slug': 'googledrive'}})
+    for callable_ in rejected.values():
+        with pytest.raises(ValueError, match='^Composio tool policy was rejected$'):
+            await callable_()
+    # Reserved helpers remain uncallable even if a mutable snapshot gains one.
+    reserved = make_callable(client, 'COMPOSIO_SEARCH_TOOLS', session)
+    with pytest.raises(ValueError, match='^Composio tool policy was rejected$'):
+        await reserved()
+    with pytest.raises(ValueError):
+        await manager(toolkits=['notion'])
+    with pytest.raises(ValueError):
+        await manager(toolkits=['googledrive'], session_id='foreign-session')
+    assert client.calls == []
+    assert await lookup(query='shared document') == {'files': _PRIVATE_DOCUMENTS['alice']}
+    result = await manager(toolkits=['googledrive'])
+    assert result['connect_link'] == client_class.sessions[client.url]['connect_link']
+    assert client.calls[-1] == ('COMPOSIO_MANAGE_CONNECTIONS', {
+        'toolkits': ['googledrive'], 'session_id': client.session_id,
+    })
+    await app_modules.middleware.disconnect_mcp_clients({'server:composio:shared': client})
+    assert client.closed

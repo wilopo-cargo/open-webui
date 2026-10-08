@@ -119,7 +119,7 @@ async def import_config(request: Request, form_data: ImportConfigForm, user=Depe
                 status_code=400,
                 detail=(
                     'Invalid Composio connection in imported config. Check its API key, connection ID, '
-                    'fixed API URL/path, and explicit toolkit/tool allowlists. No configuration was changed.'
+                    'fixed API URL/path, and toolkit/tool policy. No configuration was changed.'
                 ),
             ) from None
     await Config.upsert(form_data.config)
