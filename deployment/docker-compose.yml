@@ -1,0 +1,40 @@
+name: wilopo-open-webui-prod
+
+services:
+  app:
+    image: ${APP_IMAGE:?APP_IMAGE must be set to an immutable image}
+    env_file:
+      - .env
+    environment:
+      WEBUI_URL: ${WEBUI_URL:?WEBUI_URL must be set}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    expose:
+      - "8080"
+    volumes:
+      - open_webui_data:/app/backend/data
+    networks:
+      - proxy
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: proxy
+      traefik.http.routers.open-webui.rule: "Host(`${APP_HOST:?APP_HOST must be set}`)"
+      traefik.http.routers.open-webui.entrypoints: websecure
+      traefik.http.routers.open-webui.tls: "true"
+      traefik.http.routers.open-webui.tls.certresolver: cloudflare
+      traefik.http.services.open-webui.loadbalancer.server.port: "8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=5); urllib.request.urlopen('http://127.0.0.1:8080/health/db', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 5m
+
+volumes:
+  open_webui_data:
+
+networks:
+  proxy:
+    external: true
+    name: proxy
