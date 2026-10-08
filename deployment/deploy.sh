@@ -60,7 +60,7 @@ rm -f -- "$TEMP_ENV"
 TEMP_ENV=""
 rm -f -- "$ENCRYPTED_ENV"
 
-unset APP_HOST WEBUI_URL
+unset APP_HOST WEBUI_URL PORT
 export APP_IMAGE="${IMAGE_REPO}:${IMAGE_SHA}"
 docker compose --env-file "$ENV_FILE" --project-name wilopo-open-webui-prod --file "$DEPLOY_DIR/docker-compose.yml" config --quiet || fail 'Compose configuration is invalid'
 docker network inspect proxy >/dev/null 2>&1 || fail 'external proxy network is missing'

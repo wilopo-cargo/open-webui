@@ -7,11 +7,12 @@ services:
       - .env
     environment:
       WEBUI_URL: ${WEBUI_URL:?WEBUI_URL must be set}
+      PORT: ${PORT:-8081}
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
     expose:
-      - "8080"
+      - "${PORT:-8081}"
     volumes:
       - open_webui_data:/app/backend/data
     networks:
@@ -23,9 +24,9 @@ services:
       traefik.http.routers.open-webui.entrypoints: websecure
       traefik.http.routers.open-webui.tls: "true"
       traefik.http.routers.open-webui.tls.certresolver: cloudflare
-      traefik.http.services.open-webui.loadbalancer.server.port: "8080"
+      traefik.http.services.open-webui.loadbalancer.server.port: "${PORT:-8081}"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=5); urllib.request.urlopen('http://127.0.0.1:8080/health/db', timeout=5)"]
+      test: ["CMD", "python", "-c", "import os, urllib.request; base = 'http://127.0.0.1:' + os.environ['PORT']; urllib.request.urlopen(base + '/ready', timeout=5); urllib.request.urlopen(base + '/health/db', timeout=5)"]
       interval: 15s
       timeout: 10s
       retries: 12
