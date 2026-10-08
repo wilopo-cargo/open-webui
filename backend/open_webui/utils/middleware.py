@@ -14,6 +14,7 @@ import sys
 import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 from typing import Any, Optional
 from urllib.parse import unquote
 from uuid import uuid4
@@ -88,6 +89,12 @@ from open_webui.utils.ask_user import stage_ask_user_tool_calls
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.chat_id import is_saved_chat_id
 from open_webui.utils.code_interpreter import execute_code_jupyter
+from open_webui.utils.composio import (
+    composio_log_scope,
+    create_composio_httpx_client,
+    create_composio_session,
+    validate_composio_connection_arguments,
+)
 from open_webui.utils.context_compaction import compact_messages_for_request
 from open_webui.utils.files import (
     convert_markdown_base64_images,
@@ -1442,8 +1449,9 @@ async def chat_completion_tools_handler(
                     direct_tool = tool.get('direct', False)
 
                     spec = tool.get('spec', {})
-                    allowed_params = spec.get('parameters', {}).get('properties', {}).keys()
-                    tool_function_params = {k: v for k, v in tool_function_params.items() if k in allowed_params}
+                    if not tool.get('composio_manage_connections'):
+                        allowed_params = spec.get('parameters', {}).get('properties', {}).keys()
+                        tool_function_params = {k: v for k, v in tool_function_params.items() if k in allowed_params}
 
                     if tool.get('direct', False):
                         tool_result = await event_caller(
@@ -2372,20 +2380,149 @@ async def connect_mcp_server(
     )
 
     client = MCPClient()
-    await client.connect(
-        url=mcp_server_connection.get('url', ''),
-        headers=headers if headers else None,
+    try:
+        await client.connect(
+            url=mcp_server_connection.get('url', ''),
+            headers=headers if headers else None,
+        )
+
+        function_name_filter_list = mcp_server_connection.get('config', {}).get('function_name_filter_list', '')
+        if isinstance(function_name_filter_list, str):
+            function_name_filter_list = function_name_filter_list.split(',')
+
+        tool_specs = await client.list_tool_specs()
+        if function_name_filter_list:
+            tool_specs = [spec for spec in tool_specs if is_string_allowed(spec['name'], function_name_filter_list)]
+
+        return client, tool_specs
+    except BaseException:
+        await disconnect_mcp_clients({server_id: client})
+        raise
+
+
+async def disconnect_mcp_clients(mcp_clients: dict) -> None:
+    # MCP transport cancel scopes must close in reverse order in their owning task.
+    for tool_id, client in reversed(list(mcp_clients.items())):
+        is_composio = tool_id.startswith('server:composio:')
+        try:
+            if is_composio:
+                with composio_log_scope():
+                    await client.disconnect()
+            else:
+                await client.disconnect()
+        except BaseException as exc:
+            if is_composio:
+                log.debug('Error disconnecting Composio client')
+            else:
+                log.debug('Error disconnecting MCP client: %s', exc)
+    mcp_clients.clear()
+
+
+_COMPOSIO_SAFE_ERRORS = frozenset(
+    {
+        'Configure the WebUI URL before using Composio',
+        'Composio API rejected credentials',
+        'Composio tool policy was rejected',
+        'Composio is unavailable',
+    }
+)
+
+
+async def connect_composio_server(request, server_id: str, user) -> tuple[MCPClient, list[dict], dict] | None:
+    connection = next(
+        (
+            connection
+            for connection in await Config.get('tool_server.connections', [])
+            if connection.get('type') == 'composio'
+            and (connection.get('config') or {}).get('enable')
+            and (connection.get('info') or {}).get('id') == server_id
+        ),
+        None,
     )
+    if connection is None or not await has_connection_access(user, connection):
+        return None
 
-    function_name_filter_list = mcp_server_connection.get('config', {}).get('function_name_filter_list', '')
-    if isinstance(function_name_filter_list, str):
-        function_name_filter_list = function_name_filter_list.split(',')
+    try:
+        session = await create_composio_session(connection, user.id, await Config.get('webui.url'))
+    except Exception as exc:
+        message = str(exc)
+        if message not in _COMPOSIO_SAFE_ERRORS:
+            message = 'Composio is unavailable'
+        raise ValueError(message) from None
 
-    tool_specs = await client.list_tool_specs()
-    if function_name_filter_list:
-        tool_specs = [spec for spec in tool_specs if is_string_allowed(spec['name'], function_name_filter_list)]
+    client = MCPClient()
+    try:
+        with composio_log_scope():
+            await client.connect(
+                url=session['url'],
+                headers=session['headers'],
+                httpx_client_factory=create_composio_httpx_client,
+            )
+            tool_specs = await client.list_tool_specs()
 
-    return client, tool_specs
+        function_name_filter_list = (connection.get('config') or {}).get('function_name_filter_list', '')
+        if isinstance(function_name_filter_list, str):
+            function_name_filter_list = function_name_filter_list.split(',')
+        tool_specs = [
+            copy.deepcopy(spec)
+            for spec in tool_specs
+            if spec['name'] in session['allowed_tools']
+            and (not spec['name'].startswith('COMPOSIO_') or spec['name'] == 'COMPOSIO_MANAGE_CONNECTIONS')
+            and (
+                spec['name'] == 'COMPOSIO_MANAGE_CONNECTIONS'
+                or is_string_allowed(spec['name'], function_name_filter_list)
+            )
+        ]
+        manager_spec = next((spec for spec in tool_specs if spec['name'] == 'COMPOSIO_MANAGE_CONNECTIONS'), None)
+        if manager_spec is None:
+            raise ValueError('Composio is unavailable')
+
+        manager_spec['parameters'] = {
+            'type': 'object',
+            'properties': {
+                'toolkits': {
+                    'type': 'array',
+                    'items': {'type': 'string', 'enum': sorted(session['allowed_toolkits'])},
+                    'minItems': 1,
+                },
+                'reinitiate_all': {'type': 'boolean'},
+            },
+            'required': ['toolkits'],
+            'additionalProperties': False,
+        }
+        return client, tool_specs, session
+    except BaseException as exc:
+        await disconnect_mcp_clients({f'server:composio:{server_id}': client})
+        if not isinstance(exc, Exception):
+            raise
+        raise ValueError('Composio is unavailable') from None
+
+
+def _make_mcp_tool_function(client, function_name: str, composio_session: dict | None = None):
+    if composio_session is None:
+
+        async def tool_function(**kwargs):
+            return await client.call_tool(function_name, function_args=kwargs)
+
+    else:
+        session_id = composio_session['session_id']
+        allowed_toolkits = frozenset(composio_session['allowed_toolkits'])
+        allowed_tools = frozenset(composio_session['allowed_tools'])
+
+        async def tool_function(**kwargs):
+            if function_name not in allowed_tools or (
+                function_name.startswith('COMPOSIO_') and function_name != 'COMPOSIO_MANAGE_CONNECTIONS'
+            ):
+                raise ValueError('Composio tool policy was rejected')
+            if function_name == 'COMPOSIO_MANAGE_CONNECTIONS':
+                kwargs = validate_composio_connection_arguments(kwargs, session_id, allowed_toolkits)
+            try:
+                with composio_log_scope():
+                    return await client.call_tool(function_name, function_args=kwargs)
+            except Exception:
+                raise ValueError('Composio is unavailable') from None
+
+    return tool_function
 
 
 async def process_chat_payload(request, form_data, user, metadata, model):
@@ -2957,61 +3094,99 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         tools_dict = {}
 
         mcp_clients = {}
+        metadata['mcp_clients'] = mcp_clients
         mcp_tools_dict = {}
+
+        async def ensure_unique_tool_names(names, existing_names):
+            seen = set(existing_names)
+            for name in names:
+                if name in seen:
+                    await disconnect_mcp_clients(mcp_clients)
+                    raise ValueError('Duplicate MCP tool function name')
+                seen.add(name)
 
         if tool_ids:
             db_tool_ids = []
             for tool_id in tool_ids:
-                if tool_id.startswith('server:mcp:'):
+                if tool_id.startswith(('server:mcp:', 'server:composio:')):
+                    is_composio = tool_id.startswith('server:composio:')
+                    server_id = tool_id.split(':', 2)[2]
+                    client_key = tool_id if is_composio else server_id
+                    await ensure_unique_tool_names([client_key], mcp_clients)
                     try:
-                        server_id = tool_id[len('server:mcp:') :]
-
-                        result = await connect_mcp_server(
-                            request,
-                            server_id,
-                            user,
-                            metadata,
-                            extra_params,
-                        )
-                        if result is None:
-                            continue
-
-                        client, tool_specs = result
-                        mcp_clients[server_id] = client
-
-                        for tool_spec in tool_specs:
-
-                            async def make_tool_function(client, function_name):
-                                async def tool_function(**kwargs):
-                                    return await client.call_tool(
-                                        function_name,
-                                        function_args=kwargs,
-                                    )
-
-                                return tool_function
-
-                            tool_function = await make_tool_function(client, tool_spec['name'])
-
-                            mcp_tools_dict[f'{server_id}_{tool_spec["name"]}'] = {
-                                'spec': {
-                                    **tool_spec,
-                                    'name': f'{server_id}_{tool_spec["name"]}',
-                                },
-                                'callable': tool_function,
-                                'type': 'mcp',
-                                'client': client,
-                                'direct': False,
-                            }
+                        if is_composio:
+                            result = await connect_composio_server(request, server_id, user)
+                        else:
+                            result = await connect_mcp_server(
+                                request,
+                                server_id,
+                                user,
+                                metadata,
+                                extra_params,
+                            )
                     except Exception as e:
-                        log.debug(e)
+                        if is_composio:
+                            error_content = str(e)
+                            if error_content not in _COMPOSIO_SAFE_ERRORS:
+                                error_content = 'Composio is unavailable'
+                            log.debug('Composio connection failed: %s', error_content)
+                        else:
+                            log.debug(e)
+                            error_content = f"Failed to connect to MCP server '{server_id}'"
                         if event_emitter:
                             await event_emitter(
                                 {
                                     'type': 'chat:message:error',
-                                    'data': {'error': {'content': f"Failed to connect to MCP server '{server_id}'"}},
+                                    'data': {'error': {'content': error_content}},
                                 }
                             )
+                        elif is_composio:
+                            raise ValueError(error_content) from None
                         continue
+                    if result is None:
+                        continue
+
+                    client, tool_specs = result[:2]
+                    session = result[2] if is_composio else None
+                    mcp_clients[client_key] = client
+                    function_names = [
+                        'comp_' + sha256(f'{server_id}:{spec["name"]}'.encode()).hexdigest()[:24]
+                        if is_composio
+                        else f'{server_id}_{spec["name"]}'
+                        for spec in tool_specs
+                    ]
+                    await ensure_unique_tool_names(function_names, mcp_tools_dict)
+                    manager_name = None
+                    for tool_spec, function_name in zip(tool_specs, function_names):
+                        original_name = tool_spec['name']
+                        spec = {**tool_spec, 'name': function_name}
+                        is_manager = is_composio and original_name == 'COMPOSIO_MANAGE_CONNECTIONS'
+                        if is_composio:
+                            spec['description'] = f'{original_name}: {tool_spec.get("description") or ""}'
+                            if is_manager:
+                                manager_name = function_name
+                        mcp_tools_dict[function_name] = {
+                            'spec': spec,
+                            'callable': _make_mcp_tool_function(client, original_name, session),
+                            'type': 'mcp',
+                            'client': client,
+                            'direct': False,
+                            'composio_manage_connections': is_manager,
+                        }
+
+                    if is_composio:
+                        form_data['messages'] = add_or_update_system_message(
+                            f'Composio connection {server_id} has approved toolkits: '
+                            f'{", ".join(sorted(session["allowed_toolkits"]))}. '
+                            f'Before an unauthenticated app action, call {manager_name} with the relevant '
+                            'approved toolkit in toolkits. Show its returned authorization link and ask the '
+                            'user to complete it using their work account. '
+                            f'Call {manager_name} again to check connection status before retrying the app action. '
+                            'A browser redirect is not proof of authorization; Composio connection status and '
+                            'tool execution are authoritative. Never automatically retry writes after uncertain execution.',
+                            form_data['messages'],
+                            append=True,
+                        )
                 elif ENABLE_PLUGINS:
                     db_tool_ids.append(tool_id)
 
@@ -3029,6 +3204,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 )
 
             if mcp_tools_dict:
+                await ensure_unique_tool_names(mcp_tools_dict, tools_dict)
                 tools_dict = {**tools_dict, **mcp_tools_dict}
 
         # Resolve terminal tools if terminal_id is set (outside tool_ids check
@@ -3050,17 +3226,18 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 else:
                     terminal_tools = terminal_result
                     system_prompt = None
-                if terminal_tools:
-                    tools_dict = {**tools_dict, **terminal_tools}
-                if system_prompt:
-                    form_data['messages'] = add_or_update_system_message(
-                        system_prompt,
-                        form_data['messages'],
-                        append=True,
-                    )
             except Exception as e:
                 log.exception(e)
                 raise HTTPException(status_code=503, detail=f'Terminal unavailable: {e}') from e
+            if terminal_tools:
+                await ensure_unique_tool_names(terminal_tools, tools_dict)
+                tools_dict = {**tools_dict, **terminal_tools}
+            if system_prompt:
+                form_data['messages'] = add_or_update_system_message(
+                    system_prompt,
+                    form_data['messages'],
+                    append=True,
+                )
 
         if direct_tool_servers:
             for tool_server in direct_tool_servers:
@@ -3075,6 +3252,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     )
 
                 tool_specs = tool_server.pop('specs', [])
+                await ensure_unique_tool_names((tool['name'] for tool in tool_specs), tools_dict)
 
                 for tool in tool_specs:
                     tools_dict[tool['name']] = {
@@ -3089,9 +3267,6 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             agents_md = await get_terminal_agents_md(request, user, metadata, extra_params)
             if agents_md:
                 form_data['messages'] = add_terminal_agents_md(form_data['messages'], agents_md)
-
-        if mcp_clients:
-            metadata['mcp_clients'] = mcp_clients
 
         # Inject builtin tools for native function calling based on enabled features and model capability.
         # Only inject when the request originates from the UI (identified by session_id).
@@ -3133,6 +3308,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 model,
                 is_note_chat=is_note_chat,
             )
+            await ensure_unique_tool_names(builtin_tools, mcp_tools_dict)
             for name, tool_dict in builtin_tools.items():
                 if name not in tools_dict:
                     tools_dict[name] = tool_dict
@@ -3182,6 +3358,10 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 tools_dict.pop(name)
 
         if tools_dict:
+            resolved_function_names = [
+                tool['spec']['name'] for tool in tools_dict.values() if (tool.get('spec') or {}).get('name')
+            ]
+            await ensure_unique_tool_names(resolved_function_names, ())
             # Always store resolved tools in metadata so downstream consumers
             # (e.g. pipe functions) can access all tools including MCP and builtins.
             metadata['tools'] = tools_dict
@@ -3192,6 +3372,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     {'type': 'function', 'function': tool.get('spec', {})} for tool in tools_dict.values()
                 ]
                 if inlet_filter_tools:
+                    await ensure_unique_tool_names(
+                        (
+                            tool['function']['name']
+                            for tool in inlet_filter_tools
+                            if (tool.get('function') or {}).get('name')
+                        ),
+                        resolved_function_names,
+                    )
                     form_data['tools'].extend(inlet_filter_tools)
             else:
                 # If the function calling is not native, then call the tools function calling handler
@@ -3353,8 +3541,9 @@ async def execute_tool_call_for_output(request, form_data, user, metadata, event
     spec = tool.get('spec', {})
     tool_type = tool.get('type', '')
     direct_tool = tool.get('direct', False)
-    allowed_params = spec.get('parameters', {}).get('properties', {}).keys()
-    params = {key: value for key, value in params.items() if key in allowed_params}
+    if not tool.get('composio_manage_connections'):
+        allowed_params = spec.get('parameters', {}).get('properties', {}).keys()
+        params = {key: value for key, value in params.items() if key in allowed_params}
 
     try:
         if direct_tool:
@@ -5998,8 +6187,9 @@ async def streaming_chat_response_handler(response, ctx):
                         spec = tool.get('spec', {})
                         tool_type = tool.get('type', '')
                         direct_tool = tool.get('direct', False)
-                        allowed_params = spec.get('parameters', {}).get('properties', {}).keys()
-                        params = {key: value for key, value in params.items() if key in allowed_params}
+                        if not tool.get('composio_manage_connections'):
+                            allowed_params = spec.get('parameters', {}).get('properties', {}).keys()
+                            params = {key: value for key, value in params.items() if key in allowed_params}
                         try:
                             if direct_tool:
                                 result = await event_caller(

@@ -131,12 +131,13 @@ async def get_tools(
             )
         )
 
-    # MCP Tool Servers
+    # MCP and Composio Tool Servers
     for server in await Config.get('tool_server.connections', []):
-        if server.get('type', 'openapi') == 'mcp' and (server.get('config') or {}).get('enable'):
+        server_type = server.get('type', 'openapi')
+        if server_type in ('mcp', 'composio') and (server.get('config') or {}).get('enable'):
             info = server.get('info') or {}
             server_id = info.get('id')
-            auth_type = server.get('auth_type', 'none')
+            auth_type = server.get('auth_type', 'none') if server_type == 'mcp' else 'none'
 
             session_token = None
             if auth_type in ('oauth_2.1', 'oauth_2.1_static') and server_id:
@@ -147,7 +148,7 @@ async def get_tools(
                     user.id, f'mcp:{server_id}'
                 )
 
-            tool_id = f'server:mcp:{info.get("id")}'
+            tool_id = f'server:{server_type}:{info.get("id")}'
             server_connections[tool_id] = server
 
             tools.append(
@@ -155,7 +156,7 @@ async def get_tools(
                     **{
                         'id': tool_id,
                         'user_id': tool_id,
-                        'name': info.get('name', 'MCP Tool Server'),
+                        'name': info.get('name', 'Composio' if server_type == 'composio' else 'MCP Tool Server'),
                         'meta': {
                             'description': info.get('description', ''),
                         },

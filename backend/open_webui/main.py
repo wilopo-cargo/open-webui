@@ -243,6 +243,7 @@ from open_webui.utils.logger import start_logger
 from open_webui.utils.middleware import (
     background_tasks_handler,
     build_chat_response_context,
+    disconnect_mcp_clients,
     drain_approved_tool_calls,
     process_chat_payload,
     process_chat_response,
@@ -1736,14 +1737,9 @@ async def chat_completion(
             # MCPClient.disconnect() suppresses known transport teardown errors
             # while still propagating real task cancellation.
             try:
-                if mcp_clients := metadata.get('mcp_clients'):
-                    for client in reversed(list(mcp_clients.values())):
-                        try:
-                            await client.disconnect()
-                        except BaseException as e:
-                            log.debug('Error disconnecting MCP client: %s', e)
-            except BaseException as e:
-                log.debug('Error cleaning up MCP clients: %s', e)
+                await disconnect_mcp_clients(metadata.get('mcp_clients') or {})
+            except BaseException:
+                log.debug('Error cleaning up MCP clients')
 
             # Deregister this task, then emit chat:active=false if no others remain
             try:

@@ -5,7 +5,7 @@
 	const { saveAs } = fileSaver;
 
 	import { toast } from 'svelte-sonner';
-	import { getContext, onMount } from 'svelte';
+	import { getContext } from 'svelte';
 	const i18n = getContext<any>('i18n');
 
 	import Modal from '$lib/components/common/Modal.svelte';
@@ -17,6 +17,7 @@
 	import Switch from '$lib/components/common/Switch.svelte';
 	import Tags from './common/Tags.svelte';
 	import { getToolServerData } from '$lib/apis';
+	import { WEBUI_API_BASE_URL } from '$lib/constants';
 	import {
 		verifyToolServerConnection,
 		registerOAuthClient,
@@ -40,7 +41,7 @@
 
 	let inputElement = null;
 
-	let type = 'openapi'; // 'openapi', 'mcp'
+	let type = 'openapi'; // 'openapi', 'mcp', 'composio'
 
 	let url = '';
 
@@ -52,6 +53,25 @@
 	let forwardCookies = false;
 	let key = '';
 	let headers = '';
+
+	type ComposioToolkitRow = {
+		toolkit: string;
+		tools: string;
+		authConfigId: string;
+	};
+	let composioKey = '';
+	let composioToolkitRows: ComposioToolkitRow[] = [
+		{ toolkit: '', tools: '', authConfigId: '' }
+	];
+	let verifyingComposio = false;
+	const composioUrl = 'https://backend.composio.dev/api/v3.1';
+	const composioPath = 'tool_router/session';
+	const safeComposioErrors = [
+		'Configure the WebUI URL before using Composio',
+		'Composio API rejected credentials',
+		'Composio tool policy was rejected',
+		'Composio is unavailable'
+	];
 
 	let functionNameFilterList = '';
 	let accessGrants = [];
@@ -87,6 +107,134 @@
 		oauthAuthTypes.includes(auth_type)
 			? $i18n.t('OAuth discovery successful')
 			: $i18n.t('Connection successful');
+
+	const composioValidationError = (message: string) => {
+		toast.error($i18n.t(message));
+		return null;
+	};
+
+	const getComposioConnection = (
+		rows = composioToolkitRows,
+		values: any = {
+			key: composioKey,
+			info: { id, name, description },
+			config: {
+				enable,
+				function_name_filter_list: functionNameFilterList,
+				access_grants: accessGrants
+			}
+		}
+	) => {
+		if (direct) {
+			return composioValidationError('Composio is only available for shared admin connections');
+		}
+
+		const connectionId = typeof values.info?.id === 'string' ? values.info.id.trim() : '';
+		if (!connectionId || connectionId.includes(':') || connectionId.includes('|')) {
+			return composioValidationError('Composio requires a nonblank ID without ":" or "|" characters');
+		}
+		const apiKey = typeof values.key === 'string' ? values.key.trim() : '';
+		if (!apiKey) {
+			return composioValidationError('Please enter a Composio project API key');
+		}
+		if (!rows.length) {
+			return composioValidationError('At least one Composio toolkit is required');
+		}
+
+		const toolkits: Record<string, { tools: string[]; auth_config_id?: string }> =
+			Object.create(null);
+		let toolCount = 0;
+		for (const row of rows) {
+			const toolkit = row.toolkit.trim();
+			if (!/^[a-z0-9_-]+$/.test(toolkit)) {
+				return composioValidationError(
+					'Toolkit slugs must use lowercase ASCII letters, digits, underscores, or hyphens; wildcards are not allowed'
+				);
+			}
+			if (toolkit in toolkits) {
+				return composioValidationError('Duplicate toolkit slugs are not allowed');
+			}
+			const tools = [...new Set(row.tools.split(/[\n,]/).map((tool) => tool.trim()).filter(Boolean))];
+			if (!tools.length) {
+				return composioValidationError('Each toolkit requires at least one allowed tool slug');
+			}
+			if (tools.some((tool) => !/^[A-Z0-9_]+$/.test(tool))) {
+				return composioValidationError(
+					'Allowed tool slugs must use uppercase ASCII letters, digits, or underscores; wildcards are not allowed'
+				);
+			}
+			toolCount += tools.length;
+			if (toolCount > 1000) {
+				return composioValidationError('A Composio policy may contain at most 1,000 tools');
+			}
+			const authConfigId = row.authConfigId.trim();
+			if (authConfigId && !authConfigId.startsWith('ac_')) {
+				return composioValidationError('Auth config ID must start with ac_');
+			}
+			toolkits[toolkit] = {
+				tools,
+				...(authConfigId ? { auth_config_id: authConfigId } : {})
+			};
+		}
+
+		return {
+			type: 'composio',
+			url: composioUrl,
+			path: composioPath,
+			auth_type: 'none',
+			key: apiKey,
+			composio: { toolkits },
+			config: {
+				enable: values.config?.enable ?? true,
+				function_name_filter_list: values.config?.function_name_filter_list ?? '',
+				access_grants: values.config?.access_grants ?? []
+			},
+			info: {
+				id: connectionId,
+				name: values.info?.name ?? '',
+				description: values.info?.description ?? ''
+			}
+		};
+	};
+
+	const getComposioToolkitRows = (policy: any): ComposioToolkitRow[] => {
+		if (
+			!policy ||
+			typeof policy !== 'object' ||
+			Array.isArray(policy) ||
+			Object.keys(policy).some((field) => field !== 'toolkits') ||
+			!policy.toolkits ||
+			typeof policy.toolkits !== 'object' ||
+			Array.isArray(policy.toolkits)
+		) {
+			throw new Error('Invalid Composio policy');
+		}
+		return Object.entries(policy.toolkits).map(([toolkit, value]: [string, any]) => {
+			if (
+				!value ||
+				typeof value !== 'object' ||
+				Array.isArray(value) ||
+				Object.keys(value).some((field) => !['tools', 'auth_config_id'].includes(field)) ||
+				!Array.isArray(value.tools) ||
+				!value.tools.length ||
+				value.tools.some(
+					(tool: unknown) => typeof tool !== 'string' || !/^[A-Z0-9_]+$/.test(tool.trim())
+				) ||
+				(value.auth_config_id != null && typeof value.auth_config_id !== 'string')
+			) {
+				throw new Error('Invalid Composio policy');
+			}
+			const tools = value.tools.map((tool: string) => tool.trim());
+			if (new Set(tools).size !== tools.length) {
+				throw new Error('Invalid Composio policy');
+			}
+			return {
+				toolkit,
+				tools: tools.join('\n'),
+				authConfigId: value.auth_config_id ?? ''
+			};
+		});
+	};
 
 	const authorizeOAuthHandler = () => {
 		if (!id) {
@@ -159,6 +307,45 @@
 	};
 
 	const verifyHandler = async () => {
+		if (type === 'composio') {
+			const payload = getComposioConnection();
+			if (!payload || verifyingComposio) return;
+			verifyingComposio = true;
+			try {
+				// The native API helper logs raw validation errors, which may include a project key.
+				const response = await fetch(`${WEBUI_API_BASE_URL}/configs/tool_servers/verify`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						Authorization: `Bearer ${localStorage.token}`
+					},
+					body: JSON.stringify(payload)
+				});
+				const result = await response.json();
+				if (
+					response.ok &&
+					result?.status === true &&
+					result?.composio === true &&
+					Number.isInteger(result?.tool_count) &&
+					result.tool_count > 0
+				) {
+					toast.success($i18n.t('Composio session verified'));
+				} else {
+					const message = safeComposioErrors.includes(result?.detail)
+						? result.detail
+						: [400, 422].includes(response.status)
+							? 'Composio tool policy was rejected'
+							: 'Composio is unavailable';
+					toast.error($i18n.t(message));
+				}
+			} catch {
+				toast.error($i18n.t('Composio is unavailable'));
+			} finally {
+				verifyingComposio = false;
+			}
+			return;
+		}
+
 		if (url === '') {
 			toast.error($i18n.t('Please enter a valid URL'));
 			return;
@@ -244,7 +431,6 @@
 		const reader = new FileReader();
 		reader.onload = (event) => {
 			const json = event.target.result;
-			console.log('importHandler', json);
 
 			try {
 				let data = JSON.parse(json);
@@ -256,6 +442,45 @@
 					}
 					data = data[0];
 				}
+
+				if (!data || typeof data !== 'object') {
+					throw new Error('Invalid connection');
+				}
+				if (data.type === 'composio') {
+					if (direct) {
+						composioValidationError('Composio is only available for shared admin connections');
+						return;
+					}
+					if (
+						data.url !== composioUrl ||
+						data.path !== composioPath ||
+						data.auth_type !== 'none' ||
+						(data.forward_cookies ?? false) !== false ||
+						(data.headers != null &&
+							(typeof data.headers !== 'object' ||
+								Array.isArray(data.headers) ||
+								Object.keys(data.headers).length > 0))
+					) {
+						composioValidationError('Invalid Composio connection settings');
+						return;
+					}
+					let rows: ComposioToolkitRow[];
+					try {
+						rows = getComposioToolkitRows(data.composio);
+					} catch {
+						composioValidationError('Invalid Composio policy');
+						return;
+					}
+					const imported = getComposioConnection(rows, data);
+					if (!imported) return;
+					init(imported);
+					toast.success($i18n.t('Import successful'));
+					return;
+				}
+
+				if (type === 'composio') type = 'openapi';
+				composioKey = '';
+				composioToolkitRows = [{ toolkit: '', tools: '', authConfigId: '' }];
 
 				if (data.type) type = data.type;
 				if (data.url) url = data.url;
@@ -292,8 +517,7 @@
 
 	const exportHandler = async () => {
 		// export current connection as json file
-		const json = JSON.stringify([
-			{
+		const exported = type === 'composio' ? getComposioConnection() : {
 				type,
 				url,
 
@@ -317,8 +541,9 @@
 							}
 						: {})
 				}
-			}
-		]);
+		};
+		if (!exported) return;
+		const json = JSON.stringify([exported]);
 
 		const blob = new Blob([json], {
 			type: 'application/json'
@@ -328,6 +553,20 @@
 	};
 
 	const submitHandler = async () => {
+		if (type === 'composio') {
+			const payload = getComposioConnection();
+			if (!payload) return;
+			loading = true;
+			try {
+				await onSubmit(payload);
+				show = false;
+				init(null);
+			} finally {
+				loading = false;
+			}
+			return;
+		}
+
 		loading = true;
 
 		// remove trailing slash from url for non-MCP connections
@@ -418,72 +657,47 @@
 		loading = false;
 		show = false;
 
-		// reset form
-		type = 'openapi';
-		url = '';
-
-		spec_type = 'url';
-		spec = '';
-		path = 'openapi.json';
-
-		key = '';
-		auth_type = 'bearer';
-		forwardCookies = false;
-
-		id = '';
-		name = '';
-		description = '';
-
-		oauthClientInfo = null;
-		oauthClientId = '';
-		oauthClientSecret = '';
-		oauthServerUrl = '';
-		oauthScope = '';
-		oauthResourceParameter = 'auto';
-
-		enable = true;
-		functionNameFilterList = '';
-		accessGrants = [];
+		init(null);
 	};
 
-	const init = () => {
-		forwardCookies = connection?.forward_cookies ?? false;
-		if (connection) {
-			type = connection?.type ?? 'openapi';
-			url = connection.url;
-
-			spec_type = connection?.spec_type ?? 'url';
-			spec = connection?.spec ?? '';
-			path = connection?.path ?? 'openapi.json';
-
-			auth_type = connection?.auth_type ?? 'bearer';
-			headers = connection?.headers ? JSON.stringify(connection.headers, null, 2) : '';
-
-			key = connection?.key ?? '';
-
-			id = connection.info?.id ?? '';
-			name = connection.info?.name ?? '';
-			description = connection.info?.description ?? '';
-			oauthClientInfo = connection.info?.oauth_client_info ?? null;
-			oauthClientId = connection.info?.oauth_client_id ?? '';
-			oauthClientSecret = connection.info?.oauth_client_secret ?? '';
-			oauthServerUrl = connection.info?.oauth_server_url ?? '';
-			oauthScope = connection.info?.oauth_scope ?? '';
-			oauthResourceParameter = connection.info?.oauth_resource_parameter ?? 'auto';
-
-			enable = connection.config?.enable ?? true;
-			functionNameFilterList = connection.config?.function_name_filter_list ?? '';
-			accessGrants = connection.config?.access_grants ?? [];
+	const init = (value: any) => {
+		type = value?.type || 'openapi';
+		url = value?.url ?? '';
+		spec_type = value?.spec_type ?? 'url';
+		spec = value?.spec ?? '';
+		path = value?.path ?? 'openapi.json';
+		auth_type = value?.auth_type ?? 'bearer';
+		forwardCookies = value?.forward_cookies ?? false;
+		headers = value?.headers ? JSON.stringify(value.headers, null, 2) : '';
+		key = value?.type === 'composio' ? '' : value?.key ?? '';
+		composioKey = value?.type === 'composio' ? value?.key ?? '' : '';
+		composioToolkitRows = [{ toolkit: '', tools: '', authConfigId: '' }];
+		if (value?.type === 'composio') {
+			try {
+				composioToolkitRows = getComposioToolkitRows(value.composio);
+			} catch {
+				toast.error($i18n.t('Invalid Composio policy'));
+			}
 		}
+
+		id = value?.info?.id ?? '';
+		name = value?.info?.name ?? '';
+		description = value?.info?.description ?? '';
+		oauthClientInfo = value?.info?.oauth_client_info ?? null;
+		oauthClientId = value?.info?.oauth_client_id ?? '';
+		oauthClientSecret = value?.info?.oauth_client_secret ?? '';
+		oauthServerUrl = value?.info?.oauth_server_url ?? '';
+		oauthScope = value?.info?.oauth_scope ?? '';
+		oauthResourceParameter = value?.info?.oauth_resource_parameter ?? 'auto';
+		enable = value?.config?.enable ?? true;
+		functionNameFilterList = value?.config?.function_name_filter_list ?? '';
+		accessGrants = value?.config?.access_grants ?? [];
 	};
 
 	$: if (show) {
-		init();
+		init(direct && connection?.type === 'composio' ? null : connection);
 	}
 
-	onMount(() => {
-		init();
-	});
 </script>
 
 <Modal size="sm" bind:show>
@@ -551,20 +765,22 @@
 
 								<div class="">
 									{#if !direct}
-										<button
-											on:click={() => {
-												type = ['', 'openapi'].includes(type) ? 'mcp' : 'openapi';
-											}}
-											type="button"
-											class=" text-xs text-gray-700 dark:text-gray-300"
+										<select
+											id="connection-type"
+											aria-label={$i18n.t('Type')}
+											class={`text-xs text-gray-700 dark:text-gray-300 ${selectClass}`}
+											bind:value={type}
 										>
-											{#if ['', 'openapi'].includes(type)}
-												{$i18n.t('settings.admin.integrations.openApi.label')}
-											{:else if type === 'mcp'}
-												{$i18n.t('settings.admin.integrations.mcp.label')}
-												<span class="text-gray-500">{$i18n.t('Streamable HTTP')}</span>
-											{/if}
-										</button>
+											<option value="openapi"
+												>{$i18n.t('settings.admin.integrations.openApi.label')}</option
+											>
+											<option value="mcp"
+												>{$i18n.t('settings.admin.integrations.mcp.label')} ({$i18n.t(
+													'Streamable HTTP'
+												)})</option
+											>
+											<option value="composio">{$i18n.t('Composio')}</option>
+										</select>
 									{:else}
 										<div class="text-xs text-gray-700 dark:text-gray-300">
 											{$i18n.t('settings.personal.tools.openApi.label')}
@@ -596,7 +812,8 @@
 									<div class="flex justify-between mb-0.5">
 										<label for="enter-id" class={`text-xs text-gray-500`}
 											>{$i18n.t('ID')}
-											{#if type !== 'mcp'}<span class="opacity-50">({$i18n.t('optional')})</span
+											{#if !['mcp', 'composio'].includes(type)}<span class="opacity-50"
+													>({$i18n.t('optional')})</span
 												>{/if}</label
 										>
 									</div>
@@ -606,9 +823,9 @@
 											class={`w-full flex-1 text-sm font-mono ${inputClass}`}
 											type="text"
 											bind:value={id}
-											placeholder="auto"
+											placeholder={type === 'composio' ? 'composio' : 'auto'}
 											autocomplete="off"
-											required={type === 'mcp'}
+											required={['mcp', 'composio'].includes(type)}
 										/>
 									</div>
 								</div>
@@ -632,6 +849,120 @@
 							</div>
 						</div>
 
+						{#if type === 'composio' && !direct}
+							<div class="flex flex-col gap-2 mt-2">
+								<label for="composio-project-key" class="text-xs text-gray-500">
+									{$i18n.t('Project API key')}
+								</label>
+								<SensitiveInput
+									id="composio-project-key"
+									bind:value={composioKey}
+									type="password"
+									placeholder={$i18n.t('Composio project API key')}
+									screenReader={false}
+									required
+								/>
+								<p class="text-xs text-gray-500">
+									{$i18n.t(
+										'Stored in administrator settings, not encrypted at rest. Exports include this key; keep them private.'
+									)}
+								</p>
+
+								{#each composioToolkitRows as row, index}
+									<div class="flex flex-col gap-2 rounded-lg border border-gray-100 dark:border-gray-800 p-2">
+										<div class="flex items-center justify-between gap-2">
+											<label for={`composio-toolkit-${index}`} class="text-xs text-gray-500">
+												{$i18n.t('Toolkit slug')}
+											</label>
+											<button
+												type="button"
+												class="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-200 disabled:opacity-50"
+												aria-label={$i18n.t('Remove toolkit')}
+												disabled={composioToolkitRows.length === 1}
+												on:click={() => {
+													composioToolkitRows = composioToolkitRows.filter((_, i) => i !== index);
+												}}
+											>
+												{$i18n.t('Remove toolkit')}
+											</button>
+										</div>
+										<input
+											id={`composio-toolkit-${index}`}
+											class={`w-full text-sm font-mono ${inputClass}`}
+											type="text"
+											bind:value={row.toolkit}
+											placeholder="googledrive"
+											autocomplete="off"
+											required
+										/>
+										<label for={`composio-tools-${index}`} class="text-xs text-gray-500">
+											{$i18n.t('Allowed tool slugs')}
+										</label>
+										<textarea
+											id={`composio-tools-${index}`}
+											class={`w-full text-sm font-mono ${inputClass}`}
+											bind:value={row.tools}
+											rows="3"
+											autocomplete="off"
+											required
+										/>
+										<p class="text-xs text-gray-500">
+											{$i18n.t(
+												'One slug per line or comma-separated. Only these exact app tools are enabled; wildcards are not allowed.'
+											)}
+										</p>
+										<label for={`composio-auth-config-${index}`} class="text-xs text-gray-500">
+											{$i18n.t('Auth config ID')} ({$i18n.t('optional')})
+										</label>
+										<input
+											id={`composio-auth-config-${index}`}
+											class={`w-full text-sm font-mono ${inputClass}`}
+											type="text"
+											bind:value={row.authConfigId}
+											placeholder="ac_..."
+											autocomplete="off"
+										/>
+										<p class="text-xs text-gray-500">
+											{$i18n.t(
+												"Leave blank to use the project's default configuration. Scoped auth configurations are recommended for least privilege."
+											)}
+										</p>
+									</div>
+								{/each}
+								<button
+									type="button"
+									class="self-start text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-200 underline"
+									on:click={() => {
+										composioToolkitRows = [
+											...composioToolkitRows,
+											{ toolkit: '', tools: '', authConfigId: '' }
+										];
+									}}
+								>
+									{$i18n.t('Add toolkit')}
+								</button>
+
+								<div class="flex items-center justify-between gap-2">
+									<button
+										type="button"
+										class="flex items-center gap-2 text-xs underline disabled:opacity-50"
+										disabled={verifyingComposio}
+										on:click={verifyHandler}
+									>
+										{$i18n.t('Verify Connection')}
+										{#if verifyingComposio}<Spinner />{/if}
+									</button>
+									<Tooltip content={enable ? $i18n.t('Enabled') : $i18n.t('Disabled')}>
+										<Switch bind:state={enable} />
+									</Tooltip>
+								</div>
+								<p class="text-xs text-gray-500">
+									{$i18n.t(
+										'Verification checks credentials and tool policy, not external-account consent. Users connect their own work accounts through links in chat.'
+									)}
+								</p>
+							</div>
+						{:else}
 						<div class="flex gap-2">
 							<div class="flex flex-col w-full">
 								<div class="flex justify-between mb-0.5">
@@ -820,8 +1151,10 @@
 								</div>
 							</div>
 						</div>
+						{/if}
 
 						<div class="flex items-center justify-between">
+							{#if type !== 'composio'}
 							<button
 								type="button"
 								class="flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition mt-2"
@@ -841,6 +1174,7 @@
 								</svg>
 								{$i18n.t('Advanced')}
 							</button>
+							{/if}
 
 							{#if !direct}
 								<AccessButton
@@ -853,7 +1187,7 @@
 							{/if}
 						</div>
 
-						{#if showAdvanced}
+						{#if showAdvanced && type !== 'composio'}
 							{#if !direct && ['', 'openapi'].includes(type)}
 								<div class="flex items-center justify-between gap-3 mt-2">
 									<div>

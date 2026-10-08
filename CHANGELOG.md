@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-10-08
+
+### Added
+
+- Administrator-owned Composio connections with explicit toolkit/tool allowlists and fresh sessions bound to each verified Open WebUI user. Employees authorize their own work accounts through in-chat Connect Links; native MCP and ERP authentication remain separate.
+- Configure shared connections in Admin → Settings → Integrations, select Composio, and supply a project API key plus exact allowed tool slugs. Blank auth-config IDs use the Composio project's default configuration; scoped configurations are recommended. Set the persisted WebUI URL before verification. Keys follow existing administrator-only Config storage and are not encrypted at rest; exported connection files include the key and must remain private.
+- Verification checks credentials, callback configuration, and tool policy without executing tools or completing external-account consent. Initial Drive deployment should use only `GOOGLEDRIVE_FIND_FILE`, `GOOGLEDRIVE_GET_FILE_METADATA`, and `GOOGLEDRIVE_GET_ABOUT` with an approved read-only auth configuration.
+
 ## [0.11.4] - 2026-09-21
 
 ### Added
