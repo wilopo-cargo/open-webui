@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configure shared connections in Admin → Settings → Integrations, select Composio, and supply a project API key plus exact allowed tool slugs. Blank auth-config IDs use the Composio project's default configuration; scoped configurations are recommended. Set the persisted WebUI URL before verification. Keys follow existing administrator-only Config storage and are not encrypted at rest; exported connection files include the key and must remain private.
 - Verification checks credentials, callback configuration, and tool policy without executing tools or completing external-account consent. Initial Drive deployment should use only `GOOGLEDRIVE_FIND_FILE`, `GOOGLEDRIVE_GET_FILE_METADATA`, and `GOOGLEDRIVE_GET_ABOUT` with an approved read-only auth configuration.
 
+### Fixed
+
+- Full-config imports validate Composio connections before saving any settings; invalid policies return actionable errors without exposing credentials or changing the previous configuration.
+
 ## [0.11.4] - 2026-09-21
 
 ### Added

@@ -37,7 +37,7 @@ from open_webui.utils.tools import (
     set_terminal_servers,
     set_tool_servers,
 )
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 router = APIRouter()
 
@@ -105,6 +105,23 @@ class ImportConfigForm(BaseModel):
 
 @router.post('/import', response_model=dict)
 async def import_config(request: Request, form_data: ImportConfigForm, user=Depends(get_admin_user)):
+    connections = form_data.config.get('tool_server.connections')
+    if isinstance(connections, list):
+        try:
+            form_data.config['tool_server.connections'] = [
+                ToolServerConnection.model_validate(connection).model_dump()
+                if isinstance(connection, dict) and connection.get('type') == 'composio'
+                else connection
+                for connection in connections
+            ]
+        except ValidationError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    'Invalid Composio connection in imported config. Check its API key, connection ID, '
+                    'fixed API URL/path, and explicit toolkit/tool allowlists. No configuration was changed.'
+                ),
+            ) from None
     await Config.upsert(form_data.config)
     await publish_event(
         request,

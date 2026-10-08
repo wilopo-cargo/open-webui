@@ -27,7 +27,7 @@ _TEST_ENV = {
     'DATABASE_HOST': '',
     'DATABASE_PORT': '',
     'DATABASE_NAME': '',
-    'DATABASE_SCHEMA': '',
+    'DATABASE_SCHEMA': 'main',  # SQLite schema; an empty string breaks SQLAlchemy table introspection.
     'DATABASE_ENABLE_IAM_TOKEN_AUTH': 'false',
     'ENABLE_DB_MIGRATIONS': 'false',
     'FROM_INIT_PY': 'false',
@@ -63,6 +63,7 @@ atexit.register(_restore_test_environment)
 import httpx
 from httpx import AsyncClient as _HTTPX_ASYNC_CLIENT
 import pytest
+import pytest_asyncio
 from pydantic import ValidationError
 
 
@@ -250,6 +251,138 @@ def test_composio_connection_validation_is_type_specific(app_modules):
     )
     assert native.type == 'mcp'
     assert native.composio is None
+
+
+@pytest_asyncio.fixture
+async def config_import_client(app_modules, monkeypatch):
+    from fastapi import FastAPI
+    from open_webui import events
+    from open_webui.internal import db
+
+    Config = app_modules.configs.Config
+    Config.__table__.create(db.engine, checkfirst=True)
+    monkeypatch.setattr(Config, 'PERSISTENT_ENABLED', True)
+    monkeypatch.setattr(Config, 'OAUTH_PERSISTENT_ENABLED', False)
+    monkeypatch.setattr(Config, 'DEFAULTS', copy.deepcopy(Config.DEFAULTS))
+    saved = await Config.get_all()
+    # Import notifications/plugins are outside this persistence regression.
+    monkeypatch.setattr(events, 'EVENT_SINKS', [])
+    app = FastAPI()
+    app.include_router(app_modules.configs.router, prefix='/configs')
+    app.dependency_overrides[app_modules.configs.get_admin_user] = lambda: _user('admin', role='admin')
+    try:
+        async with _HTTPX_ASYNC_CLIENT(
+            transport=httpx.ASGITransport(app=app), base_url='http://test'
+        ) as client:
+            yield client
+    finally:
+        await Config.clear()
+        await Config.upsert(saved)
+        await db.async_engine.dispose()
+
+
+@pytest.mark.parametrize(
+    'invalid_fields',
+    [
+        pytest.param({}, id='missing-policy'),
+        {'composio': None},
+        {'composio': {'toolkits': {}}},
+        {'composio': {'toolkits': {'googledrive': {'tools': []}}}},
+        {'composio': {'toolkits': {'googledrive': {'tools': ['GOOGLEDRIVE_*']}}}},
+        {'composio': {'toolkits': {'private-provider-value': {'tools': ['private-tool-value']}}}},
+        {'composio': {'toolkits': {}}, 'config': {'enable': False}},
+        {'url': 'https://private-provider.example/secret-path'},
+        {'key': '   '},
+    ],
+)
+@pytest.mark.asyncio
+async def test_full_config_import_rejects_invalid_composio_without_changing_prior_state(
+    app_modules, config_import_client, invalid_fields
+):
+    Config = app_modules.configs.Config
+    previous_connection = _connection(server_id='previous')
+    await Config.upsert({
+        'tool_server.connections': [previous_connection],
+        'ui.default_models': 'previous-model',
+        'import_test.unrelated': {'keep': ['previous-value']},
+        'oauth.import_test_guard': 'previous-default',
+    })
+    before = await Config.get_all()
+    before_defaults = copy.deepcopy(Config.DEFAULTS)
+    invalid = {**_connection(), **invalid_fields, 'key': invalid_fields.get('key', 'private-import-api-key')}
+    if not invalid_fields:
+        invalid.pop('composio')
+    response = await config_import_client.post('/configs/import', json={'config': {
+        'ui.default_models': 'replacement-model',
+        'oauth.import_test_guard': 'replacement-default',
+        'import_test.unrelated': {'replace': True},
+        'import_test.new': 'must-not-be-persisted',
+        'tool_server.connections': [_connection(server_id='valid-first'), invalid],
+    }})
+    assert response.status_code == 400
+    detail = response.json()['detail']
+    assert 'Composio' in detail and 'toolkit/tool allowlists' in detail
+    assert 'No configuration was changed' in detail
+    for private_value in (
+        'private-import-api-key', 'private-provider-value', 'private-tool-value',
+        'private-provider.example', 'secret-path',
+    ):
+        assert private_value not in response.text
+    assert await Config.get_all() == before
+    assert Config.DEFAULTS == before_defaults
+    readable = await config_import_client.get('/configs/tool_servers')
+    assert readable.status_code == 200
+    assert readable.json()['TOOL_SERVER_CONNECTIONS'][0]['info']['id'] == 'previous'
+
+
+@pytest.mark.parametrize('connection_kind', ['composio', 'native', 'empty', 'omitted'])
+@pytest.mark.asyncio
+async def test_full_config_import_accepts_valid_connections_and_keeps_them_readable(
+    app_modules, config_import_client, connection_kind
+):
+    Config = app_modules.configs.Config
+    await Config.upsert({
+        'tool_server.connections': [_connection(server_id='previous')],
+        'import_test.retained': {'keep': True},
+    })
+    native = {**_native_connection(), 'legacy_extension': {'preserve': True}}
+    imported = {'ui.default_models': 'imported-model'}
+    if connection_kind == 'composio':
+        connection = _connection({
+            ' googledrive ': {
+                'tools': [' GOOGLEDRIVE_FIND_FILE '], 'auth_config_id': ' ac_approved_read_only ',
+            },
+            'github': {'tools': ['GITHUB_GET_THE_AUTHENTICATED_USER']},
+        }, server_id=' imported-composio ', grants=_user_read_grant('alice'))
+        connection['key'] = ' imported-project-key '
+        imported['tool_server.connections'] = [native, connection]
+    elif connection_kind == 'native':
+        imported['tool_server.connections'] = [native]
+    elif connection_kind == 'empty':
+        imported['tool_server.connections'] = []
+
+    response = await config_import_client.post('/configs/import', json={'config': imported})
+    assert response.status_code == 200
+    assert response.json()['ui.default_models'] == 'imported-model'
+    assert await Config.get('import_test.retained') == {'keep': True}
+    readable = await config_import_client.get('/configs/tool_servers')
+    assert readable.status_code == 200
+    stored = await Config.get('tool_server.connections')
+    assert response.json()['tool_server.connections'] == stored
+    if connection_kind in ('composio', 'native'):
+        assert stored[0] == native
+        assert readable.json()['TOOL_SERVER_CONNECTIONS'][0]['legacy_extension'] == {'preserve': True}
+    if connection_kind == 'composio':
+        assert stored[1]['info']['id'] == 'imported-composio'
+        assert stored[1]['key'] == 'imported-project-key'
+        assert stored[1]['composio']['toolkits']['googledrive'] == {
+            'tools': ['GOOGLEDRIVE_FIND_FILE'], 'auth_config_id': 'ac_approved_read_only',
+        }
+        assert readable.json()['TOOL_SERVER_CONNECTIONS'][1] == stored[1]
+    elif connection_kind == 'empty':
+        assert readable.json()['TOOL_SERVER_CONNECTIONS'] == []
+    elif connection_kind == 'omitted':
+        assert readable.json()['TOOL_SERVER_CONNECTIONS'][0]['info']['id'] == 'previous'
 
 
 @pytest.mark.asyncio
