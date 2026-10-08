@@ -61,15 +61,19 @@ class MCPClient:
         self.session: Optional[ClientSession] = None
         self.exit_stack = None
 
-    async def connect(self, url: str, headers: Optional[dict] = None):
+    async def connect(self, url: str, headers: Optional[dict] = None, *, httpx_client_factory=None):
         async with AsyncExitStack() as exit_stack:
             try:
                 self._streams_context = streamablehttp_client(
                     url,
                     headers=headers,
-                    httpx_client_factory=create_httpx_client
-                    if AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL
-                    else create_insecure_httpx_client,
+                    httpx_client_factory=httpx_client_factory
+                    if httpx_client_factory is not None
+                    else (
+                        create_httpx_client
+                        if AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL
+                        else create_insecure_httpx_client
+                    ),
                 )
 
                 transport = await exit_stack.enter_async_context(self._streams_context)

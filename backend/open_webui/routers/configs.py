@@ -12,6 +12,12 @@ from open_webui.events import EVENTS, publish_event
 from open_webui.models.config import Config
 from open_webui.models.oauth_sessions import OAuthSessions
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.composio import (
+    ComposioPolicy,
+    composio_log_scope,
+    create_composio_httpx_client,
+    create_composio_session,
+)
 from open_webui.utils.headers import bearer_auth_header, get_custom_headers
 from open_webui.utils.mcp.client import MCPClient
 from open_webui.utils.oauth import (
@@ -31,7 +37,7 @@ from open_webui.utils.tools import (
     set_terminal_servers,
     set_tool_servers,
 )
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 router = APIRouter()
 
@@ -99,6 +105,23 @@ class ImportConfigForm(BaseModel):
 
 @router.post('/import', response_model=dict)
 async def import_config(request: Request, form_data: ImportConfigForm, user=Depends(get_admin_user)):
+    connections = form_data.config.get('tool_server.connections')
+    if isinstance(connections, list):
+        try:
+            form_data.config['tool_server.connections'] = [
+                ToolServerConnection.model_validate(connection).model_dump()
+                if isinstance(connection, dict) and connection.get('type') == 'composio'
+                else connection
+                for connection in connections
+            ]
+        except ValidationError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    'Invalid Composio connection in imported config. Check its API key, connection ID, '
+                    'fixed API URL/path, and toolkit/tool policy. No configuration was changed.'
+                ),
+            ) from None
     await Config.upsert(form_data.config)
     await publish_event(
         request,
@@ -217,15 +240,45 @@ async def register_oauth_client(
 class ToolServerConnection(BaseModel):
     url: str
     path: str
-    type: str | None = 'openapi'  # openapi, mcp
+    type: str | None = 'openapi'  # openapi, mcp, composio
     auth_type: str | None
     forward_cookies: bool = False
     headers: dict | str | None = None
     key: str | None
     config: dict | None
     info: dict | None = None
+    composio: ComposioPolicy | None = None
 
     model_config = ConfigDict(extra='allow')
+
+    @model_validator(mode='after')
+    def validate_composio_connection(self):
+        if self.type != 'composio':
+            if self.composio is not None:
+                raise ValueError('Composio policy is only valid for Composio connections')
+            return self
+
+        if self.url != 'https://backend.composio.dev/api/v3.1' or self.path != 'tool_router/session':
+            raise ValueError('Composio connections must use the fixed API URL and path')
+        if self.auth_type != 'none':
+            raise ValueError('Composio connections must use auth_type none')
+        if self.forward_cookies:
+            raise ValueError('Composio connections cannot forward cookies')
+        has_custom_headers = bool(self.headers.strip()) if isinstance(self.headers, str) else bool(self.headers)
+        if has_custom_headers:
+            raise ValueError('Composio connections cannot use custom headers')
+        if not isinstance(self.key, str) or not self.key.strip():
+            raise ValueError('Composio API key cannot be blank')
+        self.key = self.key.strip()
+        if not isinstance(self.info, dict) or not isinstance(self.info.get('id'), str):
+            raise ValueError('Composio connection info.id is required')
+        server_id = self.info['id'].strip()
+        if not server_id or ':' in server_id or '|' in server_id:
+            raise ValueError('Composio connection info.id cannot be blank or contain ":" or "|"')
+        self.info['id'] = server_id
+        if self.composio is None:
+            raise ValueError('Composio policy is required')
+        return self
 
 
 class ToolServersConfigForm(BaseModel):
@@ -243,6 +296,10 @@ async def set_tool_servers_config(
     form_data: ToolServersConfigForm,
     user=Depends(get_admin_user),
 ):
+    connections = [
+        ToolServerConnection.model_validate(connection.model_dump()).model_dump()
+        for connection in form_data.TOOL_SERVER_CONNECTIONS
+    ]
     existing_connections = await Config.get('tool_server.connections', []) or []
     for connection in existing_connections:
         server_type = connection.get('type', 'openapi')
@@ -259,7 +316,6 @@ async def set_tool_servers_config(
                 pass
 
     # Set new tool server connections
-    connections = [connection.model_dump() for connection in form_data.TOOL_SERVER_CONNECTIONS]
     await Config.upsert({'tool_server.connections': connections})
 
     await set_tool_servers(request)
@@ -554,7 +610,53 @@ async def verify_tool_servers_config(request: Request, form_data: ToolServerConn
     Verify the connection to the tool server.
     """
     try:
-        if form_data.type == 'mcp':
+        if form_data.type == 'composio':
+            try:
+                connection = ToolServerConnection.model_validate(form_data.model_dump()).model_dump()
+            except Exception:
+                raise HTTPException(status_code=400, detail='Composio tool policy was rejected') from None
+
+            try:
+                session = await create_composio_session(connection, user.id, await Config.get('webui.url'))
+            except Exception as exc:
+                message = str(exc)
+                if message not in {
+                    'Configure the WebUI URL before using Composio',
+                    'Composio API rejected credentials',
+                    'Composio tool policy was rejected',
+                    'Composio is unavailable',
+                }:
+                    message = 'Composio is unavailable'
+                raise HTTPException(status_code=400, detail=message) from None
+
+            client = None
+            with composio_log_scope():
+                try:
+                    client = MCPClient()
+                    await client.connect(
+                        url=session['url'],
+                        headers=session['headers'],
+                        httpx_client_factory=create_composio_httpx_client,
+                    )
+                    specs = await client.list_tool_specs()
+                    specs = [
+                        spec
+                        for spec in specs
+                        if spec['name'] in session['allowed_tools']
+                        and (not spec['name'].startswith('COMPOSIO_') or spec['name'] == 'COMPOSIO_MANAGE_CONNECTIONS')
+                    ]
+                    if not any(spec['name'] == 'COMPOSIO_MANAGE_CONNECTIONS' for spec in specs):
+                        raise ValueError('Composio is unavailable')
+                    return {'status': True, 'composio': True, 'tool_count': len(specs)}
+                except Exception:
+                    raise HTTPException(status_code=400, detail='Composio is unavailable') from None
+                finally:
+                    if client is not None:
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            raise HTTPException(status_code=400, detail='Composio is unavailable') from None
+        elif form_data.type == 'mcp':
             if form_data.auth_type in ('oauth_2.1', 'oauth_2.1_static'):
                 oauth_server_url = (
                     form_data.info.get('oauth_server_url')

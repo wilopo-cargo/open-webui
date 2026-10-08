@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-10-08
+
+### Added
+
+- Administrator-owned Composio connections with configured toolkit policies and fresh sessions bound to each verified Open WebUI user. Employees authorize their own work accounts through in-chat Connect Links; native MCP and ERP authentication remain separate.
+- Configure shared connections in Admin → Settings → Integrations, select Composio, and supply a project API key. Leave a toolkit's allowed tool slugs blank to expose all app tools in that toolkit, subject to Composio auth-config execution restrictions and provider permissions/scopes; a nonempty list enables only those exact slugs. Wildcards are unsupported. Blank auth-config IDs use the Composio project's default configuration; scoped configurations are recommended. Set the persisted WebUI URL before verification. Keys follow existing administrator-only Config storage and are not encrypted at rest; exported connection files include the key and must remain private.
+- Verification checks credentials, callback configuration, and tool policy without executing tools or completing external-account consent. For broad Drive tool exposure, configure an approved auth configuration with the intended execution allowlist and OAuth scopes; leaving both execution allowlists empty does not enforce read-only access. Explicitly limiting the local list to `GOOGLEDRIVE_FIND_FILE`, `GOOGLEDRIVE_GET_FILE_METADATA`, and `GOOGLEDRIVE_GET_ABOUT` remains supported.
+
+### Fixed
+
+- Full-config imports validate Composio connections before saving any settings; invalid policies return actionable errors without exposing credentials or changing the previous configuration.
+- Empty Composio tool allowlists now accept the provider's uppercase toolkit catalog metadata and match it against configured lowercase toolkit slugs, preventing valid session/catalog responses from incorrectly reporting `Composio is unavailable`. Exact app-tool names, configured toolkit boundaries, and helper exclusions remain enforced.
+
 ## [0.11.4] - 2026-09-21
 
 ### Added
