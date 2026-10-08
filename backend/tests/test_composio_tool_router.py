@@ -2406,6 +2406,71 @@ async def test_open_toolkit_catalog_membership_controls_actual_chat_callables(
     assert client_class.instances[0].closed
 
 
+@pytest.mark.parametrize('surface', ['chat', 'admin-verify'])
+@pytest.mark.asyncio
+async def test_provider_uppercase_catalog_toolkits_match_lowercase_open_policy(
+    app_modules, monkeypatch, caplog, surface
+):
+    # Replay public metadata from the deployed provider's 200 catalog response.
+    # Its first item is a COMPOSIO helper, followed by uppercase Drive metadata.
+    catalog = {
+        'items': [
+            {'slug': 'COMPOSIO_MANAGE_CONNECTIONS', 'toolkit': {'slug': 'COMPOSIO', 'name': 'composio'}},
+            {'slug': 'GOOGLEDRIVE_ADD_PARENT', 'toolkit': {'slug': 'GOOGLEDRIVE', 'name': 'googledrive'}},
+            {'slug': 'GOOGLEDRIVE_ADD_PROPERTY', 'toolkit': {'slug': 'GOOGLEDRIVE', 'name': 'googledrive'}},
+            # Exercise reads and foreign/helper exclusions after provider parsing.
+            {'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {'slug': 'GoogleDrive', 'name': 'googledrive'}},
+            {'slug': 'GOOGLEDRIVE_FOREIGN', 'toolkit': {'slug': 'GitHub', 'name': 'googledrive'}},
+            {'slug': 'COMPOSIO_SEARCH_TOOLS', 'toolkit': {'slug': 'GOOGLEDRIVE', 'name': 'googledrive'}},
+        ],
+        'next_cursor': None, 'total_pages': 1, 'current_page': 1, 'total_items': 6,
+    }
+    allowed = {
+        'COMPOSIO_MANAGE_CONNECTIONS', 'GOOGLEDRIVE_ADD_PARENT', 'GOOGLEDRIVE_ADD_PROPERTY', 'GOOGLEDRIVE_FIND_FILE',
+    }
+    app_specs = [
+        {'name': item['slug'], 'description': item['slug'], 'parameters': {'type': 'object', 'properties': {}}}
+        for item in catalog['items']
+    ]
+    client_class = _in_process_mcp_client_class(app_specs=app_specs)
+    catalog_requests = []
+    requests = _install_user_bound_sessions(
+        monkeypatch, app_modules, client_class,
+        catalog_pages={None: catalog}, catalog_requests=catalog_requests,
+    )
+    user = _user('admin', role='admin') if surface == 'admin-verify' else _user('alice')
+    connection = _connection({'googledrive': {'tools': []}}, server_id='shared', grants=_user_read_grant(user.id))
+    request, _form, _metadata, _model = _prepare_chat_payload(
+        monkeypatch, app_modules, [connection], user, [], client_class=client_class
+    )
+    caplog.set_level(logging.DEBUG)
+    if surface == 'admin-verify':
+        monkeypatch.setattr(app_modules.configs, 'MCPClient', client_class)
+        result = await app_modules.configs.verify_tool_servers_config(
+            request, app_modules.configs.ToolServerConnection.model_validate(connection), user
+        )
+        assert result == {'status': True, 'composio': True, 'tool_count': len(allowed)}
+    else:
+        client, specs, session = await app_modules.middleware.connect_composio_server(request, 'shared', user)
+        assert session['allowed_toolkits'] == {'googledrive'}
+        assert session['allowed_tools'] == allowed
+        assert {spec['name'] for spec in specs} == allowed
+        read = app_modules.middleware._make_mcp_tool_function(client, 'GOOGLEDRIVE_FIND_FILE', session)
+        assert await read(query='shared document') == {'files': _PRIVATE_DOCUMENTS['alice']}
+        for slug in ('GOOGLEDRIVE_FOREIGN', 'COMPOSIO_SEARCH_TOOLS'):
+            forbidden = app_modules.middleware._make_mcp_tool_function(client, slug, session)
+            with pytest.raises(ValueError, match='^Composio tool policy was rejected$'):
+                await forbidden()
+        await app_modules.middleware.disconnect_mcp_clients({'server:composio:shared': client})
+    assert len(requests) == len(catalog_requests) == 1
+    assert all(client.closed for client in client_class.instances)
+    assert client_class.instances[0].calls == (
+        [] if surface == 'admin-verify' else [('GOOGLEDRIVE_FIND_FILE', {'query': 'shared document'})]
+    )
+    assert 'test-project-key' not in caplog.text
+    assert str(catalog_requests[0].url) not in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_open_toolkit_catalog_paginates_to_preload_ceiling_and_calls_late_page_tool(app_modules, monkeypatch):
     first = [
@@ -2449,7 +2514,7 @@ async def test_open_toolkit_catalog_paginates_to_preload_ceiling_and_calls_late_
         {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': 'googledrive'}]},
         {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {}}]},
         {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {'slug': None}}]},
-        {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {'slug': 'GoogleDrive'}}]},
+        {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {'slug': 'GOOGLEDRI\u212aE'}}]},
         {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {'slug': ' googledrive '}}]},
         {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {'slug': '*'}}]},
         {'items': [{'slug': None, 'toolkit': {'slug': 'googledrive'}}]},

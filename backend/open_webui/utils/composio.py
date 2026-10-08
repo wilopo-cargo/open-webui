@@ -220,6 +220,7 @@ def _check_composio_response(response: httpx.Response) -> None:
 
 async def _resolve_composio_tools(session_id: str, api_key: str, open_toolkits: set[str]) -> set[str]:
     # Membership comes from the bound session catalog, never a tool-name prefix.
+    # Provider toolkit metadata uses uppercase slugs; policies use lowercase.
     encoded_session_id = quote(session_id, safe='').replace('.', '%2E')
     url = f'https://backend.composio.dev/api/v3.1/tool_router/session/{encoded_session_id}/tools'
     allowed_tools = set()
@@ -250,12 +251,12 @@ async def _resolve_composio_tools(session_id: str, api_key: str, open_toolkits: 
                             or not re.fullmatch(r'[A-Z0-9_]+', slug, flags=re.ASCII)
                             or not isinstance(toolkit, dict)
                             or not isinstance(toolkit.get('slug'), str)
-                            or not re.fullmatch(r'[a-z0-9_-]+', toolkit['slug'], flags=re.ASCII)
+                            or not re.fullmatch(r'[A-Za-z0-9_-]+', toolkit['slug'], flags=re.ASCII)
                             or slug in seen_slugs
                         ):
                             raise ValueError
                         seen_slugs.add(slug)
-                        if toolkit['slug'] in open_toolkits and not slug.startswith('COMPOSIO_'):
+                        if toolkit['slug'].lower() in open_toolkits and not slug.startswith('COMPOSIO_'):
                             allowed_tools.add(slug)
                     cursor = result.get('next_cursor')
                     if cursor is None:

@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Full-config imports validate Composio connections before saving any settings; invalid policies return actionable errors without exposing credentials or changing the previous configuration.
+- Empty Composio tool allowlists now accept the provider's uppercase toolkit catalog metadata and match it against configured lowercase toolkit slugs, preventing valid session/catalog responses from incorrectly reporting `Composio is unavailable`. Exact app-tool names, configured toolkit boundaries, and helper exclusions remain enforced.
 
 ## [0.11.4] - 2026-09-21
 
