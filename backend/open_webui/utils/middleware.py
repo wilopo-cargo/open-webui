@@ -42,6 +42,7 @@ from open_webui.env import (
     ENABLE_QUERIES_CACHE,
     ENABLE_REALTIME_CHAT_SAVE,
     ENABLE_RESPONSES_API_STATEFUL,
+    ERP_MCP_SERVER_ID,
     GLOBAL_LOG_LEVEL,
     RAG_SYSTEM_CONTEXT,
 )
@@ -96,6 +97,7 @@ from open_webui.utils.composio import (
     validate_composio_connection_arguments,
 )
 from open_webui.utils.context_compaction import compact_messages_for_request
+from open_webui.utils.erp_mcp import bind_statement_reconcile_tool, validate_saved_mcp_url
 from open_webui.utils.files import (
     convert_markdown_base64_images,
     get_file_url_from_base64,
@@ -2345,6 +2347,57 @@ def sanitize_tool_pairs(messages: list[dict]) -> list[dict]:
     return sanitized
 
 
+async def _get_accessible_mcp_connection(server_id: str, user) -> dict | None:
+    for connection in await Config.get('tool_server.connections', []):
+        if connection.get('type', '') != 'mcp' or (connection.get('info') or {}).get('id') != server_id:
+            continue
+        if not await has_connection_access(user, connection):
+            log.warning(f'Access denied to MCP server {server_id} for user {user.id}')
+            return None
+        return connection
+    log.error(f'MCP server with id {server_id} not found')
+    return None
+
+
+def _validate_erp_mcp_connection(connection: dict, server_id: str) -> None:
+    if not ERP_MCP_SERVER_ID or server_id != ERP_MCP_SERVER_ID:
+        return
+    if connection.get('type') != 'mcp' or connection.get('auth_type') != 'oauth_2.1_static':
+        raise ValueError('ERP MCP server configuration is not enabled for static OAuth.')
+
+    configured_headers = connection.get('headers')
+    if isinstance(configured_headers, dict):
+        has_authorization = any(str(key).casefold() == 'authorization' for key in configured_headers)
+    elif isinstance(configured_headers, str) and configured_headers.strip():
+        try:
+            parsed_headers = JSONCodec.loads(configured_headers)
+        except Exception:
+            raise ValueError('ERP MCP server configuration has invalid custom headers.') from None
+        if not isinstance(parsed_headers, dict):
+            raise ValueError('ERP MCP server configuration has invalid custom headers.')
+        has_authorization = any(str(key).casefold() == 'authorization' for key in parsed_headers)
+    else:
+        has_authorization = False
+    if has_authorization:
+        raise ValueError('ERP MCP server configuration cannot override Authorization.')
+    try:
+        validate_saved_mcp_url(connection)
+    except ValueError:
+        raise ValueError('ERP MCP server configuration has an unsafe MCP URL.') from None
+
+
+async def _require_erp_mcp_oauth_token(request, user, server_id: str) -> None:
+    if not ERP_MCP_SERVER_ID or server_id != ERP_MCP_SERVER_ID:
+        return
+    try:
+        token = await request.app.state.oauth_client_manager.get_oauth_token(user.id, f'mcp:{server_id}')
+    except Exception:
+        raise ValueError('ERP authorization is unavailable; reconnect the ERP MCP server.') from None
+    access_token = token.get('access_token') if isinstance(token, dict) else None
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise ValueError('ERP authorization is unavailable; reconnect the ERP MCP server.')
+
+
 async def connect_mcp_server(
     request,
     server_id: str,
@@ -2356,19 +2409,12 @@ async def connect_mcp_server(
 
     Returns None if the server is not found or access is denied.
     """
-    mcp_server_connection = None
-    for server_connection in await Config.get('tool_server.connections', []):
-        if server_connection.get('type', '') == 'mcp' and (server_connection.get('info') or {}).get('id') == server_id:
-            mcp_server_connection = server_connection
-            break
-
+    mcp_server_connection = await _get_accessible_mcp_connection(server_id, user)
     if not mcp_server_connection:
-        log.error(f'MCP server with id {server_id} not found')
         return None
-
-    if not await has_connection_access(user, mcp_server_connection):
-        log.warning(f'Access denied to MCP server {server_id} for user {user.id}')
-        return None
+    if ERP_MCP_SERVER_ID and server_id == ERP_MCP_SERVER_ID:
+        _validate_erp_mcp_connection(mcp_server_connection, server_id)
+        await _require_erp_mcp_oauth_token(request, user, server_id)
 
     headers, _ = await build_tool_server_headers(
         mcp_server_connection,
@@ -3113,17 +3159,26 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     server_id = tool_id.split(':', 2)[2]
                     client_key = tool_id if is_composio else server_id
                     await ensure_unique_tool_names([client_key], mcp_clients)
+                    erp_connection = None
                     try:
                         if is_composio:
                             result = await connect_composio_server(request, server_id, user)
                         else:
-                            result = await connect_mcp_server(
-                                request,
-                                server_id,
-                                user,
-                                metadata,
-                                extra_params,
-                            )
+                            native_connection = await _get_accessible_mcp_connection(server_id, user)
+                            if native_connection is None:
+                                result = None
+                            else:
+                                is_erp_server = bool(ERP_MCP_SERVER_ID and server_id == ERP_MCP_SERVER_ID)
+                                if is_erp_server:
+                                    erp_connection = native_connection
+                                    _validate_erp_mcp_connection(native_connection, server_id)
+                                result = await connect_mcp_server(
+                                    request,
+                                    server_id,
+                                    user,
+                                    metadata,
+                                    extra_params,
+                                )
                     except Exception as e:
                         if is_composio:
                             error_content = str(e)
@@ -3165,9 +3220,20 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                             spec['description'] = f'{original_name}: {tool_spec.get("description") or ""}'
                             if is_manager:
                                 manager_name = function_name
+                        callable_ = _make_mcp_tool_function(client, original_name, session)
+                        if erp_connection is not None and original_name == 'statement_reconcile':
+                            spec, callable_ = await bind_statement_reconcile_tool(
+                                request,
+                                erp_connection,
+                                user,
+                                metadata.get('user_message'),
+                                spec,
+                                callable_,
+                                server_id,
+                            )
                         mcp_tools_dict[function_name] = {
                             'spec': spec,
-                            'callable': _make_mcp_tool_function(client, original_name, session),
+                            'callable': callable_,
                             'type': 'mcp',
                             'client': client,
                             'direct': False,

@@ -701,6 +701,7 @@ try:
     MCP_INITIALIZE_TIMEOUT = int(MCP_INITIALIZE_TIMEOUT)
 except (ValueError, TypeError):
     MCP_INITIALIZE_TIMEOUT = 10
+ERP_MCP_SERVER_ID = os.getenv('ERP_MCP_SERVER_ID', '').strip()
 
 
 ####################################
