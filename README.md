@@ -194,6 +194,16 @@ After installation, you can access Open WebUI at [http://localhost:3000](http://
 
 We offer various installation alternatives, including non-Docker native installation methods, Docker Compose, Kustomize, and Helm. Visit our [Open WebUI Documentation](https://docs.openwebui.com/getting-started/) or join our [Discord community](https://discord.gg/5rJgQTnV4s) for comprehensive guidance.
 
+### Native Wilopo ERP MCP
+
+This integration uses the companion ERP MCP service in `wilopo-cargo/wilopo-service` (`feat/erp-mcp-openwebui`). It is separate from Composio and from Open WebUI login.
+
+1. In Admin → Settings → Integrations, save a native MCP connection with a stable server ID, the ERP service's HTTPS URL ending exactly in `/mcp`, and **OAuth 2.1 (Static)** authentication. Supply the operator-registered client ID, client secret, OAuth server URL, and `erp.read` scope; grant connection access only to approved users or groups. Register the exact callback `<WEBUI_URL>/oauth/clients/mcp:<server-id>/callback` with the ERP OAuth client. Keep secrets and exported connection files private.
+2. Set `ERP_MCP_SERVER_ID` on the WebUI backend to that saved connection ID and restart it. An empty value leaves the ERP-specific bridge disabled. Do not configure an `Authorization` custom header: ERP requests require each user's own OAuth token, not a shared bearer token.
+3. Each user connects their own ERP account and selects the native integration in chat. For `statement_reconcile`, attach a saved CSV to the current user message. The bridge accepts only that user's owned current-turn CSV IDs, streams the original bytes to the saved ERP origin's `/uploads/statements` endpoint, and replaces the local ID with the returned ERP upload ID. Reconciliation returns a read-only proposal; it does not write ERP business records.
+
+Uploads are limited to 10 MiB, checked against stored file metadata and content hashes, and cached only within the bound turn by user and content. Foreign, shared-only, historical, temporary, non-CSV, and out-of-upload-directory references are rejected. HTTPS certificate verification remains enabled, redirects are refused, and upload responses are bounded and validated. Plain HTTP is allowed only for loopback development URLs. Finance reconciliation remains disabled until the ERP operator verifies the real account and currency configuration.
+
 ### Troubleshooting
 
 Encountering connection issues? Our [Open WebUI Documentation](https://docs.openwebui.com/troubleshooting/) has got you covered. For further assistance and to join our vibrant community, visit the [Open WebUI Discord](https://discord.gg/5rJgQTnV4s).

@@ -75,7 +75,7 @@ def app_modules():
     from open_webui import env
     from open_webui.internal import db
     from open_webui.routers import configs, tools
-    from open_webui.utils import composio, middleware
+    from open_webui.utils import composio, erp_mcp, middleware
 
     assert env.DATA_DIR.resolve() == _TEST_DATA_PATH
     assert env.DATABASE_URL == _TEST_ENV['DATABASE_URL']
@@ -86,7 +86,7 @@ def app_modules():
     assert Path(db.engine.url.database).resolve() == _TEST_DATA_PATH / 'test.db'
     assert Path(db.async_engine.url.database).resolve() == _TEST_DATA_PATH / 'test.db'
     try:
-        yield SimpleNamespace(configs=configs, composio=composio, middleware=middleware, tools=tools)
+        yield SimpleNamespace(configs=configs, composio=composio, erp_mcp=erp_mcp, middleware=middleware, tools=tools)
     finally:
         db.engine.dispose()
         _restore_test_environment()
@@ -2715,3 +2715,433 @@ async def test_resolved_open_callable_snapshot_cannot_be_broadened_or_rebound(ap
     })
     await app_modules.middleware.disconnect_mcp_clients({'server:composio:shared': client})
     assert client.closed
+
+
+@pytest.mark.asyncio
+async def test_erp_mcp_statement_reconcile_relays_owned_current_turn_bytes(
+    app_modules, monkeypatch
+):
+    import hashlib
+    from email.parser import BytesParser
+    from email.policy import default
+    from open_webui.utils.session_pool import close_session
+
+    statement = b'No. Rekening,=,1234567890\nNama,=,Fixture\nMata Uang,=,IDR\n'
+    statement += b'Tanggal,Keterangan,Cabang,Jumlah,,Saldo\n09/10/2026,fixture,000,100000.00,CR,100000.00\n'
+    statement += b'Saldo Awal,=,0.00\nKredit,=,100000.00\nDebet,=,0.00\nSaldo Akhir,=,100000.00\n'
+    remote_id = '11111111-1111-4111-8111-111111111111'
+    received = []
+
+    def read_body(handler):
+        if handler.headers.get('Transfer-Encoding', '').lower() == 'chunked':
+            chunks = []
+            while True:
+                size = int(handler.rfile.readline().split(b';', 1)[0], 16)
+                if size == 0:
+                    handler.rfile.readline()
+                    break
+                chunks.append(handler.rfile.read(size))
+                handler.rfile.read(2)
+            return b''.join(chunks)
+        return handler.rfile.read(int(handler.headers.get('Content-Length', '0')))
+
+    class Receiver(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):
+            assert self.path == '/uploads/statements'
+            body = read_body(self)
+            message = BytesParser(policy=default).parsebytes(
+                b'MIME-Version: 1.0\r\n' + f"Content-Type: {self.headers['Content-Type']}\r\n\r\n".encode() + body
+            )
+            part = next(part for part in message.walk() if part.get_content_disposition() == 'form-data')
+            received.append(
+                {
+                    'authorization': self.headers.get('Authorization'),
+                    'filename': part.get_filename(),
+                    'bytes': part.get_payload(decode=True),
+                }
+            )
+            payload = json.dumps(
+                {'file_id': remote_id, 'sha256': hashlib.sha256(statement).hexdigest(), 'expires_at': '2099-01-01T00:00:00Z'}
+            ).encode()
+            self.send_response(201)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Receiver)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        server_id = 'wilopo-erp'
+        file_id = 'web-file-1'
+        upload_path = Path(app_modules.erp_mcp.UPLOAD_DIR) / 'fixture-bank.csv'
+        upload_path.parent.mkdir(parents=True, exist_ok=True)
+        upload_path.write_bytes(statement)
+
+        class FileStore:
+            async def get_file_by_id_and_user_id(self, requested_id, user_id):
+                if requested_id != file_id or user_id != 'alice':
+                    return None
+                return SimpleNamespace(
+                    id=file_id,
+                    filename='fixture-bank.csv',
+                    path=str(upload_path),
+                    meta={'size': len(statement)},
+                )
+
+        class StorageStore:
+            @staticmethod
+            def get_file(path):
+                return path
+
+        monkeypatch.setattr(app_modules.erp_mcp, 'Files', FileStore())
+        monkeypatch.setattr(app_modules.erp_mcp, 'Storage', StorageStore())
+
+        class OAuthClientManager:
+            async def get_oauth_token(self, user_id, client_id):
+                assert user_id == 'alice'
+                assert client_id == f'mcp:{server_id}'
+                return {'access_token': 'erp-user-token'}
+
+        statement_spec = {
+            'name': 'statement_reconcile',
+            'description': 'Reconcile one statement.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'file_id': {'type': 'string'},
+                    'target_account_id': {'type': 'string'},
+                },
+                'required': ['file_id', 'target_account_id'],
+            },
+        }
+        base_client = _in_process_mcp_client_class(native_specs=[statement_spec])
+
+        class ERPClient(base_client):
+            async def connect(self, url, headers=None, *, httpx_client_factory=None):
+                self.url = url
+                self.headers = headers or {}
+                self.httpx_client_factory = httpx_client_factory
+                self.account_id = 'native'
+
+        connection = {
+            'type': 'mcp',
+            'url': f'http://127.0.0.1:{server.server_port}/mcp',
+            'path': '',
+            'auth_type': 'oauth_2.1_static',
+            'key': None,
+            'headers': {'X-ERP-Context': 'employee'},
+            'config': {'enable': True, 'access_grants': _user_read_grant('alice')},
+            'info': {'id': server_id, 'name': 'ERP'},
+        }
+        user = _user('alice')
+        request, form_data, metadata, model = _prepare_chat_payload(
+            monkeypatch,
+            app_modules,
+            [connection],
+            user,
+            [f'server:mcp:{server_id}'],
+            hostile_metadata={'user_message': {'files': [{'type': 'file', 'id': file_id}]}},
+            client_class=ERPClient,
+        )
+        request.app.state.oauth_client_manager = OAuthClientManager()
+        monkeypatch.setattr(app_modules.middleware, 'ERP_MCP_SERVER_ID', server_id)
+        await app_modules.middleware.process_chat_payload(request, form_data, user, metadata, model)
+
+        tool = metadata['tools'][f'{server_id}_statement_reconcile']
+        assert file_id in tool['spec']['description']
+        assert 'fixture-bank.csv' in tool['spec']['description']
+        result = await tool['callable'](file_id=file_id, target_account_id='account-1')
+        assert result == {'provider': 'native', 'tool': 'statement_reconcile'}
+        second_result = await tool['callable'](file_id=file_id, target_account_id='account-1')
+        assert second_result == {'provider': 'native', 'tool': 'statement_reconcile'}
+        assert received == [
+            {
+                'authorization': 'Bearer erp-user-token',
+                'filename': 'fixture-bank.csv',
+                'bytes': statement,
+            }
+        ]
+        assert hashlib.sha256(received[0]['bytes']).hexdigest() == hashlib.sha256(statement).hexdigest()
+        assert ERPClient.instances[0].calls == [
+            ('statement_reconcile', {'file_id': remote_id, 'target_account_id': 'account-1'}),
+            ('statement_reconcile', {'file_id': remote_id, 'target_account_id': 'account-1'}),
+        ]
+    finally:
+        await close_session()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    'case', ['foreign', 'shared', 'stale', 'temporary', 'non_csv', 'filesystem', 'oversize', 'actual_oversize']
+)
+@pytest.mark.asyncio
+async def test_erp_mcp_statement_reconcile_rejects_untrusted_attachment_references(
+    app_modules, monkeypatch, case
+):
+    server_id = 'wilopo-erp'
+    requested_id = f'{case}-file'
+    current_id = 'current-file'
+    upload_dir = Path(app_modules.erp_mcp.UPLOAD_DIR)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    valid_path = upload_dir / f'{case}-fixture.csv'
+    valid_path.write_bytes(b'fixture,csv\n')
+    rows = {
+        current_id: SimpleNamespace(
+            id=current_id,
+            filename='current.csv',
+            path=str(valid_path),
+            meta={'size': valid_path.stat().st_size},
+        ),
+        requested_id: SimpleNamespace(
+            id=requested_id,
+            filename='requested.csv',
+            path=str(valid_path),
+            meta={'size': valid_path.stat().st_size},
+        ),
+    }
+    if case == 'non_csv':
+        rows[current_id].filename = 'statement.txt'
+    elif case == 'filesystem':
+        rows[current_id].path = str(Path(app_modules.erp_mcp.__file__).resolve())
+    elif case == 'oversize':
+        rows[current_id].meta = {'size': 10 * 1024 * 1024 + 1}
+    elif case == 'actual_oversize':
+        valid_path.write_bytes(b'x' * (10 * 1024 * 1024 + 1))
+        rows[current_id].meta = {'size': valid_path.stat().st_size}
+
+    class FileStore:
+        async def get_file_by_id_and_user_id(self, file_id, user_id):
+            if user_id != 'alice' or case in {'foreign', 'shared'}:
+                return None
+            return rows.get(file_id)
+
+    class StorageStore:
+        @staticmethod
+        def get_file(path):
+            return path
+
+    monkeypatch.setattr(app_modules.erp_mcp, 'Files', FileStore())
+    monkeypatch.setattr(app_modules.erp_mcp, 'Storage', StorageStore())
+
+    async def forbidden_session():
+        raise AssertionError('untrusted attachment must not reach the upload session')
+
+    monkeypatch.setattr(app_modules.erp_mcp, 'get_session', forbidden_session)
+
+    class OAuthClientManager:
+        async def get_oauth_token(self, _user_id, _client_id):
+            return {'access_token': 'erp-user-token'}
+
+    statement_spec = {
+        'name': 'statement_reconcile',
+        'description': 'Reconcile one statement.',
+        'parameters': {
+            'type': 'object',
+            'properties': {'file_id': {'type': 'string'}, 'target_account_id': {'type': 'string'}},
+        },
+    }
+    base_client = _in_process_mcp_client_class(native_specs=[statement_spec])
+
+    class ERPClient(base_client):
+        async def connect(self, url, headers=None, *, httpx_client_factory=None):
+            self.url = url
+            self.headers = headers or {}
+            self.httpx_client_factory = httpx_client_factory
+            self.account_id = 'native'
+
+    connection = {
+        'type': 'mcp',
+        'url': 'http://127.0.0.1:9/mcp',
+        'path': '',
+        'auth_type': 'oauth_2.1_static',
+        'key': None,
+        'headers': None,
+        'config': {'enable': True, 'access_grants': _user_read_grant('alice')},
+        'info': {'id': server_id, 'name': 'ERP'},
+    }
+    invocation_id = requested_id if case in {'foreign', 'shared', 'stale'} else current_id
+    user_message = {
+        'files': (
+            [{'type': 'text', 'id': current_id}]
+            if case == 'temporary'
+            else [{'type': 'file', 'id': current_id}]
+        )
+    }
+    request, form_data, metadata, model = _prepare_chat_payload(
+        monkeypatch,
+        app_modules,
+        [connection],
+        _user('alice'),
+        [f'server:mcp:{server_id}'],
+        hostile_metadata={'user_message': user_message},
+        client_class=ERPClient,
+    )
+    request.app.state.oauth_client_manager = OAuthClientManager()
+    monkeypatch.setattr(app_modules.middleware, 'ERP_MCP_SERVER_ID', server_id)
+    await app_modules.middleware.process_chat_payload(request, form_data, _user('alice'), metadata, model)
+
+    tool = metadata['tools'][f'{server_id}_statement_reconcile']
+    assert invocation_id not in tool['spec']['description']
+    with pytest.raises(ValueError, match='current-turn CSV attachment'):
+        await tool['callable'](file_id=invocation_id, target_account_id='account-1')
+    assert ERPClient.instances[0].calls == []
+
+
+@pytest.mark.parametrize(
+    ('auth_type', 'headers'),
+    [
+        ('none', None),
+        ('oauth_2.1', None),
+        ('oauth_2.1_static', {'aUtHoRiZaTiOn': 'shared-token'}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_erp_mcp_connection_rejects_non_static_or_authorization_override(
+    app_modules, monkeypatch, auth_type, headers
+):
+    server_id = 'wilopo-erp'
+    connection = {
+        'type': 'mcp',
+        'url': 'http://127.0.0.1:9/mcp',
+        'path': '',
+        'auth_type': auth_type,
+        'key': None,
+        'headers': headers,
+        'config': {'enable': True, 'access_grants': _user_read_grant('alice')},
+        'info': {'id': server_id, 'name': 'ERP'},
+    }
+    client_class = _in_process_mcp_client_class()
+    request, _form, metadata, _model = _prepare_chat_payload(
+        monkeypatch,
+        app_modules,
+        [connection],
+        _user('alice'),
+        [f'server:mcp:{server_id}'],
+        client_class=client_class,
+    )
+    monkeypatch.setattr(app_modules.middleware, 'ERP_MCP_SERVER_ID', server_id)
+    with pytest.raises(ValueError, match='ERP MCP server configuration'):
+        await app_modules.middleware.connect_mcp_server(request, server_id, _user('alice'), metadata, {})
+    assert client_class.instances == []
+
+
+@pytest.mark.parametrize('failure', ['missing-token', 'redirect', 'oversize-response', 'invalid-response'])
+@pytest.mark.asyncio
+async def test_erp_mcp_statement_reconcile_blocks_relay_failures(
+    app_modules, monkeypatch, failure
+):
+    from open_webui.utils.session_pool import close_session
+
+    statement = b'No. Rekening,=,123\nNama,=,Fixture\nMata Uang,=,IDR\n'
+    statement_path = Path(app_modules.erp_mcp.UPLOAD_DIR) / f'{failure}.csv'
+    statement_path.parent.mkdir(parents=True, exist_ok=True)
+    statement_path.write_bytes(statement)
+    received_paths = []
+
+    def consume_body(handler):
+        if handler.headers.get('Transfer-Encoding', '').lower() == 'chunked':
+            while True:
+                size = int(handler.rfile.readline().split(b';', 1)[0], 16)
+                if size == 0:
+                    handler.rfile.readline()
+                    return
+                handler.rfile.read(size)
+                handler.rfile.read(2)
+        else:
+            handler.rfile.read(int(handler.headers.get('Content-Length', '0')))
+
+    class Receiver(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):
+            received_paths.append(self.path)
+            consume_body(self)
+            if failure == 'redirect':
+                self.send_response(302)
+                self.send_header('Location', '/uploads/statements/redirected')
+                self.end_headers()
+                return
+            body = (
+                b'x' * (app_modules.erp_mcp.MAX_UPLOAD_RESPONSE_BYTES + 1)
+                if failure == 'oversize-response'
+                else (b'{"file_id":"not-a-uuid"}' if failure == 'invalid-response' else b'{}')
+            )
+            self.send_response(201)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Receiver)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        file_id = 'relay-failure-file'
+
+        class FileStore:
+            async def get_file_by_id_and_user_id(self, requested_id, user_id):
+                if requested_id != file_id or user_id != 'alice':
+                    return None
+                return SimpleNamespace(
+                    id=file_id,
+                    filename='statement.csv',
+                    path=str(statement_path),
+                    meta={'size': len(statement)},
+                )
+
+        class StorageStore:
+            @staticmethod
+            def get_file(path):
+                return path
+
+        monkeypatch.setattr(app_modules.erp_mcp, 'Files', FileStore())
+        monkeypatch.setattr(app_modules.erp_mcp, 'Storage', StorageStore())
+
+        class OAuthClientManager:
+            async def get_oauth_token(self, _user_id, _client_id):
+                return None if failure == 'missing-token' else {'access_token': 'erp-user-token'}
+
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(oauth_client_manager=OAuthClientManager()))
+        )
+        calls = []
+
+        async def delegate(**kwargs):
+            calls.append(kwargs)
+            return {'unexpected': True}
+
+        spec, callable_ = await app_modules.erp_mcp.bind_statement_reconcile_tool(
+            request,
+            {
+                'type': 'mcp',
+                'url': f'http://127.0.0.1:{server.server_port}/mcp',
+                'auth_type': 'oauth_2.1_static',
+            },
+            _user('alice'),
+            {'files': [{'type': 'file', 'id': file_id}]},
+            {
+                'name': 'wilopo-erp_statement_reconcile',
+                'description': 'Reconcile.',
+                'parameters': {'type': 'object', 'properties': {'file_id': {'type': 'string'}}},
+            },
+            delegate,
+            'wilopo-erp',
+        )
+        assert file_id in spec['description']
+        with pytest.raises(ValueError):
+            await callable_(file_id=file_id, target_account_id='account-1')
+        assert calls == []
+        assert received_paths == ([] if failure == 'missing-token' else ['/uploads/statements'])
+    finally:
+        await close_session()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
