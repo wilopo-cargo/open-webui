@@ -4,7 +4,7 @@ Production deployment is an explicit, manually published GitHub Release: publish
 
 ## CI image publishing
 
-The `.github/workflows/docker.yaml` workflow builds one standard `linux/amd64` image on `ubuntu-latest` and publishes it only to `ghcr.io/wilopo-cargo/open-webui`, with branch/release tags and immutable `git-<commit-sha>` tags. ARM, CUDA, Ollama, and slim variants are not built. PyPI and Docker Hub publishing are not enabled for this fork.
+The `.github/workflows/docker.yaml` workflow builds one standard `linux/amd64` image on `ubuntu-latest` and publishes it only to `ghcr.io/wilopo-cargo/open-webui`, with branch/release tags and immutable `git-<commit-sha>` tags. ARM, CUDA, Ollama, and slim variants are not built. PyPI and Docker Hub publishing are not enabled for this fork. Helm chart notifications are not used by the Docker Compose deployment; no Helm-specific GitHub App credentials are required.
 
 The Docker frontend build uses an 8 GiB V8 heap, matching frontend CI. For pre-merge verification, dispatch `docker.yaml` on a feature branch; it builds and publishes that branch's image without triggering a production deployment.
 
