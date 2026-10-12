@@ -1,0 +1,280 @@
+name: Production deployment
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: open-webui-production
+  cancel-in-progress: false
+
+jobs:
+  resolve-release:
+    if: github.repository == 'wilopo-cargo/open-webui' && startsWith(github.event.release.tag_name, 'release-production-') && github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    outputs:
+      image_sha: ${{ steps.resolve.outputs.image_sha }}
+    steps:
+      - name: Checkout exact published release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - id: resolve
+        name: Resolve immutable source revision
+        run: |
+          set -euo pipefail
+          printf 'image_sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  prepare-matrix:
+    needs: resolve-release
+    if: github.repository == 'wilopo-cargo/open-webui' && startsWith(github.event.release.tag_name, 'release-production-') && github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      credentials_sha: ${{ steps.credentials.outputs.credentials_sha }}
+    steps:
+      - name: Validate production GitHub App configuration
+        env:
+          APP_ID: ${{ vars.CREDENTIALS_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CREDENTIALS_APP_PRIVATE_KEY }}
+          GPG_SECRET_PASSPHRASE: ${{ secrets.GPG_SECRET_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "$APP_ID" || { echo 'production variable CREDENTIALS_APP_ID is required'; exit 1; }
+          test -n "$APP_PRIVATE_KEY" || { echo 'production secret CREDENTIALS_APP_PRIVATE_KEY is required'; exit 1; }
+          test -n "$GPG_SECRET_PASSPHRASE" || { echo 'production secret GPG_SECRET_PASSPHRASE is required'; exit 1; }
+      - name: Create credentials repository token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.CREDENTIALS_APP_ID }}
+          private-key: ${{ secrets.CREDENTIALS_APP_PRIVATE_KEY }}
+          owner: wilopo-cargo
+          repositories: wilopo-credentials
+          permission-contents: read
+      - name: Checkout credentials repository
+        uses: actions/checkout@v4
+        with:
+          repository: wilopo-cargo/wilopo-credentials
+          token: ${{ steps.app-token.outputs.token }}
+          path: credentials
+          fetch-depth: 1
+          persist-credentials: false
+      - id: credentials
+        name: Pin credentials revision for all matrix consumers
+        working-directory: credentials
+        run: printf 'credentials_sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Decrypt deployment server matrix
+        env:
+          GPG_SECRET_PASSPHRASE: ${{ secrets.GPG_SECRET_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$GPG_SECRET_PASSPHRASE" | gpg --quiet --batch --no-tty --pinentry-mode loopback \
+            --passphrase-fd 0 --decrypt --output "$RUNNER_TEMP/servers.json" \
+            credentials/open-webui/production-servers-matrix.json.gpg
+      - id: matrix
+        name: Validate and export safe deployment matrix
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/servers.json" "$GITHUB_OUTPUT" <<'PY'
+          import ipaddress, json, re, sys
+          from pathlib import PurePosixPath
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              servers = json.load(f)
+          if not isinstance(servers, list) or not servers:
+              raise SystemExit("deployment matrix must be a nonempty array")
+          required = {"region", "ip", "username", "key", "port", "path", "fingerprint"}
+          seen_paths = set()
+          seen_regions = set()
+          for server in servers:
+              if not isinstance(server, dict) or set(server) != required:
+                  raise SystemExit("each server must contain exactly region, ip, username, key, port, path, fingerprint")
+              checks = (
+                  ("region", r"[a-z0-9][a-z0-9-]{0,31}"),
+                  ("username", r"[A-Za-z_][A-Za-z0-9_-]{0,31}"),
+                  ("key", r"[A-Z_][A-Z0-9_]{0,127}"),
+                  ("fingerprint", r"SHA256:[A-Za-z0-9+/]{43}=?"),
+              )
+              for field, pattern in checks:
+                  if not isinstance(server[field], str) or not re.fullmatch(pattern, server[field]):
+                      raise SystemExit(f"invalid {field} in deployment matrix")
+              endpoint = server["ip"]
+              if not isinstance(endpoint, str):
+                  raise SystemExit("invalid ip in deployment matrix")
+              try:
+                  if ipaddress.ip_address(endpoint).version != 4:
+                      raise SystemExit("deployment targets must use IPv4 or DNS hostnames")
+              except ValueError:
+                  if not re.fullmatch(r"(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*", endpoint):
+                      raise SystemExit("invalid ip in deployment matrix")
+              port = server["port"]
+              if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                  raise SystemExit("invalid SSH port in deployment matrix")
+              region = server["region"]
+              path = server["path"]
+              if (not isinstance(path, str) or not path.startswith("/") or "\\" in path
+                      or any(part in {"", ".", ".."} for part in path.split("/")[1:])
+                      or not re.fullmatch(r"/[A-Za-z0-9._/-]+", path)
+                      or not path.endswith("/open-webui") or "wilopo-service" in path):
+                  raise SystemExit("server path must be a dedicated safe absolute path ending /open-webui")
+              normalized_path = str(PurePosixPath(path))
+              if path == "/open-webui" or normalized_path in seen_paths or region in seen_regions:
+                  raise SystemExit("deployment regions and paths must be distinct dedicated directories")
+              seen_paths.add(normalized_path)
+              seen_regions.add(region)
+          with open(sys.argv[2], "w", encoding="utf-8") as out:
+              out.write("matrix=" + json.dumps(servers, separators=(",", ":")) + "\n")
+          PY
+
+  build-image:
+    needs: resolve-release
+    if: github.repository == 'wilopo-cargo/open-webui' && startsWith(github.event.release.tag_name, 'release-production-') && github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact published release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-release.outputs.image_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and publish immutable production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/wilopo-cargo/open-webui:${{ needs.resolve-release.outputs.image_sha }}
+          cache-from: type=registry,ref=ghcr.io/wilopo-cargo/open-webui:production-buildcache
+          cache-to: type=registry,ref=ghcr.io/wilopo-cargo/open-webui:production-buildcache,mode=max
+          build-args: BUILD_HASH=${{ needs.resolve-release.outputs.image_sha }}
+
+  deploy-production:
+    needs: [resolve-release, prepare-matrix, build-image]
+    if: github.repository == 'wilopo-cargo/open-webui' && startsWith(github.event.release.tag_name, 'release-production-') && github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    environment: production
+    strategy:
+      fail-fast: false
+      matrix:
+        server: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    env:
+      GPG_SECRET_PASSPHRASE: ${{ secrets.GPG_SECRET_PASSPHRASE }}
+      GITHUB_TOKEN: ${{ github.token }}
+      IMAGE_REPO: ghcr.io/wilopo-cargo/open-webui
+      IMAGE_SHA: ${{ needs.resolve-release.outputs.image_sha }}
+    steps:
+      - name: Checkout exact published release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-release.outputs.image_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate credentials access configuration
+        env:
+          APP_ID: ${{ vars.CREDENTIALS_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CREDENTIALS_APP_PRIVATE_KEY }}
+          DEPLOY_KEY: ${{ secrets[matrix.server.key] }}
+        run: |
+          set -euo pipefail
+          test -n "$APP_ID" || { echo 'production variable CREDENTIALS_APP_ID is required'; exit 1; }
+          test -n "$APP_PRIVATE_KEY" || { echo 'production secret CREDENTIALS_APP_PRIVATE_KEY is required'; exit 1; }
+          test -n "$GPG_SECRET_PASSPHRASE" || { echo 'production secret GPG_SECRET_PASSPHRASE is required'; exit 1; }
+          test -n "$DEPLOY_KEY" || { echo 'SSH key named by the production server matrix is missing'; exit 1; }
+      - name: Create credentials repository token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.CREDENTIALS_APP_ID }}
+          private-key: ${{ secrets.CREDENTIALS_APP_PRIVATE_KEY }}
+          owner: wilopo-cargo
+          repositories: wilopo-credentials
+          permission-contents: read
+      - name: Checkout pinned credentials revision
+        uses: actions/checkout@v4
+        with:
+          repository: wilopo-cargo/wilopo-credentials
+          ref: ${{ needs.prepare-matrix.outputs.credentials_sha }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: credentials
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Stage encrypted server environment
+        env:
+          REGION: ${{ matrix.server.region }}
+        run: |
+          set -euo pipefail
+          source="credentials/open-webui/${REGION}.production.env.gpg"
+          test -f "$source" || { echo "Missing encrypted production environment for region ${REGION}"; exit 1; }
+          cp "$source" deployment/.env.gpg
+          chmod 0600 deployment/.env.gpg
+      - name: Create dedicated deployment directory
+        uses: appleboy/ssh-action@v1.1.0
+        env:
+          DEPLOY_PATH: ${{ matrix.server.path }}
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets[matrix.server.key] }}
+          port: ${{ matrix.server.port }}
+          fingerprint: ${{ matrix.server.fingerprint }}
+          envs: DEPLOY_PATH
+          script: |
+            set -euo pipefail
+            mkdir -p -- "$DEPLOY_PATH"
+      - name: Copy deployment files with pinned SSH host key
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets[matrix.server.key] }}
+          port: ${{ matrix.server.port }}
+          fingerprint: ${{ matrix.server.fingerprint }}
+          source: deployment/docker-compose.yml,deployment/deploy.sh
+          target: ${{ matrix.server.path }}/
+          strip_components: 1
+      - name: Copy encrypted runtime environment
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets[matrix.server.key] }}
+          port: ${{ matrix.server.port }}
+          fingerprint: ${{ matrix.server.fingerprint }}
+          source: deployment/.env.gpg
+          target: ${{ matrix.server.path }}/
+          strip_components: 1
+      - name: Remove runner-side encrypted environment copy
+        if: always()
+        run: rm -f -- deployment/.env.gpg
+      - name: Deploy pinned image
+        uses: appleboy/ssh-action@v1.1.0
+        env:
+          DEPLOY_PATH: ${{ matrix.server.path }}
+          GPG_SECRET_PASSPHRASE: ${{ secrets.GPG_SECRET_PASSPHRASE }}
+          GITHUB_TOKEN: ${{ github.token }}
+          IMAGE_REPO: ghcr.io/wilopo-cargo/open-webui
+          IMAGE_SHA: ${{ needs.resolve-release.outputs.image_sha }}
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets[matrix.server.key] }}
+          port: ${{ matrix.server.port }}
+          fingerprint: ${{ matrix.server.fingerprint }}
+          envs: DEPLOY_PATH,GPG_SECRET_PASSPHRASE,GITHUB_TOKEN,IMAGE_REPO,IMAGE_SHA
+          script: |
+            set -euo pipefail
+            cd -- "$DEPLOY_PATH"
+            bash ./deploy.sh

@@ -248,6 +248,10 @@ If you have any questions, suggestions, or need assistance, please open an issue
 
 If you believe you've found a security vulnerability, or something that shouldn't be disclosed publicly, please [reach out confidentially through our responsible disclosure program on GitHub](https://github.com/open-webui/open-webui/security). We accept reports only through GitHub, not through any other platform. Thank you for helping us keep Open WebUI secure!
 
+## Wilopo production deployment
+
+Deployment prerequisites, GitHub configuration, server setup, recovery behavior, and a safe smoke plan are documented in [`deployment/README.md`](deployment/README.md).
+
 ## Star History
 
 <a href="https://star-history.com/#open-webui/open-webui&Date">

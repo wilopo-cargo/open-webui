@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configure shared connections in Admin → Settings → Integrations, select Composio, and supply a project API key. Leave a toolkit's allowed tool slugs blank to expose all app tools in that toolkit, subject to Composio auth-config execution restrictions and provider permissions/scopes; a nonempty list enables only those exact slugs. Wildcards are unsupported. Blank auth-config IDs use the Composio project's default configuration; scoped configurations are recommended. Set the persisted WebUI URL before verification. Keys follow existing administrator-only Config storage and are not encrypted at rest; exported connection files include the key and must remain private.
 - Verification checks credentials, callback configuration, and tool policy without executing tools or completing external-account consent. For broad Drive tool exposure, configure an approved auth configuration with the intended execution allowlist and OAuth scopes; leaving both execution allowlists empty does not enforce read-only access. Explicitly limiting the local list to `GOOGLEDRIVE_FIND_FILE`, `GOOGLEDRIVE_GET_FILE_METADATA`, and `GOOGLEDRIVE_GET_ABOUT` remains supported.
 
+- Production-only GitHub Actions deployment for published `release-production-*` releases, using immutable commit-SHA images, encrypted per-region configuration, pinned SSH host keys, and a dedicated single-app Compose deployment. Setup and recovery prerequisites are documented in [`deployment/README.md`](deployment/README.md).
+- Production deployment uses the native `PORT` runtime setting, defaulting to `8081`; `PORT=8082` configures the listener, Traefik backend, and health checks together.
+
 ### Fixed
 
 - Full-config imports validate Composio connections before saving any settings; invalid policies return actionable errors without exposing credentials or changing the previous configuration.
