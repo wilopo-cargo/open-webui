@@ -60,9 +60,7 @@
 		authConfigId: string;
 	};
 	let composioKey = '';
-	let composioToolkitRows: ComposioToolkitRow[] = [
-		{ toolkit: '', tools: '', authConfigId: '' }
-	];
+	let composioToolkitRows: ComposioToolkitRow[] = [{ toolkit: '', tools: '', authConfigId: '' }];
 	let verifyingComposio = false;
 	const composioUrl = 'https://backend.composio.dev/api/v3.1';
 	const composioPath = 'tool_router/session';
@@ -131,7 +129,9 @@
 
 		const connectionId = typeof values.info?.id === 'string' ? values.info.id.trim() : '';
 		if (!connectionId || connectionId.includes(':') || connectionId.includes('|')) {
-			return composioValidationError('Composio requires a nonblank ID without ":" or "|" characters');
+			return composioValidationError(
+				'Composio requires a nonblank ID without ":" or "|" characters'
+			);
 		}
 		const apiKey = typeof values.key === 'string' ? values.key.trim() : '';
 		if (!apiKey) {
@@ -154,7 +154,14 @@
 			if (toolkit in toolkits) {
 				return composioValidationError('Duplicate toolkit slugs are not allowed');
 			}
-			const tools = [...new Set(row.tools.split(/[\n,]/).map((tool) => tool.trim()).filter(Boolean))];
+			const tools = [
+				...new Set(
+					row.tools
+						.split(/[\n,]/)
+						.map((tool) => tool.trim())
+						.filter(Boolean)
+				)
+			];
 			if (tools.some((tool) => !/^[A-Z0-9_]+$/.test(tool))) {
 				return composioValidationError(
 					'Allowed tool slugs must use uppercase ASCII letters, digits, or underscores; wildcards are not allowed'
@@ -513,31 +520,36 @@
 
 	const exportHandler = async () => {
 		// export current connection as json file
-		const exported = type === 'composio' ? getComposioConnection() : {
-				type,
-				url,
+		const exported =
+			type === 'composio'
+				? getComposioConnection()
+				: {
+						type,
+						url,
 
-				spec_type,
-				spec,
-				path,
+						spec_type,
+						spec,
+						path,
 
-				auth_type,
-				...(!direct && ['', 'openapi'].includes(type) ? { forward_cookies: forwardCookies } : {}),
-				headers: headers ? JSON.parse(headers) : undefined,
-				key,
+						auth_type,
+						...(!direct && ['', 'openapi'].includes(type)
+							? { forward_cookies: forwardCookies }
+							: {}),
+						headers: headers ? JSON.parse(headers) : undefined,
+						key,
 
-				info: {
-					id: id,
-					name: name,
-					description: description,
-					...(type === 'mcp' && ['oauth_2.1', 'oauth_2.1_static'].includes(auth_type)
-						? {
-								...(oauthScope ? { oauth_scope: oauthScope } : {}),
-								oauth_resource_parameter: oauthResourceParameter
-							}
-						: {})
-				}
-		};
+						info: {
+							id: id,
+							name: name,
+							description: description,
+							...(type === 'mcp' && ['oauth_2.1', 'oauth_2.1_static'].includes(auth_type)
+								? {
+										...(oauthScope ? { oauth_scope: oauthScope } : {}),
+										oauth_resource_parameter: oauthResourceParameter
+									}
+								: {})
+						}
+					};
 		if (!exported) return;
 		const json = JSON.stringify([exported]);
 
@@ -665,8 +677,8 @@
 		auth_type = value?.auth_type ?? 'bearer';
 		forwardCookies = value?.forward_cookies ?? false;
 		headers = value?.headers ? JSON.stringify(value.headers, null, 2) : '';
-		key = value?.type === 'composio' ? '' : value?.key ?? '';
-		composioKey = value?.type === 'composio' ? value?.key ?? '' : '';
+		key = value?.type === 'composio' ? '' : (value?.key ?? '');
+		composioKey = value?.type === 'composio' ? (value?.key ?? '') : '';
 		composioToolkitRows = [{ toolkit: '', tools: '', authConfigId: '' }];
 		if (value?.type === 'composio') {
 			try {
@@ -693,7 +705,6 @@
 	$: if (show) {
 		init(direct && connection?.type === 'composio' ? null : connection);
 	}
-
 </script>
 
 <Modal size="sm" bind:show>
@@ -865,7 +876,9 @@
 								</p>
 
 								{#each composioToolkitRows as row, index}
-									<div class="flex flex-col gap-2 rounded-lg border border-gray-100 dark:border-gray-800 p-2">
+									<div
+										class="flex flex-col gap-2 rounded-lg border border-gray-100 dark:border-gray-800 p-2"
+									>
 										<div class="flex items-center justify-between gap-2">
 											<label for={`composio-toolkit-${index}`} class="text-xs text-gray-500">
 												{$i18n.t('Toolkit slug')}
@@ -958,217 +971,220 @@
 								</p>
 							</div>
 						{:else}
-						<div class="flex gap-2">
-							<div class="flex flex-col w-full">
-								<div class="flex justify-between mb-0.5">
-									<label for="api-base-url" class={`text-xs text-gray-500`}>{$i18n.t('URL')}</label>
-								</div>
-
-								<div class="flex flex-1 items-center">
-									<input
-										id="api-base-url"
-										class={`w-full flex-1 text-sm ${inputClass}`}
-										type="text"
-										bind:value={url}
-										placeholder={$i18n.t('API Base URL')}
-										autocomplete="off"
-										required
-									/>
-
-									<Tooltip content={verifyLabel()} className="shrink-0 flex items-center mr-1">
-										<button
-											class="self-center p-1 bg-transparent hover:bg-gray-100 dark:hover:bg-gray-850 rounded-lg transition"
-											on:click={() => {
-												verifyHandler();
-											}}
-											aria-label={verifyLabel()}
-											type="button"
+							<div class="flex gap-2">
+								<div class="flex flex-col w-full">
+									<div class="flex justify-between mb-0.5">
+										<label for="api-base-url" class={`text-xs text-gray-500`}
+											>{$i18n.t('URL')}</label
 										>
-											<svg
-												xmlns="http://www.w3.org/2000/svg"
-												viewBox="0 0 20 20"
-												fill="currentColor"
-												class="w-4 h-4"
-												aria-hidden="true"
-											>
-												<path
-													fill-rule="evenodd"
-													d="M15.312 11.424a5.5 5.5 0 01-9.201 2.466l-.312-.311h2.433a.75.75 0 000-1.5H3.989a.75.75 0 00-.75.75v4.242a.75.75 0 001.5 0v-2.43l.31.31a7 7 0 0011.712-3.138.75.75 0 00-1.449-.39zm1.23-3.723a.75.75 0 00.219-.53V2.929a.75.75 0 00-1.5 0V5.36l-.31-.31A7 7 0 003.239 8.188a.75.75 0 101.448.389A5.5 5.5 0 0113.89 6.11l.311.31h-2.432a.75.75 0 000 1.5h4.243a.75.75 0 00.53-.219z"
-													clip-rule="evenodd"
-												/>
-											</svg>
-										</button>
-									</Tooltip>
-
-									<Tooltip content={enable ? $i18n.t('Enabled') : $i18n.t('Disabled')}>
-										<Switch bind:state={enable} />
-									</Tooltip>
-								</div>
-							</div>
-						</div>
-
-						<div class="flex gap-2 mt-2">
-							<div class="flex flex-col w-full">
-								<div class="flex justify-between items-center">
-									<div class="flex gap-2 items-center">
-										<div for="select-bearer-or-session" class={`text-xs text-gray-500`}>
-											{$i18n.t('Auth')}
-										</div>
-									</div>
-
-									{#if oauthAuthTypes.includes(auth_type)}
-										<div class="flex items-center gap-2">
-											{#if oauthClientInfo}
-												<div class="flex flex-col justify-end items-center shrink-0">
-													<Tooltip
-														content={edit
-															? $i18n.t('Authorize OAuth')
-															: $i18n.t('Please save the connection before authorizing OAuth')}
-													>
-														<button
-															class=" text-xs underline dark:text-gray-500 dark:hover:text-gray-200 text-gray-700 hover:text-gray-900 disabled:opacity-50 disabled:no-underline transition"
-															type="button"
-															disabled={!edit}
-															on:click={authorizeOAuthHandler}
-														>
-															{$i18n.t('Authorize OAuth')}
-														</button>
-													</Tooltip>
-												</div>
-											{/if}
-
-											<div class="flex flex-col justify-end items-center shrink-0">
-												<Tooltip
-													content={oauthClientInfo
-														? $i18n.t('Register Again')
-														: $i18n.t('Register Client')}
-												>
-													<button
-														class=" text-xs underline dark:text-gray-500 dark:hover:text-gray-200 text-gray-700 hover:text-gray-900 transition"
-														type="button"
-														on:click={() => {
-															registerOAuthClientHandler();
-														}}
-													>
-														{$i18n.t('Register Client')}
-													</button>
-												</Tooltip>
-											</div>
-
-											{#if !oauthClientInfo}
-												<div
-													class="text-xs font-normal px-1.5 rounded-md bg-yellow-500/20 text-yellow-700 dark:text-yellow-200"
-												>
-													{$i18n.t('Not Registered')}
-												</div>
-											{:else}
-												<div
-													class="text-xs font-normal px-1.5 rounded-md bg-green-500/20 text-green-700 dark:text-green-200"
-												>
-													{$i18n.t('Registered')}
-												</div>
-											{/if}
-										</div>
-									{/if}
-								</div>
-
-								<div class="flex gap-2">
-									<div class="flex-shrink-0 self-start">
-										<select
-											id="select-bearer-or-session"
-											class={`w-full text-sm ${selectClass}`}
-											bind:value={auth_type}
-										>
-											<option value="none">{$i18n.t('None')}</option>
-
-											<option value="bearer">{$i18n.t('Bearer')}</option>
-											<option value="session">{$i18n.t('Session')}</option>
-
-											{#if !direct}
-												<option value="system_oauth">{$i18n.t('OAuth')}</option>
-												{#if type === 'mcp'}
-													<option value="oauth_2.1">{$i18n.t('OAuth 2.1')}</option>
-													<option value="oauth_2.1_static">{$i18n.t('OAuth 2.1 (Static)')}</option>
-												{/if}
-											{/if}
-										</select>
 									</div>
 
 									<div class="flex flex-1 items-center">
-										{#if auth_type === 'bearer'}
-											<SensitiveInput
-												bind:value={key}
-												placeholder={$i18n.t('API Key')}
-												required={false}
-											/>
-										{:else if auth_type === 'none'}
-											<div class={`text-xs self-center translate-y-[1px] text-gray-500`}>
-												{$i18n.t('No authentication')}
-											</div>
-										{:else if auth_type === 'session'}
-											<div class={`text-xs self-center translate-y-[1px] text-gray-500`}>
-												{$i18n.t('Forwards system user session credentials to authenticate')}
-											</div>
-										{:else if auth_type === 'system_oauth'}
-											<div class={`text-xs self-center translate-y-[1px] text-gray-500`}>
-												{$i18n.t('Forwards system user OAuth access token to authenticate')}
-											</div>
-										{:else if auth_type === 'oauth_2.1'}
-											<div
-												class={`flex items-center text-xs self-center translate-y-[1px] text-gray-500`}
+										<input
+											id="api-base-url"
+											class={`w-full flex-1 text-sm ${inputClass}`}
+											type="text"
+											bind:value={url}
+											placeholder={$i18n.t('API Base URL')}
+											autocomplete="off"
+											required
+										/>
+
+										<Tooltip content={verifyLabel()} className="shrink-0 flex items-center mr-1">
+											<button
+												class="self-center p-1 bg-transparent hover:bg-gray-100 dark:hover:bg-gray-850 rounded-lg transition"
+												on:click={() => {
+													verifyHandler();
+												}}
+												aria-label={verifyLabel()}
+												type="button"
 											>
-												{$i18n.t('Uses OAuth 2.1 Dynamic Client Registration')}
-											</div>
-										{:else if auth_type === 'oauth_2.1_static'}
-											<div class="flex flex-col gap-1.5 w-full mt-0.5">
-												<SensitiveInput
-													bind:value={oauthClientId}
-													placeholder={$i18n.t('Client ID')}
-													required={false}
-												/>
-												<SensitiveInput
-													bind:value={oauthClientSecret}
-													placeholder={$i18n.t('Client Secret')}
-													required={false}
-												/>
-												<div class="flex flex-1 items-center">
-													<input
-														class={`w-full text-sm ${inputClass}`}
-														type="text"
-														bind:value={oauthServerUrl}
-														placeholder={$i18n.t('OAuth Server URL')}
-														autocomplete="off"
+												<svg
+													xmlns="http://www.w3.org/2000/svg"
+													viewBox="0 0 20 20"
+													fill="currentColor"
+													class="w-4 h-4"
+													aria-hidden="true"
+												>
+													<path
+														fill-rule="evenodd"
+														d="M15.312 11.424a5.5 5.5 0 01-9.201 2.466l-.312-.311h2.433a.75.75 0 000-1.5H3.989a.75.75 0 00-.75.75v4.242a.75.75 0 001.5 0v-2.43l.31.31a7 7 0 0011.712-3.138.75.75 0 00-1.449-.39zm1.23-3.723a.75.75 0 00.219-.53V2.929a.75.75 0 00-1.5 0V5.36l-.31-.31A7 7 0 003.239 8.188a.75.75 0 101.448.389A5.5 5.5 0 0113.89 6.11l.311.31h-2.432a.75.75 0 000 1.5h4.243a.75.75 0 00.53-.219z"
+														clip-rule="evenodd"
 													/>
-												</div>
-											</div>
-										{/if}
+												</svg>
+											</button>
+										</Tooltip>
+
+										<Tooltip content={enable ? $i18n.t('Enabled') : $i18n.t('Disabled')}>
+											<Switch bind:state={enable} />
+										</Tooltip>
 									</div>
 								</div>
 							</div>
-						</div>
+
+							<div class="flex gap-2 mt-2">
+								<div class="flex flex-col w-full">
+									<div class="flex justify-between items-center">
+										<div class="flex gap-2 items-center">
+											<div for="select-bearer-or-session" class={`text-xs text-gray-500`}>
+												{$i18n.t('Auth')}
+											</div>
+										</div>
+
+										{#if oauthAuthTypes.includes(auth_type)}
+											<div class="flex items-center gap-2">
+												{#if oauthClientInfo}
+													<div class="flex flex-col justify-end items-center shrink-0">
+														<Tooltip
+															content={edit
+																? $i18n.t('Authorize OAuth')
+																: $i18n.t('Please save the connection before authorizing OAuth')}
+														>
+															<button
+																class=" text-xs underline dark:text-gray-500 dark:hover:text-gray-200 text-gray-700 hover:text-gray-900 disabled:opacity-50 disabled:no-underline transition"
+																type="button"
+																disabled={!edit}
+																on:click={authorizeOAuthHandler}
+															>
+																{$i18n.t('Authorize OAuth')}
+															</button>
+														</Tooltip>
+													</div>
+												{/if}
+
+												<div class="flex flex-col justify-end items-center shrink-0">
+													<Tooltip
+														content={oauthClientInfo
+															? $i18n.t('Register Again')
+															: $i18n.t('Register Client')}
+													>
+														<button
+															class=" text-xs underline dark:text-gray-500 dark:hover:text-gray-200 text-gray-700 hover:text-gray-900 transition"
+															type="button"
+															on:click={() => {
+																registerOAuthClientHandler();
+															}}
+														>
+															{$i18n.t('Register Client')}
+														</button>
+													</Tooltip>
+												</div>
+
+												{#if !oauthClientInfo}
+													<div
+														class="text-xs font-normal px-1.5 rounded-md bg-yellow-500/20 text-yellow-700 dark:text-yellow-200"
+													>
+														{$i18n.t('Not Registered')}
+													</div>
+												{:else}
+													<div
+														class="text-xs font-normal px-1.5 rounded-md bg-green-500/20 text-green-700 dark:text-green-200"
+													>
+														{$i18n.t('Registered')}
+													</div>
+												{/if}
+											</div>
+										{/if}
+									</div>
+
+									<div class="flex gap-2">
+										<div class="flex-shrink-0 self-start">
+											<select
+												id="select-bearer-or-session"
+												class={`w-full text-sm ${selectClass}`}
+												bind:value={auth_type}
+											>
+												<option value="none">{$i18n.t('None')}</option>
+
+												<option value="bearer">{$i18n.t('Bearer')}</option>
+												<option value="session">{$i18n.t('Session')}</option>
+
+												{#if !direct}
+													<option value="system_oauth">{$i18n.t('OAuth')}</option>
+													{#if type === 'mcp'}
+														<option value="oauth_2.1">{$i18n.t('OAuth 2.1')}</option>
+														<option value="oauth_2.1_static">{$i18n.t('OAuth 2.1 (Static)')}</option
+														>
+													{/if}
+												{/if}
+											</select>
+										</div>
+
+										<div class="flex flex-1 items-center">
+											{#if auth_type === 'bearer'}
+												<SensitiveInput
+													bind:value={key}
+													placeholder={$i18n.t('API Key')}
+													required={false}
+												/>
+											{:else if auth_type === 'none'}
+												<div class={`text-xs self-center translate-y-[1px] text-gray-500`}>
+													{$i18n.t('No authentication')}
+												</div>
+											{:else if auth_type === 'session'}
+												<div class={`text-xs self-center translate-y-[1px] text-gray-500`}>
+													{$i18n.t('Forwards system user session credentials to authenticate')}
+												</div>
+											{:else if auth_type === 'system_oauth'}
+												<div class={`text-xs self-center translate-y-[1px] text-gray-500`}>
+													{$i18n.t('Forwards system user OAuth access token to authenticate')}
+												</div>
+											{:else if auth_type === 'oauth_2.1'}
+												<div
+													class={`flex items-center text-xs self-center translate-y-[1px] text-gray-500`}
+												>
+													{$i18n.t('Uses OAuth 2.1 Dynamic Client Registration')}
+												</div>
+											{:else if auth_type === 'oauth_2.1_static'}
+												<div class="flex flex-col gap-1.5 w-full mt-0.5">
+													<SensitiveInput
+														bind:value={oauthClientId}
+														placeholder={$i18n.t('Client ID')}
+														required={false}
+													/>
+													<SensitiveInput
+														bind:value={oauthClientSecret}
+														placeholder={$i18n.t('Client Secret')}
+														required={false}
+													/>
+													<div class="flex flex-1 items-center">
+														<input
+															class={`w-full text-sm ${inputClass}`}
+															type="text"
+															bind:value={oauthServerUrl}
+															placeholder={$i18n.t('OAuth Server URL')}
+															autocomplete="off"
+														/>
+													</div>
+												</div>
+											{/if}
+										</div>
+									</div>
+								</div>
+							</div>
 						{/if}
 
 						<div class="flex items-center justify-between">
 							{#if type !== 'composio'}
-							<button
-								type="button"
-								class="flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition mt-2"
-								on:click={() => (showAdvanced = !showAdvanced)}
-							>
-								<svg
-									xmlns="http://www.w3.org/2000/svg"
-									viewBox="0 0 20 20"
-									fill="currentColor"
-									class="w-3 h-3 transition-transform {showAdvanced ? 'rotate-90' : ''}"
+								<button
+									type="button"
+									class="flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition mt-2"
+									on:click={() => (showAdvanced = !showAdvanced)}
 								>
-									<path
-										fill-rule="evenodd"
-										d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z"
-										clip-rule="evenodd"
-									/>
-								</svg>
-								{$i18n.t('Advanced')}
-							</button>
+									<svg
+										xmlns="http://www.w3.org/2000/svg"
+										viewBox="0 0 20 20"
+										fill="currentColor"
+										class="w-3 h-3 transition-transform {showAdvanced ? 'rotate-90' : ''}"
+									>
+										<path
+											fill-rule="evenodd"
+											d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z"
+											clip-rule="evenodd"
+										/>
+									</svg>
+									{$i18n.t('Advanced')}
+								</button>
 							{/if}
 
 							{#if !direct}
