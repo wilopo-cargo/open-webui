@@ -70,9 +70,7 @@ class MCPClient:
                     httpx_client_factory=httpx_client_factory
                     if httpx_client_factory is not None
                     else (
-                        create_httpx_client
-                        if AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL
-                        else create_insecure_httpx_client
+                        create_httpx_client if AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL else create_insecure_httpx_client
                     ),
                 )
 

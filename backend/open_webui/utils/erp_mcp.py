@@ -50,7 +50,8 @@ def validate_saved_mcp_url(connection: dict) -> str:
         or parsed.query
         or parsed.fragment
         or parsed.path != '/mcp'
-        or port is None and ':' in parsed.netloc.rsplit(']', 1)[-1]
+        or port is None
+        and ':' in parsed.netloc.rsplit(']', 1)[-1]
     ):
         raise _AttachmentError('ERP MCP attachment upload is not configured safely.')
 
