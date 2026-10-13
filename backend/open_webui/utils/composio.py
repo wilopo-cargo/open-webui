@@ -68,7 +68,9 @@ class ComposioPolicy(BaseModel):
                 raise ValueError('Toolkit slugs must be strings')
             toolkit = toolkit.strip()
             if not re.fullmatch(r'[a-z0-9_-]+', toolkit, flags=re.ASCII):
-                raise ValueError('Toolkit slugs must contain only lowercase ASCII letters, digits, underscores, and hyphens')
+                raise ValueError(
+                    'Toolkit slugs must contain only lowercase ASCII letters, digits, underscores, and hyphens'
+                )
             if toolkit in toolkits:
                 raise ValueError('Duplicate toolkit slugs are not allowed')
             toolkits[toolkit] = policy
@@ -374,8 +376,10 @@ def validate_composio_connection_arguments(arguments: dict, session_id: str, all
     if set(arguments) - {'toolkits', 'reinitiate_all', 'session_id'}:
         raise ValueError('Invalid Composio connection arguments')
     toolkits = arguments.get('toolkits')
-    if not isinstance(toolkits, list) or not toolkits or any(
-        not isinstance(toolkit, str) or toolkit not in allowed_toolkits for toolkit in toolkits
+    if (
+        not isinstance(toolkits, list)
+        or not toolkits
+        or any(not isinstance(toolkit, str) or toolkit not in allowed_toolkits for toolkit in toolkits)
     ):
         raise ValueError('Composio connection request includes a forbidden toolkit')
     if 'reinitiate_all' in arguments and not isinstance(arguments['reinitiate_all'], bool):

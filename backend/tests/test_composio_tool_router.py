@@ -75,7 +75,7 @@ def app_modules():
     from open_webui import env
     from open_webui.internal import db
     from open_webui.routers import configs, tools
-    from open_webui.utils import composio, middleware
+    from open_webui.utils import composio, erp_mcp, middleware
 
     assert env.DATA_DIR.resolve() == _TEST_DATA_PATH
     assert env.DATABASE_URL == _TEST_ENV['DATABASE_URL']
@@ -86,7 +86,7 @@ def app_modules():
     assert Path(db.engine.url.database).resolve() == _TEST_DATA_PATH / 'test.db'
     assert Path(db.async_engine.url.database).resolve() == _TEST_DATA_PATH / 'test.db'
     try:
-        yield SimpleNamespace(configs=configs, composio=composio, middleware=middleware, tools=tools)
+        yield SimpleNamespace(configs=configs, composio=composio, erp_mcp=erp_mcp, middleware=middleware, tools=tools)
     finally:
         db.engine.dispose()
         _restore_test_environment()
@@ -197,7 +197,12 @@ async def test_composio_dependency_logs_are_scoped_and_native_logs_survive(app_m
         {'toolkits': {'googledrive': {'tools': ['GOOGLEDRIVE_FIND_FILE'], 'auth_config_id': 'shared-auth'}}},
         {'toolkits': {'googledrive': {'tools': ['GOOGLEDRIVE_FIND_FILE'], 'extra': True}}},
         {'toolkits': {'googledrive': {'tools': ['GOOGLEDRIVE_FIND_FILE']}}, 'extra': True},
-        {'toolkits': {'googledrive': {'tools': ['GOOGLEDRIVE_FIND_FILE']}, ' googledrive ': {'tools': ['GOOGLEDRIVE_GET_ABOUT']}}},
+        {
+            'toolkits': {
+                'googledrive': {'tools': ['GOOGLEDRIVE_FIND_FILE']},
+                ' googledrive ': {'tools': ['GOOGLEDRIVE_GET_ABOUT']},
+            }
+        },
         {'toolkits': {'googledrive': {'tools': [f'GOOGLEDRIVE_TOOL_{index}' for index in range(1001)]}}},
         {'toolkits': {}},
         {'toolkits': {'googledrive': {'tools': ['*']}}},
@@ -211,14 +216,18 @@ def test_policy_rejects_missing_malformed_wildcard_and_duplicate_allowlists(app_
         app_modules.composio.ComposioPolicy.model_validate(policy)
 
 
-@pytest.mark.parametrize('auth_fields', [{}, {'auth_config_id': None}, {'auth_config_id': '  '}, {'auth_config_id': ' ac_drive_read '}])
+@pytest.mark.parametrize(
+    'auth_fields', [{}, {'auth_config_id': None}, {'auth_config_id': '  '}, {'auth_config_id': ' ac_drive_read '}]
+)
 def test_empty_tools_allow_open_toolkit_without_changing_optional_auth_config(app_modules, auth_fields):
-    policy = app_modules.composio.ComposioPolicy.model_validate({
-        'toolkits': {
-            'googledrive': {'tools': [], **auth_fields},
-            'notion': {'tools': [' NOTION_SEARCH ']},
-        },
-    })
+    policy = app_modules.composio.ComposioPolicy.model_validate(
+        {
+            'toolkits': {
+                'googledrive': {'tools': [], **auth_fields},
+                'notion': {'tools': [' NOTION_SEARCH ']},
+            },
+        }
+    )
     assert policy.toolkits['googledrive'].tools == []
     assert policy.toolkits['googledrive'].auth_config_id == ((auth_fields.get('auth_config_id') or '').strip() or None)
     assert policy.toolkits['notion'].tools == ['NOTION_SEARCH']
@@ -286,9 +295,7 @@ async def config_import_client(app_modules, monkeypatch):
     app.include_router(app_modules.configs.router, prefix='/configs')
     app.dependency_overrides[app_modules.configs.get_admin_user] = lambda: _user('admin', role='admin')
     try:
-        async with _HTTPX_ASYNC_CLIENT(
-            transport=httpx.ASGITransport(app=app), base_url='http://test'
-        ) as client:
+        async with _HTTPX_ASYNC_CLIENT(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
             yield client
     finally:
         await Config.clear()
@@ -319,31 +326,41 @@ async def test_full_config_import_rejects_invalid_composio_without_changing_prio
 ):
     Config = app_modules.configs.Config
     previous_connection = _connection(server_id='previous')
-    await Config.upsert({
-        'tool_server.connections': [previous_connection],
-        'ui.default_models': 'previous-model',
-        'import_test.unrelated': {'keep': ['previous-value']},
-        'oauth.import_test_guard': 'previous-default',
-    })
+    await Config.upsert(
+        {
+            'tool_server.connections': [previous_connection],
+            'ui.default_models': 'previous-model',
+            'import_test.unrelated': {'keep': ['previous-value']},
+            'oauth.import_test_guard': 'previous-default',
+        }
+    )
     before = await Config.get_all()
     before_defaults = copy.deepcopy(Config.DEFAULTS)
     invalid = {**_connection(), **invalid_fields, 'key': invalid_fields.get('key', 'private-import-api-key')}
     if not invalid_fields:
         invalid.pop('composio')
-    response = await config_import_client.post('/configs/import', json={'config': {
-        'ui.default_models': 'replacement-model',
-        'oauth.import_test_guard': 'replacement-default',
-        'import_test.unrelated': {'replace': True},
-        'import_test.new': 'must-not-be-persisted',
-        'tool_server.connections': [_connection(server_id='valid-first'), invalid],
-    }})
+    response = await config_import_client.post(
+        '/configs/import',
+        json={
+            'config': {
+                'ui.default_models': 'replacement-model',
+                'oauth.import_test_guard': 'replacement-default',
+                'import_test.unrelated': {'replace': True},
+                'import_test.new': 'must-not-be-persisted',
+                'tool_server.connections': [_connection(server_id='valid-first'), invalid],
+            }
+        },
+    )
     assert response.status_code == 400
     detail = response.json()['detail']
     assert 'Composio' in detail and 'toolkit' in detail.lower()
     assert 'No configuration was changed' in detail
     for private_value in (
-        'private-import-api-key', 'private-provider-value', 'private-tool-value',
-        'private-provider.example', 'secret-path',
+        'private-import-api-key',
+        'private-provider-value',
+        'private-tool-value',
+        'private-provider.example',
+        'secret-path',
     ):
         assert private_value not in response.text
     assert await Config.get_all() == before
@@ -359,20 +376,26 @@ async def test_full_config_import_accepts_valid_connections_and_keeps_them_reada
     app_modules, config_import_client, connection_kind
 ):
     Config = app_modules.configs.Config
-    await Config.upsert({
-        'tool_server.connections': [_connection(server_id='previous')],
-        'import_test.retained': {'keep': True},
-    })
+    await Config.upsert(
+        {
+            'tool_server.connections': [_connection(server_id='previous')],
+            'import_test.retained': {'keep': True},
+        }
+    )
     native = {**_native_connection(), 'legacy_extension': {'preserve': True}}
     imported = {'ui.default_models': 'imported-model'}
     if connection_kind in ('composio', 'composio-open'):
-        connection = _connection({
-            ' googledrive ': {
-                'tools': [] if connection_kind == 'composio-open' else [' GOOGLEDRIVE_FIND_FILE '],
-                'auth_config_id': ' ac_approved_read_only ',
+        connection = _connection(
+            {
+                ' googledrive ': {
+                    'tools': [] if connection_kind == 'composio-open' else [' GOOGLEDRIVE_FIND_FILE '],
+                    'auth_config_id': ' ac_approved_read_only ',
+                },
+                'github': {'tools': ['GITHUB_GET_THE_AUTHENTICATED_USER']},
             },
-            'github': {'tools': ['GITHUB_GET_THE_AUTHENTICATED_USER']},
-        }, server_id=' imported-composio ', grants=_user_read_grant('alice'))
+            server_id=' imported-composio ',
+            grants=_user_read_grant('alice'),
+        )
         connection['key'] = ' imported-project-key '
         imported['tool_server.connections'] = [native, connection]
     elif connection_kind == 'native':
@@ -517,13 +540,15 @@ async def test_provider_errors_are_safe_and_never_retry(app_modules, monkeypatch
         {**_session_response('alice', url='https://user@backend.composio.dev/mcp')},
         {**_session_response('alice', url='https://backend.composio.dev:444/mcp')},
         {**_session_response('alice', url='https://backend.composio.dev/mcp#fragment')},
-        {'session_id': ' ', 'config': {'user_id': 'openwebui:alice'}, 'mcp': {'type': 'http', 'url': 'https://backend.composio.dev/mcp'}},
+        {
+            'session_id': ' ',
+            'config': {'user_id': 'openwebui:alice'},
+            'mcp': {'type': 'http', 'url': 'https://backend.composio.dev/mcp'},
+        },
     ],
 )
 @pytest.mark.asyncio
-async def test_mismatched_or_unsafe_session_responses_fail_before_mcp_connection(
-    app_modules, monkeypatch, response
-):
+async def test_mismatched_or_unsafe_session_responses_fail_before_mcp_connection(app_modules, monkeypatch, response):
     client_class = _in_process_mcp_client_class()
     seen = []
 
@@ -553,14 +578,25 @@ async def test_callback_url_is_required_and_restricted_to_secure_or_loopback_ori
 
     _install_composio_transport(monkeypatch, composio, handler)
     for url in (
-        None, '', '/relative', 'http://webui.example.test', 'https://user@webui.example.test',
-        'https://webui.example.test/?q=1', 'https://webui.example.test/#anchor', 'https://webui.example.test/?',
+        None,
+        '',
+        '/relative',
+        'http://webui.example.test',
+        'https://user@webui.example.test',
+        'https://webui.example.test/?q=1',
+        'https://webui.example.test/#anchor',
+        'https://webui.example.test/?',
     ):
         with pytest.raises(ValueError, match='Configure the WebUI URL before using Composio'):
             await composio.create_composio_session(_connection(), 'alice', url)
     assert calls == []
 
-    for url in ('http://127.0.0.1:3000', 'http://localhost:3000/', 'http://[::1]:3000', 'https://webui.example.test/path///'):
+    for url in (
+        'http://127.0.0.1:3000',
+        'http://localhost:3000/',
+        'http://[::1]:3000',
+        'https://webui.example.test/path///',
+    ):
         await composio.create_composio_session(_connection(), 'alice', url)
         assert json.loads(calls[-1].content)['manage_connections']['callback_url'] == url.rstrip('/') + '/'
     assert len(calls) == 4
@@ -592,7 +628,9 @@ async def test_composio_http_factory_does_not_follow_real_local_redirect(app_mod
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        async with app_modules.composio.create_composio_httpx_client(headers={'x-api-key': 'test-project-key'}) as client:
+        async with app_modules.composio.create_composio_httpx_client(
+            headers={'x-api-key': 'test-project-key'}
+        ) as client:
             response = await client.get(f'http://127.0.0.1:{server.server_port}/redirect')
         assert response.status_code == 302
         assert RedirectHandler.destination_hits == 0
@@ -650,6 +688,7 @@ def test_policy_normalizes_inputs_and_accepts_exact_maximum(app_modules):
     )
     assert len(maximum.toolkits['googledrive'].tools) == 1000
 
+
 @pytest.mark.parametrize(
     ('ssl_enabled', 'expected_factory'),
     [
@@ -703,6 +742,7 @@ async def test_mcp_client_keeps_native_factory_selection_and_accepts_composio_ov
 
     def custom_factory(**_kwargs):
         return None
+
     composio_client = mcp_client.MCPClient()
     await composio_client.connect(
         'https://backend.composio.dev/session',
@@ -818,8 +858,12 @@ _OPEN_TOOL_CATALOG = [
 _OPEN_TOOL_SPECS = _APP_TOOL_SPECS + [
     {'name': slug, 'description': slug, 'parameters': {'type': 'object', 'properties': {}}}
     for slug in (
-        'WORKSPACE_FIND_FILE', 'NOTION_DELETE_PAGE', 'GOOGLEDRIVE_FOREIGN',
-        'GITHUB_PRIVATE_TOOL', 'GOOGLEDRIVE_UNKNOWN_MCP_ONLY', 'COMPOSIO_PROXY_EXECUTE',
+        'WORKSPACE_FIND_FILE',
+        'NOTION_DELETE_PAGE',
+        'GOOGLEDRIVE_FOREIGN',
+        'GITHUB_PRIVATE_TOOL',
+        'GOOGLEDRIVE_UNKNOWN_MCP_ONLY',
+        'COMPOSIO_PROXY_EXECUTE',
     )
 ]
 
@@ -828,9 +872,7 @@ _PRIVATE_DOCUMENTS = {
     'alice': [
         {'id': 'alice-board-budget', 'title': 'shared document', 'owner': 'alice', 'content': 'ALICE-PRIVATE-BUDGET'}
     ],
-    'bob': [
-        {'id': 'bob-work-goals', 'title': 'shared document', 'owner': 'bob', 'content': 'BOB-PRIVATE-GOALS'}
-    ],
+    'bob': [{'id': 'bob-work-goals', 'title': 'shared document', 'owner': 'bob', 'content': 'BOB-PRIVATE-GOALS'}],
 }
 
 
@@ -838,6 +880,7 @@ def _in_process_mcp_client_class(
     *, app_specs=None, native_specs=None, fail_connect=False, fail_listing=False, consent_status='active'
 ):
     """Contract provider: opaque issued sessions enforce access to stored documents."""
+
     class InProcessMCPClient:
         instances = []
         sessions = {}
@@ -870,8 +913,10 @@ def _in_process_mcp_client_class(
         async def list_tool_specs(self):
             if fail_listing:
                 raise RuntimeError(f'private listing failure at {self.url} with {self.headers}')
-            specs = native_specs if self.account_id == 'native' and native_specs is not None else (
-                app_specs if app_specs is not None else _APP_TOOL_SPECS
+            specs = (
+                native_specs
+                if self.account_id == 'native' and native_specs is not None
+                else (app_specs if app_specs is not None else _APP_TOOL_SPECS)
             )
             return copy.deepcopy(specs)
 
@@ -891,10 +936,15 @@ def _in_process_mcp_client_class(
             documents = _PRIVATE_DOCUMENTS.get(self.account_id, [])
             if function_name in ('GOOGLEDRIVE_FIND_FILE', 'WORKSPACE_FIND_FILE'):
                 query = function_args.get('query', '').lower()
-                return {'files': copy.deepcopy([
-                    document for document in documents
-                    if query in document['title'].lower() or query in document['content'].lower()
-                ])}
+                return {
+                    'files': copy.deepcopy(
+                        [
+                            document
+                            for document in documents
+                            if query in document['title'].lower() or query in document['content'].lower()
+                        ]
+                    )
+                }
             if function_name == 'GOOGLEDRIVE_GET_FILE_METADATA':
                 document = next(
                     (document for document in documents if document['id'] == function_args.get('file_id')), None
@@ -916,7 +966,9 @@ def _in_process_mcp_client_class(
 def _install_user_bound_sessions(monkeypatch, app_modules, client_class, *, catalog_pages=None, catalog_requests=None):
     requests = []
     catalog_requests = [] if catalog_requests is None else catalog_requests
-    catalog_pages = {None: {'items': _OPEN_TOOL_CATALOG, 'next_cursor': None}} if catalog_pages is None else catalog_pages
+    catalog_pages = (
+        {None: {'items': _OPEN_TOOL_CATALOG, 'next_cursor': None}} if catalog_pages is None else catalog_pages
+    )
 
     def handler(request):
         assert request.url.host == 'backend.composio.dev'
@@ -960,7 +1012,9 @@ def _install_user_bound_sessions(monkeypatch, app_modules, client_class, *, cata
     return requests
 
 
-def _prepare_chat_payload(monkeypatch, app_modules, connections, user, tool_ids, *, hostile_metadata=None, client_class):
+def _prepare_chat_payload(
+    monkeypatch, app_modules, connections, user, tool_ids, *, hostile_metadata=None, client_class
+):
     middleware = app_modules.middleware
 
     async def config_get(key, default=None):
@@ -1052,9 +1106,12 @@ def _user_read_grant(user_id):
 def _tool_server_enabled(connection):
     return {**connection, 'config': {**connection.get('config', {}), 'enable': True}}
 
+
 @pytest.mark.parametrize('open_toolkit', [False, True])
 @pytest.mark.asyncio
-async def test_users_get_distinct_bound_callables_not_metadata_selected_accounts(app_modules, monkeypatch, open_toolkit):
+async def test_users_get_distinct_bound_callables_not_metadata_selected_accounts(
+    app_modules, monkeypatch, open_toolkit
+):
     grants = _user_read_grant('alice') + _user_read_grant('bob')
     connection = _connection(
         {'googledrive': {'tools': [] if open_toolkit else ['GOOGLEDRIVE_FIND_FILE', 'GOOGLEDRIVE_GET_FILE_METADATA']}},
@@ -1130,7 +1187,15 @@ async def test_disabled_denied_and_forged_composio_ids_make_no_provider_request(
     bob = _user('bob')
 
     cases = [
-        (_connection(server_id='shared', enabled=False, grants=[{'principal_type': 'user', 'principal_id': '*', 'permission': 'read'}]), 'shared', alice),
+        (
+            _connection(
+                server_id='shared',
+                enabled=False,
+                grants=[{'principal_type': 'user', 'principal_id': '*', 'permission': 'read'}],
+            ),
+            'shared',
+            alice,
+        ),
         (_connection(server_id='shared', grants=_user_read_grant('alice')), 'shared', bob),
         (_connection(server_id='shared', grants=_user_read_grant('alice')), 'alice', bob),
         (_connection(server_id='shared', grants=[]), 'shared', alice),
@@ -1345,16 +1410,10 @@ async def test_incomplete_consent_is_not_misreported_as_authorized_or_retried(
 
 @pytest.mark.parametrize('failure', ['connect', 'listing'])
 @pytest.mark.asyncio
-async def test_mcp_failures_close_client_and_sanitize_private_diagnostics(
-    app_modules, monkeypatch, caplog, failure
-):
-    client_class = _in_process_mcp_client_class(
-        fail_connect=failure == 'connect', fail_listing=failure == 'listing'
-    )
+async def test_mcp_failures_close_client_and_sanitize_private_diagnostics(app_modules, monkeypatch, caplog, failure):
+    client_class = _in_process_mcp_client_class(fail_connect=failure == 'connect', fail_listing=failure == 'listing')
     _install_user_bound_sessions(monkeypatch, app_modules, client_class)
-    connection = _tool_server_enabled(
-        _connection(server_id='shared', grants=_user_read_grant('alice'))
-    )
+    connection = _tool_server_enabled(_connection(server_id='shared', grants=_user_read_grant('alice')))
     request, _form, _metadata, _model = _prepare_chat_payload(
         monkeypatch,
         app_modules,
@@ -1381,9 +1440,7 @@ async def test_missing_connection_manager_fails_closed_and_disconnects(app_modul
     catalog = [_APP_TOOL_SPECS[0]]
     client_class = _in_process_mcp_client_class(app_specs=catalog)
     _install_user_bound_sessions(monkeypatch, app_modules, client_class)
-    connection = _tool_server_enabled(
-        _connection(server_id='shared', grants=_user_read_grant('alice'))
-    )
+    connection = _tool_server_enabled(_connection(server_id='shared', grants=_user_read_grant('alice')))
     request, _form, _metadata, _model = _prepare_chat_payload(
         monkeypatch,
         app_modules,
@@ -1401,9 +1458,7 @@ async def test_missing_connection_manager_fails_closed_and_disconnects(app_modul
 async def test_request_cleanup_closes_composio_client_and_clears_full_tool_id_map(app_modules, monkeypatch):
     client_class = _in_process_mcp_client_class()
     _install_user_bound_sessions(monkeypatch, app_modules, client_class)
-    connection = _tool_server_enabled(
-        _connection(server_id='shared', grants=_user_read_grant('alice'))
-    )
+    connection = _tool_server_enabled(_connection(server_id='shared', grants=_user_read_grant('alice')))
     _request, _form, metadata, _ = await _process_chat_with_servers(
         monkeypatch,
         app_modules,
@@ -1420,9 +1475,7 @@ async def test_request_cleanup_closes_composio_client_and_clears_full_tool_id_ma
 
 
 @pytest.mark.asyncio
-async def test_native_and_composio_with_same_id_and_overlapping_slug_keep_callables_separate(
-    app_modules, monkeypatch
-):
+async def test_native_and_composio_with_same_id_and_overlapping_slug_keep_callables_separate(app_modules, monkeypatch):
     native_connection = {
         'type': 'mcp',
         'url': 'https://native.example/mcp',
@@ -1612,7 +1665,11 @@ def test_composio_http_factory_always_verifies_tls_and_preserves_sdk_timeout(app
     auth = httpx.BasicAuth('fixture', 'fixture')
     composio.create_composio_httpx_client(headers={'x-api-key': 'fixture-key'}, timeout=timeout, auth=auth)
     assert seen[-1] == {
-        'verify': True, 'follow_redirects': False, 'timeout': timeout, 'auth': auth, 'headers': {'x-api-key': 'fixture-key'}
+        'verify': True,
+        'follow_redirects': False,
+        'timeout': timeout,
+        'auth': auth,
+        'headers': {'x-api-key': 'fixture-key'},
     }
 
 
@@ -1652,8 +1709,12 @@ async def test_sessions_are_fresh_per_request_and_multiple_connections_bind_thei
     ]
     saved = copy.deepcopy(connections)
     _request, form_data, first, _ = await _process_chat_with_servers(
-        monkeypatch, app_modules, connections, _user('alice'),
-        ['server:composio:drive', 'server:composio:notion'], client_class=client_class
+        monkeypatch,
+        app_modules,
+        connections,
+        _user('alice'),
+        ['server:composio:drive', 'server:composio:notion'],
+        client_class=client_class,
     )
     _request, _form, second, _ = await _process_chat_with_servers(
         monkeypatch, app_modules, connections, _user('alice'), ['server:composio:drive'], client_class=client_class
@@ -1661,11 +1722,19 @@ async def test_sessions_are_fresh_per_request_and_multiple_connections_bind_thei
     drive_name = _composio_function_name('drive', 'GOOGLEDRIVE_FIND_FILE')
     notion_name = _composio_function_name('notion', 'NOTION_SEARCH')
     assert first['tools'][drive_name]['callable'] is not second['tools'][drive_name]['callable']
-    assert await first['tools'][drive_name]['callable'](query='shared document') == {'files': _PRIVATE_DOCUMENTS['alice']}
-    assert await second['tools'][drive_name]['callable'](query='shared document') == {'files': _PRIVATE_DOCUMENTS['alice']}
-    assert await first['tools'][notion_name]['callable'](query='plan') == {'pages': [{'id': 'work-plan', 'title': 'plan'}]}
+    assert await first['tools'][drive_name]['callable'](query='shared document') == {
+        'files': _PRIVATE_DOCUMENTS['alice']
+    }
+    assert await second['tools'][drive_name]['callable'](query='shared document') == {
+        'files': _PRIVATE_DOCUMENTS['alice']
+    }
+    assert await first['tools'][notion_name]['callable'](query='plan') == {
+        'pages': [{'id': 'work-plan', 'title': 'plan'}]
+    }
     assert [client.calls[0][0] for client in client_class.instances] == [
-        'GOOGLEDRIVE_FIND_FILE', 'NOTION_SEARCH', 'GOOGLEDRIVE_FIND_FILE'
+        'GOOGLEDRIVE_FIND_FILE',
+        'NOTION_SEARCH',
+        'GOOGLEDRIVE_FIND_FILE',
     ]
     assert len({client.session_id for client in client_class.instances}) == 3
     assert [json.loads(request.content)['user_id'] for request in requests] == ['openwebui:alice'] * 3
@@ -1713,11 +1782,15 @@ async def test_catalog_is_access_filtered_without_sessions_oauth_or_private_fiel
     monkeypatch.setattr(config, 'BYPASS_ADMIN_ACCESS_CONTROL', False)
     monkeypatch.setattr(Groups, 'get_groups_by_member_id', staticmethod(no_servers))
     _install_composio_transport(monkeypatch, app_modules.composio, handler)
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
-        redis=None,
-        TOOL_SERVERS=[],
-        oauth_client_manager=SimpleNamespace(get_oauth_token=forbidden_oauth),
-    )))
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                redis=None,
+                TOOL_SERVERS=[],
+                oauth_client_manager=SimpleNamespace(get_oauth_token=forbidden_oauth),
+            )
+        )
+    )
     alice = await app_modules.tools.get_tools(request, user=_user('alice'), db=None)
     assert {tool.id for tool in alice} == {'server:composio:shared', 'server:mcp:shared'}
     bob = await app_modules.tools.get_tools(request, user=_user('bob'), db=None)
@@ -1792,6 +1865,7 @@ async def test_admin_verification_fails_closed_and_cleans_up(app_modules, monkey
         monkeypatch.setattr(app_modules.configs.Config, 'get', staticmethod(config_get))
         expected = 'Configure the WebUI URL before using Composio'
     elif failure == 'foreign-user':
+
         def handler(provider_request):
             requests.append(provider_request)
             return httpx.Response(200, json=_session_response('alice'), request=provider_request)
@@ -1826,12 +1900,16 @@ async def test_invalid_composio_record_is_revalidated_before_oauth_or_config_mut
 
     monkeypatch.setattr(app_modules.configs.Config, 'get', staticmethod(config_get))
     monkeypatch.setattr(app_modules.configs.Config, 'upsert', staticmethod(upsert))
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
-        oauth_client_manager=SimpleNamespace(
-            remove_client=lambda *_args: effects.append('remove-oauth'),
-            add_client=lambda *_args: effects.append('add-oauth'),
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                oauth_client_manager=SimpleNamespace(
+                    remove_client=lambda *_args: effects.append('remove-oauth'),
+                    add_client=lambda *_args: effects.append('add-oauth'),
+                )
+            )
         )
-    )))
+    )
     valid = app_modules.configs.ToolServerConnection.model_validate(_connection())
     invalid = valid.model_copy(deep=True)
     invalid.composio = None  # Simulate a malformed saved/imported policy past form construction.
@@ -1846,9 +1924,7 @@ async def test_invalid_composio_record_is_revalidated_before_oauth_or_config_mut
 async def test_actual_tool_execution_rejects_hostile_manager_kwargs_and_normalizes_mcp_results(
     app_modules, monkeypatch, consent_status
 ):
-    base_client = _in_process_mcp_client_class(
-        consent_status=consent_status, native_specs=[_APP_TOOL_SPECS[0]]
-    )
+    base_client = _in_process_mcp_client_class(consent_status=consent_status, native_specs=[_APP_TOOL_SPECS[0]])
 
     class ContentMCPClient(base_client):
         async def call_tool(self, function_name, function_args):
@@ -1860,8 +1936,12 @@ async def test_actual_tool_execution_rejects_hostile_manager_kwargs_and_normaliz
     connection = _connection(server_id='shared', grants=_user_read_grant('alice'))
     user = _user('alice')
     request, form_data, metadata, _ = await _process_chat_with_servers(
-        monkeypatch, app_modules, [_native_connection(), connection], user,
-        ['server:mcp:shared', 'server:composio:shared'], client_class=client_class
+        monkeypatch,
+        app_modules,
+        [_native_connection(), connection],
+        user,
+        ['server:mcp:shared', 'server:composio:shared'],
+        client_class=client_class,
     )
     manager_name = _composio_function_name('shared', 'COMPOSIO_MANAGE_CONNECTIONS')
     provider = client_class.instances[1]
@@ -1878,7 +1958,8 @@ async def test_actual_tool_execution_rejects_hostile_manager_kwargs_and_normaliz
         app_modules, request, form_data, metadata, user, manager_name, {'toolkits': ['googledrive']}
     )
     assert json.loads(result['content']) == {
-        'status': consent_status, 'connect_link': client_class.sessions[provider.url]['connect_link']
+        'status': consent_status,
+        'connect_link': client_class.sessions[provider.url]['connect_link'],
     }
     assert provider.calls == [
         ('COMPOSIO_MANAGE_CONNECTIONS', {'toolkits': ['googledrive'], 'session_id': provider.session_id})
@@ -1898,8 +1979,13 @@ async def test_actual_tool_execution_rejects_hostile_manager_kwargs_and_normaliz
         assert 'not found' in not_allowed['content']
     assert len(provider.calls) == 2
     native_result = await _execute_tool_output(
-        app_modules, request, form_data, metadata, user, 'shared_GOOGLEDRIVE_FIND_FILE',
-        {'query': 'document', 'unknown': True}
+        app_modules,
+        request,
+        form_data,
+        metadata,
+        user,
+        'shared_GOOGLEDRIVE_FIND_FILE',
+        {'query': 'document', 'unknown': True},
     )
     assert json.loads(native_result['content']) == {'provider': 'native', 'tool': 'GOOGLEDRIVE_FIND_FILE'}
     assert client_class.instances[0].calls == [('GOOGLEDRIVE_FIND_FILE', {'query': 'document'})]
@@ -1910,8 +1996,12 @@ async def test_actual_tool_execution_rejects_hostile_manager_kwargs_and_normaliz
 async def test_native_mcp_listing_failure_still_propagates_and_closes_client(app_modules, monkeypatch):
     client_class = _in_process_mcp_client_class(fail_listing=True)
     request, _form, metadata, _model = _prepare_chat_payload(
-        monkeypatch, app_modules, [_native_connection()], _user('alice'), ['server:mcp:shared'],
-        client_class=client_class
+        monkeypatch,
+        app_modules,
+        [_native_connection()],
+        _user('alice'),
+        ['server:mcp:shared'],
+        client_class=client_class,
     )
     with pytest.raises(RuntimeError, match='private listing failure'):
         await app_modules.middleware.connect_mcp_server(request, 'shared', _user('alice'), metadata, {})
@@ -1923,21 +2013,23 @@ async def test_native_mcp_listing_failure_still_propagates_and_closes_client(app
 
 @pytest.mark.parametrize('server_type', ['mcp', 'composio'])
 @pytest.mark.asyncio
-async def test_duplicate_specs_within_one_mcp_catalog_fail_without_overwriting(
-    app_modules, monkeypatch, server_type
-):
+async def test_duplicate_specs_within_one_mcp_catalog_fail_without_overwriting(app_modules, monkeypatch, server_type):
     duplicated = [copy.deepcopy(_APP_TOOL_SPECS[0]), copy.deepcopy(_APP_TOOL_SPECS[0])]
-    client_class = _in_process_mcp_client_class(
-        app_specs=duplicated + [_APP_TOOL_SPECS[-1]], native_specs=duplicated
-    )
+    client_class = _in_process_mcp_client_class(app_specs=duplicated + [_APP_TOOL_SPECS[-1]], native_specs=duplicated)
     _install_user_bound_sessions(monkeypatch, app_modules, client_class)
-    connection = _native_connection() if server_type == 'mcp' else _connection(
-        server_id='shared', grants=_user_read_grant('alice')
+    connection = (
+        _native_connection()
+        if server_type == 'mcp'
+        else _connection(server_id='shared', grants=_user_read_grant('alice'))
     )
     with pytest.raises(ValueError, match='^Duplicate MCP tool function name$'):
         await _process_chat_with_servers(
-            monkeypatch, app_modules, [connection], _user('alice'), [f'server:{server_type}:shared'],
-            client_class=client_class
+            monkeypatch,
+            app_modules,
+            [connection],
+            _user('alice'),
+            [f'server:{server_type}:shared'],
+            client_class=client_class,
         )
     assert len(client_class.instances) == 1
     assert client_class.instances[0].closed
@@ -1974,6 +2066,7 @@ async def test_mcp_name_collisions_at_other_tool_merge_boundaries_fail_and_close
         return None
 
     if source in {'plugin', 'aliased-plugin'}:
+
         async def no_filters(*_args, **_kwargs):
             return []
 
@@ -1991,7 +2084,11 @@ async def test_mcp_name_collisions_at_other_tool_merge_boundaries_fail_and_close
         original_get = middleware.Config.get
 
         async def config_get(key, default=None):
-            return [{'id': 'fixture-terminal'}] if key == 'terminal_server.connections' else await original_get(key, default)
+            return (
+                [{'id': 'fixture-terminal'}]
+                if key == 'terminal_server.connections'
+                else await original_get(key, default)
+            )
 
         form_data['terminal_id'] = 'fixture-terminal'
         monkeypatch.setattr(middleware.Config, 'get', staticmethod(config_get))
@@ -2000,6 +2097,7 @@ async def test_mcp_name_collisions_at_other_tool_merge_boundaries_fail_and_close
     elif source == 'direct':
         metadata['tool_servers'] = [{'url': 'https://direct.example/tool', 'specs': [spec]}]
     elif source == 'inlet':
+
         async def inlet(_request, body, *_args, **_kwargs):
             body['tools'] = [{'type': 'function', 'function': spec}]
             return body
@@ -2068,9 +2166,12 @@ async def test_real_composio_lifecycle_suppresses_private_dependency_logs_but_no
     requests = _install_user_bound_sessions(monkeypatch, app_modules, client_class)
     caplog.set_level(logging.DEBUG)
     _request, _form, metadata, _ = await _process_chat_with_servers(
-        monkeypatch, app_modules,
+        monkeypatch,
+        app_modules,
         [_native_connection(), _connection(server_id='shared', grants=_user_read_grant('alice'))],
-        _user('alice'), ['server:mcp:shared', 'server:composio:shared'], client_class=client_class
+        _user('alice'),
+        ['server:mcp:shared', 'server:composio:shared'],
+        client_class=client_class,
     )
     native_name = 'shared_GOOGLEDRIVE_FIND_FILE'
     composio_name = _composio_function_name('shared', 'GOOGLEDRIVE_FIND_FILE')
@@ -2118,11 +2219,15 @@ async def test_saving_composio_policy_preserves_native_settings_without_oauth_or
     monkeypatch.setattr(app_modules.configs.Config, 'upsert', staticmethod(config_upsert))
     monkeypatch.setattr(app_modules.configs, 'publish_event', publish)
     _install_composio_transport(monkeypatch, app_modules.composio, handler)
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
-        redis=None,
-        TOOL_SERVERS=[],
-        oauth_client_manager=SimpleNamespace(remove_client=forbidden_oauth, add_client=forbidden_oauth),
-    )))
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                redis=None,
+                TOOL_SERVERS=[],
+                oauth_client_manager=SimpleNamespace(remove_client=forbidden_oauth, add_client=forbidden_oauth),
+            )
+        )
+    )
     composio = _connection(
         {'googledrive': {'tools': ['GOOGLEDRIVE_FIND_FILE'], 'auth_config_id': 'ac_approved_read_only'}},
         grants=_user_read_grant('alice'),
@@ -2226,7 +2331,6 @@ async def test_bound_callable_captures_policy_and_rejects_unlisted_or_reserved_t
     assert result['connect_link'] == client_class.sessions[client.url]['connect_link']
     assert client.calls[-1][1]['session_id'] == client.session_id
     await app_modules.middleware.disconnect_mcp_clients({'server:composio:shared': client})
-
 
 
 @pytest.mark.parametrize('private_status', [200, 503])
@@ -2350,23 +2454,24 @@ async def test_composio_scope_suppresses_real_httpx_telemetry_without_suppressin
 # This provider fixture proves local policy, not live auth-config/scope enforcement.
 @pytest.mark.parametrize('auth_config_id', [None, 'ac_provider_fixture'])
 @pytest.mark.asyncio
-async def test_open_toolkit_catalog_membership_controls_actual_chat_callables(
-    app_modules, monkeypatch, auth_config_id
-):
+async def test_open_toolkit_catalog_membership_controls_actual_chat_callables(app_modules, monkeypatch, auth_config_id):
     client_class = _in_process_mcp_client_class(app_specs=_OPEN_TOOL_SPECS)
     catalog_requests = []
-    requests = _install_user_bound_sessions(
-        monkeypatch, app_modules, client_class, catalog_requests=catalog_requests
-    )
+    requests = _install_user_bound_sessions(monkeypatch, app_modules, client_class, catalog_requests=catalog_requests)
     drive = {'tools': []}
     if auth_config_id is not None:
         drive['auth_config_id'] = auth_config_id
     connection = _connection(
         {'googledrive': drive, 'notion': {'tools': ['NOTION_SEARCH']}},
-        server_id='shared', grants=_user_read_grant('alice'),
+        server_id='shared',
+        grants=_user_read_grant('alice'),
     )
     _request, _form, metadata, _ = await _process_chat_with_servers(
-        monkeypatch, app_modules, [connection], _user('alice'), ['server:composio:shared'],
+        monkeypatch,
+        app_modules,
+        [connection],
+        _user('alice'),
+        ['server:composio:shared'],
         client_class=client_class,
     )
     body = json.loads(requests[0].content)
@@ -2377,17 +2482,26 @@ async def test_open_toolkit_catalog_membership_controls_actual_chat_callables(
         'auth_configs': {} if auth_config_id is None else {'googledrive': auth_config_id},
         'instant': False,
         'manage_connections': {
-            'enable': True, 'callback_url': 'https://webui.example.test/',
-            'enable_wait_for_connections': False, 'enable_connection_removal': False,
+            'enable': True,
+            'callback_url': 'https://webui.example.test/',
+            'enable_wait_for_connections': False,
+            'enable_connection_removal': False,
         },
-        'workbench': {'enable': False}, 'proxy_execute': {'enable': False},
-        'multi_account': {'enable': False}, 'preload': {'tools': 'all'},
-        'search': {'enable': False}, 'execute': {'enable_multi_execute': False},
+        'workbench': {'enable': False},
+        'proxy_execute': {'enable': False},
+        'multi_account': {'enable': False},
+        'preload': {'tools': 'all'},
+        'search': {'enable': False},
+        'execute': {'enable_multi_execute': False},
     }
     assert len(requests) == len(catalog_requests) == 1
     allowed = {
-        'GOOGLEDRIVE_FIND_FILE', 'GOOGLEDRIVE_GET_FILE_METADATA', 'GOOGLEDRIVE_WRITE_FILE',
-        'WORKSPACE_FIND_FILE', 'NOTION_SEARCH', 'COMPOSIO_MANAGE_CONNECTIONS',
+        'GOOGLEDRIVE_FIND_FILE',
+        'GOOGLEDRIVE_GET_FILE_METADATA',
+        'GOOGLEDRIVE_WRITE_FILE',
+        'WORKSPACE_FIND_FILE',
+        'NOTION_SEARCH',
+        'COMPOSIO_MANAGE_CONNECTIONS',
     }
     assert set(metadata['tools']) == {_composio_function_name('shared', slug) for slug in allowed}
     # This name has no Drive prefix; the provider membership grants it access.
@@ -2423,10 +2537,16 @@ async def test_provider_uppercase_catalog_toolkits_match_lowercase_open_policy(
             {'slug': 'GOOGLEDRIVE_FOREIGN', 'toolkit': {'slug': 'GitHub', 'name': 'googledrive'}},
             {'slug': 'COMPOSIO_SEARCH_TOOLS', 'toolkit': {'slug': 'GOOGLEDRIVE', 'name': 'googledrive'}},
         ],
-        'next_cursor': None, 'total_pages': 1, 'current_page': 1, 'total_items': 6,
+        'next_cursor': None,
+        'total_pages': 1,
+        'current_page': 1,
+        'total_items': 6,
     }
     allowed = {
-        'COMPOSIO_MANAGE_CONNECTIONS', 'GOOGLEDRIVE_ADD_PARENT', 'GOOGLEDRIVE_ADD_PROPERTY', 'GOOGLEDRIVE_FIND_FILE',
+        'COMPOSIO_MANAGE_CONNECTIONS',
+        'GOOGLEDRIVE_ADD_PARENT',
+        'GOOGLEDRIVE_ADD_PROPERTY',
+        'GOOGLEDRIVE_FIND_FILE',
     }
     app_specs = [
         {'name': item['slug'], 'description': item['slug'], 'parameters': {'type': 'object', 'properties': {}}}
@@ -2435,8 +2555,11 @@ async def test_provider_uppercase_catalog_toolkits_match_lowercase_open_policy(
     client_class = _in_process_mcp_client_class(app_specs=app_specs)
     catalog_requests = []
     requests = _install_user_bound_sessions(
-        monkeypatch, app_modules, client_class,
-        catalog_pages={None: catalog}, catalog_requests=catalog_requests,
+        monkeypatch,
+        app_modules,
+        client_class,
+        catalog_pages={None: catalog},
+        catalog_requests=catalog_requests,
     )
     user = _user('admin', role='admin') if surface == 'admin-verify' else _user('alice')
     connection = _connection({'googledrive': {'tools': []}}, server_id='shared', grants=_user_read_grant(user.id))
@@ -2473,17 +2596,18 @@ async def test_provider_uppercase_catalog_toolkits_match_lowercase_open_policy(
 
 @pytest.mark.asyncio
 async def test_open_toolkit_catalog_paginates_to_preload_ceiling_and_calls_late_page_tool(app_modules, monkeypatch):
-    first = [
-        {'slug': f'DRIVE_APP_{index}', 'toolkit': {'slug': 'googledrive'}} for index in range(500)
+    first = [{'slug': f'DRIVE_APP_{index}', 'toolkit': {'slug': 'googledrive'}} for index in range(500)]
+    second = [{'slug': f'DRIVE_APP_{index}', 'toolkit': {'slug': 'googledrive'}} for index in range(500, 999)] + [
+        {'slug': 'WORKSPACE_FIND_FILE', 'toolkit': {'slug': 'googledrive'}}
     ]
-    second = [
-        {'slug': f'DRIVE_APP_{index}', 'toolkit': {'slug': 'googledrive'}} for index in range(500, 999)
-    ] + [{'slug': 'WORKSPACE_FIND_FILE', 'toolkit': {'slug': 'googledrive'}}]
     cursor = 'opaque+/=&cursor'
     catalog_requests = []
     client_class = _in_process_mcp_client_class(app_specs=_OPEN_TOOL_SPECS)
     requests = _install_user_bound_sessions(
-        monkeypatch, app_modules, client_class, catalog_requests=catalog_requests,
+        monkeypatch,
+        app_modules,
+        client_class,
+        catalog_requests=catalog_requests,
         catalog_pages={
             None: {'items': first, 'next_cursor': cursor},
             cursor: {'items': second},  # Missing next_cursor is a terminal page.
@@ -2508,8 +2632,13 @@ async def test_open_toolkit_catalog_paginates_to_preload_ceiling_and_calls_late_
 @pytest.mark.parametrize(
     'catalog',
     [
-        None, [], {}, {'items': None}, {'items': {}},
-        {'items': [None]}, {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE'}]},
+        None,
+        [],
+        {},
+        {'items': None},
+        {'items': {}},
+        {'items': [None]},
+        {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE'}]},
         {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': None}]},
         {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': 'googledrive'}]},
         {'items': [{'slug': 'GOOGLEDRIVE_FIND_FILE', 'toolkit': {}}]},
@@ -2538,8 +2667,11 @@ async def test_malformed_open_catalog_fails_safely_before_mcp_on_chat_and_verify
     client_class = _in_process_mcp_client_class(app_specs=_OPEN_TOOL_SPECS)
     catalog_requests = []
     requests = _install_user_bound_sessions(
-        monkeypatch, app_modules, client_class,
-        catalog_pages={None: catalog}, catalog_requests=catalog_requests,
+        monkeypatch,
+        app_modules,
+        client_class,
+        catalog_pages={None: catalog},
+        catalog_requests=catalog_requests,
     )
     user = _user('admin', role='admin') if surface == 'admin-verify' else _user('alice')
     connection = _connection({'googledrive': {'tools': []}}, server_id='shared', grants=_user_read_grant(user.id))
@@ -2568,10 +2700,14 @@ async def test_malformed_open_catalog_fails_safely_before_mcp_on_chat_and_verify
 @pytest.mark.parametrize(
     ('failure', 'message'),
     [
-        (401, 'Composio API rejected credentials'), (403, 'Composio API rejected credentials'),
-        (400, 'Composio tool policy was rejected'), (422, 'Composio tool policy was rejected'),
-        (503, 'Composio is unavailable'), ('redirect', 'Composio is unavailable'),
-        ('transport', 'Composio is unavailable'), ('timeout', 'Composio is unavailable'),
+        (401, 'Composio API rejected credentials'),
+        (403, 'Composio API rejected credentials'),
+        (400, 'Composio tool policy was rejected'),
+        (422, 'Composio tool policy was rejected'),
+        (503, 'Composio is unavailable'),
+        ('redirect', 'Composio is unavailable'),
+        ('transport', 'Composio is unavailable'),
+        ('timeout', 'Composio is unavailable'),
         ('invalid-json', 'Composio is unavailable'),
     ],
 )
@@ -2595,19 +2731,24 @@ async def test_open_catalog_errors_never_retry_broaden_or_expose_private_data(
         )
         assert provider_request.headers['x-api-key'] == 'test-project-key'
         if failure == 'redirect':
-            return httpx.Response(307, headers={'location': 'https://attacker.example/collect'}, request=provider_request)
+            return httpx.Response(
+                307, headers={'location': 'https://attacker.example/collect'}, request=provider_request
+            )
         if failure == 'transport':
             raise httpx.ConnectError(f'{private} at {provider_request.url}', request=provider_request)
         if failure == 'timeout':
             raise httpx.ReadTimeout(f'{private} at {provider_request.url}', request=provider_request)
         if failure == 'invalid-json':
-            return httpx.Response(200, content=f'private malformed response {private}'.encode(), request=provider_request)
+            return httpx.Response(
+                200, content=f'private malformed response {private}'.encode(), request=provider_request
+            )
         return httpx.Response(failure, json={'private': private}, request=provider_request)
 
     _install_composio_transport(monkeypatch, app_modules.composio, handler)
     connection = _connection(
         {'googledrive': {'tools': []}, 'notion': {'tools': ['NOTION_SEARCH']}},
-        server_id='shared', grants=_user_read_grant('alice'),
+        server_id='shared',
+        grants=_user_read_grant('alice'),
     )
     request, _form, _metadata, _model = _prepare_chat_payload(
         monkeypatch, app_modules, [connection], _user('alice'), [], client_class=client_class
@@ -2622,7 +2763,10 @@ async def test_open_catalog_errors_never_retry_broaden_or_expose_private_data(
     assert all(str(request.url) not in caplog.text for request in seen)
 
 
-@pytest.mark.parametrize('failure', ['oversize-page', 'oversize-total', 'ceiling-cursor', 'repeated-cursor', 'duplicate-slug', 'union-ceiling'])
+@pytest.mark.parametrize(
+    'failure',
+    ['oversize-page', 'oversize-total', 'ceiling-cursor', 'repeated-cursor', 'duplicate-slug', 'union-ceiling'],
+)
 @pytest.mark.asyncio
 async def test_open_catalog_pagination_is_bounded_and_fail_closed(app_modules, monkeypatch, failure):
     first = [{'slug': f'DRIVE_APP_{index}', 'toolkit': {'slug': 'googledrive'}} for index in range(500)]
@@ -2634,9 +2778,12 @@ async def test_open_catalog_pagination_is_bounded_and_fail_closed(app_modules, m
         expected_requests = 1
     elif failure == 'oversize-total':
         pages['page-two'] = {'items': second[:499], 'next_cursor': 'page-three'}
-        pages['page-three'] = {'items': [
-            second[-1], {'slug': 'TOOL_1001', 'toolkit': {'slug': 'googledrive'}},
-        ]}
+        pages['page-three'] = {
+            'items': [
+                second[-1],
+                {'slug': 'TOOL_1001', 'toolkit': {'slug': 'googledrive'}},
+            ]
+        }
         expected_requests = 3
     elif failure == 'ceiling-cursor':
         pages['page-two']['next_cursor'] = 'page-three'
@@ -2672,9 +2819,7 @@ async def test_open_catalog_pagination_is_bounded_and_fail_closed(app_modules, m
 async def test_resolved_open_callable_snapshot_cannot_be_broadened_or_rebound(app_modules, monkeypatch):
     catalog = copy.deepcopy(_OPEN_TOOL_CATALOG)
     client_class = _in_process_mcp_client_class(app_specs=_OPEN_TOOL_SPECS)
-    _install_user_bound_sessions(
-        monkeypatch, app_modules, client_class, catalog_pages={None: {'items': catalog}}
-    )
+    _install_user_bound_sessions(monkeypatch, app_modules, client_class, catalog_pages={None: {'items': catalog}})
     connection = _connection({'googledrive': {'tools': []}}, server_id='shared', grants=_user_read_grant('alice'))
     connection['config']['function_name_filter_list'] = 'WORKSPACE_FIND_FILE'
     request, _form, _metadata, _model = _prepare_chat_payload(
@@ -2710,8 +2855,434 @@ async def test_resolved_open_callable_snapshot_cannot_be_broadened_or_rebound(ap
     assert await lookup(query='shared document') == {'files': _PRIVATE_DOCUMENTS['alice']}
     result = await manager(toolkits=['googledrive'])
     assert result['connect_link'] == client_class.sessions[client.url]['connect_link']
-    assert client.calls[-1] == ('COMPOSIO_MANAGE_CONNECTIONS', {
-        'toolkits': ['googledrive'], 'session_id': client.session_id,
-    })
+    assert client.calls[-1] == (
+        'COMPOSIO_MANAGE_CONNECTIONS',
+        {
+            'toolkits': ['googledrive'],
+            'session_id': client.session_id,
+        },
+    )
     await app_modules.middleware.disconnect_mcp_clients({'server:composio:shared': client})
     assert client.closed
+
+
+@pytest.mark.asyncio
+async def test_erp_mcp_statement_reconcile_relays_owned_current_turn_bytes(app_modules, monkeypatch):
+    import hashlib
+    from email.parser import BytesParser
+    from email.policy import default
+    from open_webui.utils.session_pool import close_session
+
+    statement = b'No. Rekening,=,1234567890\nNama,=,Fixture\nMata Uang,=,IDR\n'
+    statement += b'Tanggal,Keterangan,Cabang,Jumlah,,Saldo\n09/10/2026,fixture,000,100000.00,CR,100000.00\n'
+    statement += b'Saldo Awal,=,0.00\nKredit,=,100000.00\nDebet,=,0.00\nSaldo Akhir,=,100000.00\n'
+    remote_id = '11111111-1111-4111-8111-111111111111'
+    received = []
+
+    def read_body(handler):
+        if handler.headers.get('Transfer-Encoding', '').lower() == 'chunked':
+            chunks = []
+            while True:
+                size = int(handler.rfile.readline().split(b';', 1)[0], 16)
+                if size == 0:
+                    handler.rfile.readline()
+                    break
+                chunks.append(handler.rfile.read(size))
+                handler.rfile.read(2)
+            return b''.join(chunks)
+        return handler.rfile.read(int(handler.headers.get('Content-Length', '0')))
+
+    class Receiver(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):
+            assert self.path == '/uploads/statements'
+            body = read_body(self)
+            message = BytesParser(policy=default).parsebytes(
+                b'MIME-Version: 1.0\r\n' + f'Content-Type: {self.headers["Content-Type"]}\r\n\r\n'.encode() + body
+            )
+            part = next(part for part in message.walk() if part.get_content_disposition() == 'form-data')
+            received.append(
+                {
+                    'authorization': self.headers.get('Authorization'),
+                    'filename': part.get_filename(),
+                    'bytes': part.get_payload(decode=True),
+                }
+            )
+            payload = json.dumps(
+                {
+                    'file_id': remote_id,
+                    'sha256': hashlib.sha256(statement).hexdigest(),
+                    'expires_at': '2099-01-01T00:00:00Z',
+                }
+            ).encode()
+            self.send_response(201)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Receiver)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        server_id = 'wilopo-erp'
+        file_id = 'web-file-1'
+        upload_path = Path(app_modules.erp_mcp.UPLOAD_DIR) / 'fixture-bank.csv'
+        upload_path.parent.mkdir(parents=True, exist_ok=True)
+        upload_path.write_bytes(statement)
+
+        class FileStore:
+            async def get_file_by_id_and_user_id(self, requested_id, user_id):
+                if requested_id != file_id or user_id != 'alice':
+                    return None
+                return SimpleNamespace(
+                    id=file_id,
+                    filename='fixture-bank.csv',
+                    path=str(upload_path),
+                    meta={'size': len(statement)},
+                )
+
+        class StorageStore:
+            @staticmethod
+            def get_file(path):
+                return path
+
+        monkeypatch.setattr(app_modules.erp_mcp, 'Files', FileStore())
+        monkeypatch.setattr(app_modules.erp_mcp, 'Storage', StorageStore())
+
+        class OAuthClientManager:
+            async def get_oauth_token(self, user_id, client_id):
+                assert user_id == 'alice'
+                assert client_id == f'mcp:{server_id}'
+                return {'access_token': 'erp-user-token'}
+
+        statement_spec = {
+            'name': 'statement_reconcile',
+            'description': 'Reconcile one statement.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'file_id': {'type': 'string'},
+                    'target_account_id': {'type': 'string'},
+                },
+                'required': ['file_id', 'target_account_id'],
+            },
+        }
+        base_client = _in_process_mcp_client_class(native_specs=[statement_spec])
+
+        class ERPClient(base_client):
+            async def connect(self, url, headers=None, *, httpx_client_factory=None):
+                self.url = url
+                self.headers = headers or {}
+                self.httpx_client_factory = httpx_client_factory
+                self.account_id = 'native'
+
+        connection = {
+            'type': 'mcp',
+            'url': f'http://127.0.0.1:{server.server_port}/mcp',
+            'path': '',
+            'auth_type': 'oauth_2.1_static',
+            'key': None,
+            'headers': {'X-ERP-Context': 'employee'},
+            'config': {'enable': True, 'access_grants': _user_read_grant('alice')},
+            'info': {'id': server_id, 'name': 'ERP'},
+        }
+        user = _user('alice')
+        request, form_data, metadata, model = _prepare_chat_payload(
+            monkeypatch,
+            app_modules,
+            [connection],
+            user,
+            [f'server:mcp:{server_id}'],
+            hostile_metadata={'user_message': {'files': [{'type': 'file', 'id': file_id}]}},
+            client_class=ERPClient,
+        )
+        request.app.state.oauth_client_manager = OAuthClientManager()
+        monkeypatch.setattr(app_modules.middleware, 'ERP_MCP_SERVER_ID', server_id)
+        await app_modules.middleware.process_chat_payload(request, form_data, user, metadata, model)
+
+        tool = metadata['tools'][f'{server_id}_statement_reconcile']
+        assert file_id in tool['spec']['description']
+        assert 'fixture-bank.csv' in tool['spec']['description']
+        result = await tool['callable'](file_id=file_id, target_account_id='account-1')
+        assert result == {'provider': 'native', 'tool': 'statement_reconcile'}
+        second_result = await tool['callable'](file_id=file_id, target_account_id='account-1')
+        assert second_result == {'provider': 'native', 'tool': 'statement_reconcile'}
+        assert received == [
+            {
+                'authorization': 'Bearer erp-user-token',
+                'filename': 'fixture-bank.csv',
+                'bytes': statement,
+            }
+        ]
+        assert hashlib.sha256(received[0]['bytes']).hexdigest() == hashlib.sha256(statement).hexdigest()
+        assert ERPClient.instances[0].calls == [
+            ('statement_reconcile', {'file_id': remote_id, 'target_account_id': 'account-1'}),
+            ('statement_reconcile', {'file_id': remote_id, 'target_account_id': 'account-1'}),
+        ]
+    finally:
+        await close_session()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    'case', ['foreign', 'shared', 'stale', 'temporary', 'non_csv', 'filesystem', 'oversize', 'actual_oversize']
+)
+@pytest.mark.asyncio
+async def test_erp_mcp_statement_reconcile_rejects_untrusted_attachment_references(app_modules, monkeypatch, case):
+    server_id = 'wilopo-erp'
+    requested_id = f'{case}-file'
+    current_id = 'current-file'
+    upload_dir = Path(app_modules.erp_mcp.UPLOAD_DIR)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    valid_path = upload_dir / f'{case}-fixture.csv'
+    valid_path.write_bytes(b'fixture,csv\n')
+    rows = {
+        current_id: SimpleNamespace(
+            id=current_id,
+            filename='current.csv',
+            path=str(valid_path),
+            meta={'size': valid_path.stat().st_size},
+        ),
+        requested_id: SimpleNamespace(
+            id=requested_id,
+            filename='requested.csv',
+            path=str(valid_path),
+            meta={'size': valid_path.stat().st_size},
+        ),
+    }
+    if case == 'non_csv':
+        rows[current_id].filename = 'statement.txt'
+    elif case == 'filesystem':
+        rows[current_id].path = str(Path(app_modules.erp_mcp.__file__).resolve())
+    elif case == 'oversize':
+        rows[current_id].meta = {'size': 10 * 1024 * 1024 + 1}
+    elif case == 'actual_oversize':
+        valid_path.write_bytes(b'x' * (10 * 1024 * 1024 + 1))
+        rows[current_id].meta = {'size': valid_path.stat().st_size}
+
+    class FileStore:
+        async def get_file_by_id_and_user_id(self, file_id, user_id):
+            if user_id != 'alice' or case in {'foreign', 'shared'}:
+                return None
+            return rows.get(file_id)
+
+    class StorageStore:
+        @staticmethod
+        def get_file(path):
+            return path
+
+    monkeypatch.setattr(app_modules.erp_mcp, 'Files', FileStore())
+    monkeypatch.setattr(app_modules.erp_mcp, 'Storage', StorageStore())
+
+    async def forbidden_session():
+        raise AssertionError('untrusted attachment must not reach the upload session')
+
+    monkeypatch.setattr(app_modules.erp_mcp, 'get_session', forbidden_session)
+
+    class OAuthClientManager:
+        async def get_oauth_token(self, _user_id, _client_id):
+            return {'access_token': 'erp-user-token'}
+
+    statement_spec = {
+        'name': 'statement_reconcile',
+        'description': 'Reconcile one statement.',
+        'parameters': {
+            'type': 'object',
+            'properties': {'file_id': {'type': 'string'}, 'target_account_id': {'type': 'string'}},
+        },
+    }
+    base_client = _in_process_mcp_client_class(native_specs=[statement_spec])
+
+    class ERPClient(base_client):
+        async def connect(self, url, headers=None, *, httpx_client_factory=None):
+            self.url = url
+            self.headers = headers or {}
+            self.httpx_client_factory = httpx_client_factory
+            self.account_id = 'native'
+
+    connection = {
+        'type': 'mcp',
+        'url': 'http://127.0.0.1:9/mcp',
+        'path': '',
+        'auth_type': 'oauth_2.1_static',
+        'key': None,
+        'headers': None,
+        'config': {'enable': True, 'access_grants': _user_read_grant('alice')},
+        'info': {'id': server_id, 'name': 'ERP'},
+    }
+    invocation_id = requested_id if case in {'foreign', 'shared', 'stale'} else current_id
+    user_message = {
+        'files': ([{'type': 'text', 'id': current_id}] if case == 'temporary' else [{'type': 'file', 'id': current_id}])
+    }
+    request, form_data, metadata, model = _prepare_chat_payload(
+        monkeypatch,
+        app_modules,
+        [connection],
+        _user('alice'),
+        [f'server:mcp:{server_id}'],
+        hostile_metadata={'user_message': user_message},
+        client_class=ERPClient,
+    )
+    request.app.state.oauth_client_manager = OAuthClientManager()
+    monkeypatch.setattr(app_modules.middleware, 'ERP_MCP_SERVER_ID', server_id)
+    await app_modules.middleware.process_chat_payload(request, form_data, _user('alice'), metadata, model)
+
+    tool = metadata['tools'][f'{server_id}_statement_reconcile']
+    assert invocation_id not in tool['spec']['description']
+    with pytest.raises(ValueError, match='current-turn CSV attachment'):
+        await tool['callable'](file_id=invocation_id, target_account_id='account-1')
+    assert ERPClient.instances[0].calls == []
+
+
+@pytest.mark.parametrize(
+    ('auth_type', 'headers'),
+    [
+        ('none', None),
+        ('oauth_2.1', None),
+        ('oauth_2.1_static', {'aUtHoRiZaTiOn': 'shared-token'}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_erp_mcp_connection_rejects_non_static_or_authorization_override(
+    app_modules, monkeypatch, auth_type, headers
+):
+    server_id = 'wilopo-erp'
+    connection = {
+        'type': 'mcp',
+        'url': 'http://127.0.0.1:9/mcp',
+        'path': '',
+        'auth_type': auth_type,
+        'key': None,
+        'headers': headers,
+        'config': {'enable': True, 'access_grants': _user_read_grant('alice')},
+        'info': {'id': server_id, 'name': 'ERP'},
+    }
+    client_class = _in_process_mcp_client_class()
+    request, _form, metadata, _model = _prepare_chat_payload(
+        monkeypatch,
+        app_modules,
+        [connection],
+        _user('alice'),
+        [f'server:mcp:{server_id}'],
+        client_class=client_class,
+    )
+    monkeypatch.setattr(app_modules.middleware, 'ERP_MCP_SERVER_ID', server_id)
+    with pytest.raises(ValueError, match='ERP MCP server configuration'):
+        await app_modules.middleware.connect_mcp_server(request, server_id, _user('alice'), metadata, {})
+    assert client_class.instances == []
+
+
+@pytest.mark.parametrize('failure', ['missing-token', 'redirect', 'oversize-response', 'invalid-response'])
+@pytest.mark.asyncio
+async def test_erp_mcp_statement_reconcile_blocks_relay_failures(app_modules, monkeypatch, failure):
+    from open_webui.utils.session_pool import close_session
+
+    statement = b'No. Rekening,=,123\nNama,=,Fixture\nMata Uang,=,IDR\n'
+    statement_path = Path(app_modules.erp_mcp.UPLOAD_DIR) / f'{failure}.csv'
+    statement_path.parent.mkdir(parents=True, exist_ok=True)
+    statement_path.write_bytes(statement)
+    received_paths = []
+
+    def consume_body(handler):
+        if handler.headers.get('Transfer-Encoding', '').lower() == 'chunked':
+            while True:
+                size = int(handler.rfile.readline().split(b';', 1)[0], 16)
+                if size == 0:
+                    handler.rfile.readline()
+                    return
+                handler.rfile.read(size)
+                handler.rfile.read(2)
+        else:
+            handler.rfile.read(int(handler.headers.get('Content-Length', '0')))
+
+    class Receiver(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):
+            received_paths.append(self.path)
+            consume_body(self)
+            if failure == 'redirect':
+                self.send_response(302)
+                self.send_header('Location', '/uploads/statements/redirected')
+                self.end_headers()
+                return
+            body = (
+                b'x' * (app_modules.erp_mcp.MAX_UPLOAD_RESPONSE_BYTES + 1)
+                if failure == 'oversize-response'
+                else (b'{"file_id":"not-a-uuid"}' if failure == 'invalid-response' else b'{}')
+            )
+            self.send_response(201)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Receiver)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        file_id = 'relay-failure-file'
+
+        class FileStore:
+            async def get_file_by_id_and_user_id(self, requested_id, user_id):
+                if requested_id != file_id or user_id != 'alice':
+                    return None
+                return SimpleNamespace(
+                    id=file_id,
+                    filename='statement.csv',
+                    path=str(statement_path),
+                    meta={'size': len(statement)},
+                )
+
+        class StorageStore:
+            @staticmethod
+            def get_file(path):
+                return path
+
+        monkeypatch.setattr(app_modules.erp_mcp, 'Files', FileStore())
+        monkeypatch.setattr(app_modules.erp_mcp, 'Storage', StorageStore())
+
+        class OAuthClientManager:
+            async def get_oauth_token(self, _user_id, _client_id):
+                return None if failure == 'missing-token' else {'access_token': 'erp-user-token'}
+
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(oauth_client_manager=OAuthClientManager())))
+        calls = []
+
+        async def delegate(**kwargs):
+            calls.append(kwargs)
+            return {'unexpected': True}
+
+        spec, callable_ = await app_modules.erp_mcp.bind_statement_reconcile_tool(
+            request,
+            {
+                'type': 'mcp',
+                'url': f'http://127.0.0.1:{server.server_port}/mcp',
+                'auth_type': 'oauth_2.1_static',
+            },
+            _user('alice'),
+            {'files': [{'type': 'file', 'id': file_id}]},
+            {
+                'name': 'wilopo-erp_statement_reconcile',
+                'description': 'Reconcile.',
+                'parameters': {'type': 'object', 'properties': {'file_id': {'type': 'string'}}},
+            },
+            delegate,
+            'wilopo-erp',
+        )
+        assert file_id in spec['description']
+        with pytest.raises(ValueError):
+            await callable_(file_id=file_id, target_account_id='account-1')
+        assert calls == []
+        assert received_paths == ([] if failure == 'missing-token' else ['/uploads/statements'])
+    finally:
+        await close_session()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

@@ -2,6 +2,12 @@
 
 Production deployment is an explicit, manually published GitHub Release: publish a non-prerelease release whose tag begins `release-production-` in `wilopo-cargo/open-webui`. Pushes, pull requests, and releases in forks do not deploy. The workflow does not create or publish releases. It builds the standard Dockerfile once and deploys the immutable resolved commit SHA to the configured production matrix. It is single-instance, with controlled downtime while the app restarts; Open WebUI startup may apply database migrations.
 
+## CI image publishing
+
+The `.github/workflows/docker.yaml` workflow builds one standard `linux/amd64` image on `ubuntu-latest` and publishes it only to `ghcr.io/wilopo-cargo/open-webui`, with branch/release tags and immutable `git-<commit-sha>` tags. ARM, CUDA, Ollama, and slim variants are not built. PyPI and Docker Hub publishing are not enabled for this fork. Helm chart notifications are not used by the Docker Compose deployment; no Helm-specific GitHub App credentials are required.
+
+The Docker frontend build uses an 8 GiB V8 heap, matching frontend CI. For pre-merge verification, dispatch `docker.yaml` on a feature branch; it builds and publishes that branch's image without triggering a production deployment.
+
 ## Required GitHub setup
 
 Create the `production` GitHub Environment and configure:
