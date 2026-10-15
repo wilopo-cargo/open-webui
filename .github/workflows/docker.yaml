@@ -77,4 +77,6 @@ jobs:
           cache-from: type=registry,ref=${{ steps.cache-meta.outputs.tags }}
           cache-to: type=registry,ref=${{ steps.cache-meta.outputs.tags }},mode=max
           sbom: true
-          build-args: BUILD_HASH=${{ github.sha }}
+          build-args: |
+            BUILD_HASH=${{ github.sha }}
+            BUILD_CHANNEL=${{ github.ref == 'refs/heads/dev' && 'dev' || (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && 'main' || 'unknown' }}

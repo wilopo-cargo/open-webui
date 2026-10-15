@@ -5,7 +5,7 @@
 	const { saveAs } = fileSaver;
 
 	import { toast } from 'svelte-sonner';
-	import { getContext } from 'svelte';
+	import { getContext, tick } from 'svelte';
 	const i18n = getContext<any>('i18n');
 
 	import Modal from '$lib/components/common/Modal.svelte';
@@ -17,6 +17,7 @@
 	import Switch from '$lib/components/common/Switch.svelte';
 	import Tags from './common/Tags.svelte';
 	import { getToolServerData } from '$lib/apis';
+	import { slugify } from '$lib/utils';
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
 	import {
 		verifyToolServerConnection,
@@ -97,10 +98,9 @@
 	const selectClass =
 		'bg-transparent pr-5 outline-hidden placeholder:text-gray-300 dark:placeholder:text-gray-700';
 	const oauthAuthTypes = ['oauth_2.1', 'oauth_2.1_static'];
-	const verifyLabel = () =>
-		oauthAuthTypes.includes(auth_type)
-			? $i18n.t('Check OAuth Discovery')
-			: $i18n.t('Verify Connection');
+	$: verifyLabel = oauthAuthTypes.includes(auth_type)
+		? $i18n.t('Check OAuth Discovery')
+		: $i18n.t('Verify Connection');
 	const verifySuccessMessage = () =>
 		oauthAuthTypes.includes(auth_type)
 			? $i18n.t('OAuth discovery successful')
@@ -239,9 +239,15 @@
 		});
 	};
 
+	const ensureConnectionId = () => {
+		if (type === 'mcp' && !edit && !id.trim()) {
+			id = slugify(name.trim()) || uuidv4();
+		}
+	};
+
 	const authorizeOAuthHandler = () => {
 		if (!id) {
-			toast.error($i18n.t('Please enter a valid ID'));
+			toast.error($i18n.t('Please enter a Connection ID before authorizing OAuth.'));
 			return;
 		}
 
@@ -263,13 +269,14 @@
 			return;
 		}
 
-		if (id === '') {
-			toast.error($i18n.t('Please enter a valid ID'));
+		if (auth_type === 'oauth_2.1_static' && (!oauthClientId || !oauthClientSecret)) {
+			toast.error($i18n.t('Please enter Client ID and Client Secret'));
 			return;
 		}
 
-		if (auth_type === 'oauth_2.1_static' && (!oauthClientId || !oauthClientSecret)) {
-			toast.error($i18n.t('Please enter Client ID and Client Secret'));
+		ensureConnectionId();
+		if (!id.trim()) {
+			toast.error($i18n.t('Enter a Connection ID to register.'));
 			return;
 		}
 
@@ -297,10 +304,9 @@
 		});
 
 		if (res) {
+			// $i18n.t('Please save the connection to persist the OAuth client information and do not change the ID');
 			toast.warning(
-				$i18n.t(
-					'Please save the connection to persist the OAuth client information and do not change the ID'
-				)
+				$i18n.t('Save the connection to keep the OAuth details. Keep the Connection ID unchanged.')
 			);
 			toast.success($i18n.t('Registration successful'));
 
@@ -432,7 +438,7 @@
 		if (!file) return;
 
 		const reader = new FileReader();
-		reader.onload = (event) => {
+		reader.onload = async (event) => {
 			const json = event.target.result;
 
 			try {
@@ -510,6 +516,11 @@
 					accessGrants = data.config.access_grants ?? [];
 				}
 
+				if (data.info?.id) {
+					await tick();
+					id = data.info.id;
+				}
+
 				toast.success($i18n.t('Import successful'));
 			} catch (error) {
 				toast.error($i18n.t('Please select a valid JSON file'));
@@ -576,6 +587,7 @@
 		}
 
 		loading = true;
+		ensureConnectionId();
 
 		// remove trailing slash from url for non-MCP connections
 		// MCP servers may require a trailing slash; stripping it can cause
@@ -584,7 +596,11 @@
 			url = url.replace(/\/$/, '');
 		}
 		if (id.includes(':') || id.includes('|')) {
-			toast.error($i18n.t('ID cannot contain ":" or "|" characters'));
+			toast.error(
+				type === 'mcp'
+					? $i18n.t('Connection ID cannot contain ":" or "|" characters')
+					: $i18n.t('ID cannot contain ":" or "|" characters')
+			);
 			loading = false;
 			return;
 		}
@@ -668,7 +684,7 @@
 		init(null);
 	};
 
-	const init = (value: any) => {
+	const init = async (value: any) => {
 		type = value?.type || 'openapi';
 		url = value?.url ?? '';
 		spec_type = value?.spec_type ?? 'url';
@@ -700,10 +716,18 @@
 		enable = value?.config?.enable ?? true;
 		functionNameFilterList = value?.config?.function_name_filter_list ?? '';
 		accessGrants = value?.config?.access_grants ?? [];
+		if (value?.info?.id) {
+			await tick();
+			id = value.info.id;
+		}
 	};
 
 	$: if (show) {
 		init(direct && connection?.type === 'composio' ? null : connection);
+	}
+
+	$: if (show && type === 'mcp' && !edit && !oauthClientInfo && name) {
+		id = slugify(name.trim());
 	}
 </script>
 
@@ -817,14 +841,30 @@
 							{#if !direct}
 								<div class="flex flex-col flex-1">
 									<div class="flex justify-between mb-0.5">
-										<label for="enter-id" class={`text-xs text-gray-500`}
-											>{$i18n.t('ID')}
-											{#if !['mcp', 'composio'].includes(type)}<span class="opacity-50"
-													>({$i18n.t('optional')})</span
-												>{/if}</label
-										>
+										<label for="enter-id" class={`text-xs text-gray-500`}>
+											{#if type === 'mcp'}
+												{$i18n.t('Connection ID')}
+											{:else}
+												{$i18n.t('ID')}
+												{#if type !== 'composio'}
+													<span class="opacity-50">({$i18n.t('optional')})</span>
+												{/if}
+											{/if}
+										</label>
 									</div>
-									<div class="flex flex-1 items-center">
+									<Tooltip
+										className="flex flex-1 items-center"
+										tippyOptions={{ trigger: 'mouseenter focusin' }}
+										content={type === 'mcp' && oauthAuthTypes.includes(auth_type)
+											? edit
+												? $i18n.t(
+														'Identifies this connection in Open WebUI, separately from the OAuth client ID.'
+													)
+												: $i18n.t(
+														'Generated from the name, or enter your own. Identifies this connection in Open WebUI, separately from the OAuth client ID.'
+													)
+											: ''}
+									>
 										<input
 											id="enter-id"
 											class={`w-full flex-1 text-sm font-mono ${inputClass}`}
@@ -834,7 +874,7 @@
 											autocomplete="off"
 											required={['mcp', 'composio'].includes(type)}
 										/>
-									</div>
+									</Tooltip>
 								</div>
 							{/if}
 						</div>
@@ -990,13 +1030,13 @@
 											required
 										/>
 
-										<Tooltip content={verifyLabel()} className="shrink-0 flex items-center mr-1">
+										<Tooltip content={verifyLabel} className="shrink-0 flex items-center mr-1">
 											<button
 												class="self-center p-1 bg-transparent hover:bg-gray-100 dark:hover:bg-gray-850 rounded-lg transition"
 												on:click={() => {
 													verifyHandler();
 												}}
-												aria-label={verifyLabel()}
+												aria-label={verifyLabel}
 												type="button"
 											>
 												<svg
@@ -1413,9 +1453,7 @@
 						</div>
 
 						<button
-							class="px-3.5 py-1.5 text-sm font-medium bg-black hover:bg-gray-900 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition rounded-full flex items-center gap-2 whitespace-nowrap {loading
-								? ' cursor-not-allowed'
-								: ''}"
+							class="flex h-7 shrink-0 items-center justify-center gap-1.5 rounded-lg bg-gray-900 px-2.5 text-xs font-normal text-white transition hover:bg-black disabled:opacity-60 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white disabled:cursor-not-allowed"
 							type="submit"
 							disabled={loading}
 						>
@@ -1423,7 +1461,7 @@
 
 							{#if loading}
 								<span class="shrink-0">
-									<Spinner />
+									<Spinner className="size-3" />
 								</span>
 							{/if}
 						</button>

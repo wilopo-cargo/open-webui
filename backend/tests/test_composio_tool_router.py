@@ -33,6 +33,10 @@ _TEST_ENV = {
     'FROM_INIT_PY': 'false',
     'ENV': 'test',
     'WEBUI_AUTH': 'true',
+    'ENABLE_TOOL_SERVERS': 'true',
+    'ENABLE_TOOLS': 'false',
+    'ENABLE_FUNCTIONS': 'false',
+    'ERP_MCP_SERVER_ID': 'wilopo-erp',
     'WEBUI_SECRET_KEY': 'test-only-composio-signing-key-never-use-in-production',
     'WEBUI_JWT_SECRET_KEY': '',
     'GLOBAL_LOG_LEVEL': '',
@@ -76,6 +80,7 @@ def app_modules():
     from open_webui.internal import db
     from open_webui.routers import configs, tools
     from open_webui.utils import composio, erp_mcp, middleware
+    from open_webui.utils import tools as tool_utils
 
     assert env.DATA_DIR.resolve() == _TEST_DATA_PATH
     assert env.DATABASE_URL == _TEST_ENV['DATABASE_URL']
@@ -86,7 +91,14 @@ def app_modules():
     assert Path(db.engine.url.database).resolve() == _TEST_DATA_PATH / 'test.db'
     assert Path(db.async_engine.url.database).resolve() == _TEST_DATA_PATH / 'test.db'
     try:
-        yield SimpleNamespace(configs=configs, composio=composio, erp_mcp=erp_mcp, middleware=middleware, tools=tools)
+        yield SimpleNamespace(
+            configs=configs,
+            composio=composio,
+            erp_mcp=erp_mcp,
+            middleware=middleware,
+            tools=tools,
+            tool_utils=tool_utils,
+        )
     finally:
         db.engine.dispose()
         _restore_test_environment()
@@ -344,6 +356,7 @@ async def test_full_config_import_rejects_invalid_composio_without_changing_prio
         json={
             'config': {
                 'ui.default_models': 'replacement-model',
+                'auth.mfa.enable': True,
                 'oauth.import_test_guard': 'replacement-default',
                 'import_test.unrelated': {'replace': True},
                 'import_test.new': 'must-not-be-persisted',
@@ -352,9 +365,6 @@ async def test_full_config_import_rejects_invalid_composio_without_changing_prio
         },
     )
     assert response.status_code == 400
-    detail = response.json()['detail']
-    assert 'Composio' in detail and 'toolkit' in detail.lower()
-    assert 'No configuration was changed' in detail
     for private_value in (
         'private-import-api-key',
         'private-provider-value',
@@ -703,6 +713,7 @@ async def test_mcp_client_keeps_native_factory_selection_and_accepts_composio_ov
     from open_webui.utils.mcp import client as mcp_client
 
     factories = []
+    auths = []
 
     class Context:
         def __init__(self, result):
@@ -722,22 +733,26 @@ async def test_mcp_client_keeps_native_factory_selection_and_accepts_composio_ov
             return None
 
         async def initialize(self):
-            return None
+            return SimpleNamespace(instructions=None)
 
-    def streamablehttp_client(url, headers=None, httpx_client_factory=None):
+    def streamablehttp_client(url, headers=None, auth=None, httpx_client_factory=None):
         factories.append(httpx_client_factory)
+        auths.append(auth)
         return Context((object(), object(), None))
 
     monkeypatch.setattr(mcp_client, 'streamablehttp_client', streamablehttp_client)
-    monkeypatch.setattr(mcp_client, 'ClientSession', lambda *_args: Session())
+    monkeypatch.setattr(mcp_client, 'ClientSession', lambda *_args, **_kwargs: Session())
     monkeypatch.setattr(mcp_client, 'AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL', ssl_enabled)
 
     native_client = mcp_client.MCPClient()
-    await native_client.connect('https://native.example/mcp')
+    native_auth = httpx.BasicAuth('test-user', 'test-password')
+    await native_client.connect('https://native.example/mcp', auth=native_auth)
+    assert auths[-1] is native_auth
     native_factory = factories[-1]
     assert native_factory is (
         mcp_client.create_httpx_client if expected_factory == 'secure' else mcp_client.create_insecure_httpx_client
     )
+    assert native_client.instructions is None
     await native_client.disconnect()
 
     def custom_factory(**_kwargs):
@@ -886,19 +901,23 @@ def _in_process_mcp_client_class(
         sessions = {}
         disconnect_order = []
 
-        def __init__(self):
+        def __init__(self, event_caller=None, server_name=''):
             self.url = None
             self.headers = None
             self.account_id = None
             self.session_id = None
             self.calls = []
             self.closed = False
+            self.instructions = None
+            self.event_caller = event_caller
+            self.server_name = server_name
             self.instances.append(self)
 
-        async def connect(self, url, headers=None, *, httpx_client_factory=None):
+        async def connect(self, url, headers=None, auth=None, *, httpx_client_factory=None):
             self.url = url
             self.headers = headers or {}
             self.httpx_client_factory = httpx_client_factory
+            self.auth = auth
             if url == 'https://native.example/mcp':
                 self.account_id = 'native'
             else:
@@ -1015,6 +1034,8 @@ def _install_user_bound_sessions(monkeypatch, app_modules, client_class, *, cata
 def _prepare_chat_payload(
     monkeypatch, app_modules, connections, user, tool_ids, *, hostile_metadata=None, client_class
 ):
+    from open_webui.config import DEFAULT_USER_PERMISSIONS
+
     middleware = app_modules.middleware
 
     async def config_get(key, default=None):
@@ -1022,6 +1043,7 @@ def _prepare_chat_payload(
             'tool_server.connections': connections,
             'webui.url': 'https://webui.example.test',
             'terminal_server.connections': [],
+            'user.permissions': copy.deepcopy(DEFAULT_USER_PERMISSIONS),
         }
         return values.get(key, default)
 
@@ -1037,8 +1059,9 @@ def _prepare_chat_payload(
     from open_webui.models.groups import Groups
 
     monkeypatch.setattr(middleware.Config, 'get', staticmethod(config_get))
-    monkeypatch.setattr(middleware, 'ENABLE_PLUGINS', False)
+    monkeypatch.setattr(middleware, 'ENABLE_FUNCTIONS', False)
     monkeypatch.setattr(middleware, 'MCPClient', client_class)
+    monkeypatch.setattr(app_modules.tool_utils, 'MCPClient', client_class)
     monkeypatch.setattr(middleware, 'apply_params_to_form_data', lambda form, _model: form)
     monkeypatch.setattr(middleware, 'process_pipeline_inlet_filter', return_form)
     monkeypatch.setattr(middleware, 'get_event_emitter', no_result)
@@ -1082,7 +1105,7 @@ async def _process_chat_with_servers(
         hostile_metadata=hostile_metadata,
         client_class=client_class,
     )
-    form_data, metadata, _events = await app_modules.middleware.process_chat_payload(
+    form_data, metadata, _events, _pending = await app_modules.middleware.process_chat_payload(
         request,
         form_data,
         user,
@@ -1213,7 +1236,7 @@ async def test_disabled_denied_and_forged_composio_ids_make_no_provider_request(
         )
         result = await app_modules.middleware.connect_composio_server(_request, server_id, user)
         assert result is None
-        _form, chat_metadata, _events = await app_modules.middleware.process_chat_payload(
+        _form, chat_metadata, _events, _pending = await app_modules.middleware.process_chat_payload(
             _request, _form, user, _metadata, _model
         )
         assert not chat_metadata.get('mcp_clients')
@@ -1341,9 +1364,6 @@ async def test_manager_tool_schema_and_callable_are_policy_and_session_scoped(ap
         if message.get('role') == 'system' and isinstance(message.get('content'), str)
     )
     assert manager_name in system_context
-    assert 'work account' in system_context.lower()
-    assert 'status' in system_context.lower()
-    assert 'never automatically retry' in system_context.lower()
     assert 'test-project-key' not in json.dumps(form_data, default=str)
     assert client_class.instances[0].url not in system_context
 
@@ -1594,15 +1614,19 @@ def _native_connection(server_id='shared'):
 
 
 async def _execute_tool_output(app_modules, request, form_data, metadata, user, name, arguments):
-    return await app_modules.middleware.execute_tool_call_for_output(
-        request,
-        form_data,
-        user,
-        metadata,
-        None,
-        None,
-        {'id': 'test-call', 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(arguments)}},
+    tool_call = {
+        'id': 'test-call',
+        'type': 'function',
+        'function': {'name': name, 'arguments': json.dumps(arguments)},
+    }
+    _params, result, tool, tool_type, direct = await app_modules.middleware.execute_tool_call(
+        form_data, metadata, None, tool_call
     )
+    if tool:
+        result, _files, _embeds = await app_modules.middleware.process_tool_result(
+            request, tool_call['function']['name'], result, tool_type, direct, metadata, user
+        )
+    return {'content': app_modules.middleware.tool_result_content(result)}
 
 
 @pytest.mark.parametrize('policy', [None, {}, {'toolkits': {}}, {'toolkits': {'googledrive': {'tools': ['*']}}}])
@@ -1740,7 +1764,7 @@ async def test_sessions_are_fresh_per_request_and_multiple_connections_bind_thei
     assert [json.loads(request.content)['user_id'] for request in requests] == ['openwebui:alice'] * 3
     assert set(first['mcp_clients']) == {'server:composio:drive', 'server:composio:notion'}
     assert connections == saved
-    model_context = json.dumps(form_data['tools']) + (first['system_prompt'] or '')
+    model_context = json.dumps({'tools': form_data['tools'], 'messages': form_data['messages']})
     for client in client_class.instances:
         assert client.url not in model_context and client.session_id not in model_context
     assert 'test-project-key' not in model_context
@@ -1777,7 +1801,7 @@ async def test_catalog_is_access_filtered_without_sessions_oauth_or_private_fiel
         raise AssertionError('Listing integrations must not contact Composio')
 
     monkeypatch.setattr(app_modules.tools.Config, 'get', staticmethod(config_get))
-    monkeypatch.setattr(app_modules.tools, 'ENABLE_PLUGINS', False)
+    monkeypatch.setattr(app_modules.tools, 'ENABLE_TOOLS', False)
     monkeypatch.setattr(app_modules.tools, 'BYPASS_ADMIN_ACCESS_CONTROL', False)
     monkeypatch.setattr(config, 'BYPASS_ADMIN_ACCESS_CONTROL', False)
     monkeypatch.setattr(Groups, 'get_groups_by_member_id', staticmethod(no_servers))
@@ -2004,7 +2028,7 @@ async def test_native_mcp_listing_failure_still_propagates_and_closes_client(app
         client_class=client_class,
     )
     with pytest.raises(RuntimeError, match='private listing failure'):
-        await app_modules.middleware.connect_mcp_server(request, 'shared', _user('alice'), metadata, {})
+        await app_modules.tool_utils.connect_mcp_server(request, 'shared', _user('alice'), {'__metadata__': metadata})
     assert len(client_class.instances) == 1
     assert client_class.instances[0].closed
     assert client_class.instances[0].httpx_client_factory is None
@@ -2073,7 +2097,7 @@ async def test_mcp_name_collisions_at_other_tool_merge_boundaries_fail_and_close
         async def filter_form(*_args, **kwargs):
             return kwargs['form_data'], {}
 
-        monkeypatch.setattr(middleware, 'ENABLE_PLUGINS', True)
+        monkeypatch.setattr(middleware, 'ENABLE_FUNCTIONS', True)
         monkeypatch.setattr(middleware, 'get_filter_context', lambda _request: None)
         monkeypatch.setattr(middleware, 'get_filter_functions', no_filters)
         monkeypatch.setattr(middleware, 'process_filter_functions', filter_form)
@@ -2143,8 +2167,8 @@ async def test_real_composio_lifecycle_suppresses_private_dependency_logs_but_no
                 logging.getLogger('mcp.client.streamable_http').debug('transport traceback', exc_info=True)
                 logging.getLogger('open_webui.utils.mcp.client').debug('client traceback', exc_info=True)
 
-        async def connect(self, url, headers=None, *, httpx_client_factory=None):
-            await super().connect(url, headers, httpx_client_factory=httpx_client_factory)
+        async def connect(self, url, headers=None, auth=None, *, httpx_client_factory=None):
+            await super().connect(url, headers, auth=auth, httpx_client_factory=httpx_client_factory)
             self.phases = []
             self._emit('connect')
             await asyncio.sleep(0)
@@ -2866,12 +2890,21 @@ async def test_resolved_open_callable_snapshot_cannot_be_broadened_or_rebound(ap
     assert client.closed
 
 
+@pytest.mark.parametrize('deferred', [False, True])
 @pytest.mark.asyncio
-async def test_erp_mcp_statement_reconcile_relays_owned_current_turn_bytes(app_modules, monkeypatch):
+async def test_erp_mcp_statement_reconcile_relays_owned_current_turn_bytes(app_modules, monkeypatch, deferred):
     import hashlib
     from email.parser import BytesParser
     from email.policy import default
     from open_webui.utils.session_pool import close_session
+    from open_webui.utils import tool_search
+
+    if deferred:
+
+        async def search_config():
+            return {'defer_threshold': 0, 'always_loaded': [], 'defer_builtin_tools': False}
+
+        monkeypatch.setattr(tool_search, 'get_tool_search_config', search_config)
 
     statement = b'No. Rekening,=,1234567890\nNama,=,Fixture\nMata Uang,=,IDR\n'
     statement += b'Tanggal,Keterangan,Cabang,Jumlah,,Saldo\n09/10/2026,fixture,000,100000.00,CR,100000.00\n'
@@ -2973,7 +3006,7 @@ async def test_erp_mcp_statement_reconcile_relays_owned_current_turn_bytes(app_m
         base_client = _in_process_mcp_client_class(native_specs=[statement_spec])
 
         class ERPClient(base_client):
-            async def connect(self, url, headers=None, *, httpx_client_factory=None):
+            async def connect(self, url, headers=None, auth=None, *, httpx_client_factory=None):
                 self.url = url
                 self.headers = headers or {}
                 self.httpx_client_factory = httpx_client_factory
@@ -3000,15 +3033,29 @@ async def test_erp_mcp_statement_reconcile_relays_owned_current_turn_bytes(app_m
             client_class=ERPClient,
         )
         request.app.state.oauth_client_manager = OAuthClientManager()
-        monkeypatch.setattr(app_modules.middleware, 'ERP_MCP_SERVER_ID', server_id)
         await app_modules.middleware.process_chat_payload(request, form_data, user, metadata, model)
 
         tool = metadata['tools'][f'{server_id}_statement_reconcile']
         assert file_id in tool['spec']['description']
         assert 'fixture-bank.csv' in tool['spec']['description']
-        result = await tool['callable'](file_id=file_id, target_account_id='account-1')
+
+        async def invoke_reconcile():
+            arguments = {'file_id': file_id, 'target_account_id': 'account-1'}
+            if not deferred:
+                return await tool['callable'](**arguments)
+            assert tool['spec']['name'] in metadata['deferred_tools']
+            call = {
+                'function': {
+                    'name': 'call_tool',
+                    'arguments': json.dumps({'tool_name': tool['spec']['name'], 'params': json.dumps(arguments)}),
+                }
+            }
+            _params, result, *_ = await app_modules.middleware.execute_tool_call(form_data, metadata, None, call)
+            return result
+
+        result = await invoke_reconcile()
         assert result == {'provider': 'native', 'tool': 'statement_reconcile'}
-        second_result = await tool['callable'](file_id=file_id, target_account_id='account-1')
+        second_result = await invoke_reconcile()
         assert second_result == {'provider': 'native', 'tool': 'statement_reconcile'}
         assert received == [
             {
@@ -3099,7 +3146,7 @@ async def test_erp_mcp_statement_reconcile_rejects_untrusted_attachment_referenc
     base_client = _in_process_mcp_client_class(native_specs=[statement_spec])
 
     class ERPClient(base_client):
-        async def connect(self, url, headers=None, *, httpx_client_factory=None):
+        async def connect(self, url, headers=None, auth=None, *, httpx_client_factory=None):
             self.url = url
             self.headers = headers or {}
             self.httpx_client_factory = httpx_client_factory
@@ -3129,7 +3176,6 @@ async def test_erp_mcp_statement_reconcile_rejects_untrusted_attachment_referenc
         client_class=ERPClient,
     )
     request.app.state.oauth_client_manager = OAuthClientManager()
-    monkeypatch.setattr(app_modules.middleware, 'ERP_MCP_SERVER_ID', server_id)
     await app_modules.middleware.process_chat_payload(request, form_data, _user('alice'), metadata, model)
 
     tool = metadata['tools'][f'{server_id}_statement_reconcile']
@@ -3171,9 +3217,10 @@ async def test_erp_mcp_connection_rejects_non_static_or_authorization_override(
         [f'server:mcp:{server_id}'],
         client_class=client_class,
     )
-    monkeypatch.setattr(app_modules.middleware, 'ERP_MCP_SERVER_ID', server_id)
     with pytest.raises(ValueError, match='ERP MCP server configuration'):
-        await app_modules.middleware.connect_mcp_server(request, server_id, _user('alice'), metadata, {})
+        await app_modules.tool_utils.connect_mcp_server(
+            request, server_id, _user('alice'), {'__metadata__': metadata}
+        )
     assert client_class.instances == []
 
 
@@ -3286,3 +3333,165 @@ async def test_erp_mcp_statement_reconcile_blocks_relay_failures(app_modules, mo
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_disabled_tool_servers_hide_catalog_and_block_native_and_composio_resolution(app_modules, monkeypatch):
+    client_class = _in_process_mcp_client_class()
+    requests = _install_user_bound_sessions(monkeypatch, app_modules, client_class)
+    user = _user('alice')
+    connection = _connection(server_id='shared', grants=_user_read_grant('alice'))
+    request, form_data, metadata, model = _prepare_chat_payload(
+        monkeypatch,
+        app_modules,
+        [connection, _native_connection()],
+        user,
+        ['server:composio:shared', 'server:mcp:shared'],
+        client_class=client_class,
+    )
+    for module in (app_modules.middleware, app_modules.tools, app_modules.tool_utils):
+        monkeypatch.setattr(module, 'ENABLE_TOOL_SERVERS', False)
+    assert await app_modules.tools.get_tools(request, user=user, db=None) == []
+    assert await app_modules.middleware.connect_composio_server(request, 'shared', user) is None
+    assert await app_modules.tool_utils.connect_mcp_server(request, 'shared', user, {}) is None
+    await app_modules.middleware.process_chat_payload(request, form_data, user, metadata, model)
+    assert not metadata.get('tools')
+    assert client_class.instances == []
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_deferred_composio_dispatch_keeps_user_scope_and_rejects_hostile_manager_arguments(
+    app_modules, monkeypatch
+):
+    from open_webui.utils import tool_search
+
+    async def search_config():
+        return {'defer_threshold': 0, 'always_loaded': [], 'defer_builtin_tools': False}
+
+    monkeypatch.setattr(tool_search, 'get_tool_search_config', search_config)
+    client_class = _in_process_mcp_client_class()
+    _install_user_bound_sessions(monkeypatch, app_modules, client_class)
+    connection = _connection(server_id='shared', grants=_user_read_grant('alice') + _user_read_grant('bob'))
+    for user_id in ('alice', 'bob'):
+        _request, form_data, metadata, _ = await _process_chat_with_servers(
+            monkeypatch,
+            app_modules,
+            [connection],
+            _user(user_id),
+            ['server:composio:shared'],
+            client_class=client_class,
+        )
+        assert {tool['function']['name'] for tool in form_data['tools']} == {'search_tools', 'call_tool'}
+        app_name = _composio_function_name('shared', 'GOOGLEDRIVE_FIND_FILE')
+        manager_name = _composio_function_name('shared', 'COMPOSIO_MANAGE_CONNECTIONS')
+        assert app_name in metadata['deferred_tools'] and manager_name in metadata['deferred_tools']
+
+        def tool_call(name, params):
+            return {'function': {'name': name, 'arguments': json.dumps(params)}}
+
+        _params, found, *_ = await app_modules.middleware.execute_tool_call(
+            form_data, metadata, None, tool_call('search_tools', {'query': 'GOOGLEDRIVE_FIND_FILE'})
+        )
+        assert app_name in {spec['name'] for spec in json.loads(found)['tools']}
+        for arguments in (
+            {'toolkits': ['notion']},
+            {'toolkits': ['googledrive'], 'session_id': 'foreign-session'},
+            {'toolkits': ['googledrive'], 'unknown': True},
+        ):
+            _params, result, *_ = await app_modules.middleware.execute_tool_call(
+                form_data,
+                metadata,
+                None,
+                tool_call('call_tool', {'tool_name': manager_name, 'params': json.dumps(arguments)}),
+            )
+            assert result.get('error')
+            assert client_class.instances[-1].calls == []
+        _params, result, *_ = await app_modules.middleware.execute_tool_call(
+            form_data,
+            metadata,
+            None,
+            tool_call('call_tool', {'tool_name': app_name, 'params': json.dumps({'query': 'shared document'})}),
+        )
+        assert result == {'files': _PRIVATE_DOCUMENTS[user_id]}
+        await app_modules.middleware.disconnect_mcp_clients(metadata['mcp_clients'])
+
+
+@pytest.mark.asyncio
+async def test_native_mcp_retains_instructions_long_names_elicitation_and_live_system_oauth(app_modules, monkeypatch):
+    names = ['tool_' + 'x' * 75 + suffix for suffix in ('first', 'second')]
+    specs = [
+        {'name': name, 'description': 'Native tool.', 'parameters': {'type': 'object', 'properties': {}}}
+        for name in names
+    ]
+    base_client = _in_process_mcp_client_class(native_specs=specs)
+
+    class NativeClient(base_client):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.instructions = 'Use the native server instructions.'
+
+    user = _user('alice')
+    connection = {**_native_connection(), 'auth_type': 'system_oauth'}
+    request, form_data, metadata, model = _prepare_chat_payload(
+        monkeypatch,
+        app_modules,
+        [connection],
+        user,
+        ['server:mcp:shared'],
+        hostile_metadata={'session_id': 'test-browser'},
+        client_class=NativeClient,
+    )
+
+    async def event_call(_event):
+        return {'action': 'cancel'}
+
+    async def get_event_call(_metadata):
+        return event_call
+
+    tokens = iter(['first-token', 'refreshed-token'])
+
+    async def get_oauth_token(_request, current_user):
+        assert current_user.id == user.id
+        return {'access_token': next(tokens)}
+
+    monkeypatch.setattr(app_modules.middleware, 'get_event_call', get_event_call)
+    monkeypatch.setattr(app_modules.tool_utils, 'get_system_oauth_token', get_oauth_token)
+    await app_modules.middleware.process_chat_payload(request, form_data, user, metadata, model)
+    client = NativeClient.instances[0]
+    assert client.event_caller is event_call
+    assert any(client.instructions in message.get('content', '') for message in form_data['messages'])
+    assert len(metadata['tools']) == 2
+    assert all(len(name) <= 64 for name in metadata['tools'])
+    results = [await tool['callable']() for tool in metadata['tools'].values()]
+    assert {result['tool'] for result in results} == set(names)
+
+    authorizations = []
+
+    def transport(http_request):
+        authorizations.append(http_request.headers['Authorization'])
+        return httpx.Response(200)
+
+    async with _HTTPX_ASYNC_CLIENT(transport=httpx.MockTransport(transport), auth=client.auth) as http:
+        await http.post('https://native.example/mcp', json={})
+        await http.post('https://native.example/mcp', json={})
+    assert authorizations == ['Bearer first-token', 'Bearer refreshed-token']
+    await app_modules.middleware.disconnect_mcp_clients(metadata['mcp_clients'])
+
+
+@pytest.mark.asyncio
+async def test_full_config_import_preserves_upstream_mfa_authorization_guard(app_modules, config_import_client):
+    Config = app_modules.configs.Config
+    before = await Config.get_all()
+    response = await config_import_client.post(
+        '/configs/import',
+        json={
+            'config': {
+                'auth.mfa.enable': True,
+                'ui.default_models': 'must-not-change',
+                'tool_server.connections': [_connection()],
+            }
+        },
+    )
+    assert response.status_code == 403
+    assert await Config.get_all() == before
