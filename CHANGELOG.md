@@ -14,8 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Verification checks credentials, callback configuration, and tool policy without executing tools or completing external-account consent. For broad Drive tool exposure, configure an approved auth configuration with the intended execution allowlist and OAuth scopes; leaving both execution allowlists empty does not enforce read-only access. Explicitly limiting the local list to `GOOGLEDRIVE_FIND_FILE`, `GOOGLEDRIVE_GET_FILE_METADATA`, and `GOOGLEDRIVE_GET_ABOUT` remains supported.
 - Native Wilopo ERP MCP current-turn CSV handoff, enabled by `ERP_MCP_SERVER_ID` and using each user's separate static OAuth connection. Owned saved CSV bytes are uploaded to the configured ERP service for read-only statement reconciliation, without ERP business-record writes.
 
-- Production-only GitHub Actions deployment for published `release-production-*` releases, using immutable commit-SHA images, encrypted per-region configuration, pinned SSH host keys, and a dedicated single-app Compose deployment. Setup and recovery prerequisites are documented in [`deployment/README.md`](deployment/README.md).
-- Production deployment uses the native `PORT` runtime setting, defaulting to `8081`; `PORT=8082` configures the listener, Traefik backend, and health checks together.
+- Disabled production-only GitHub Actions deployment for published `release-production-*` releases. Its immutable commit-SHA image, encrypted per-region configuration, pinned SSH host keys, dedicated single-app Compose setup, and recovery reference remain in [`deployment/README.md`](deployment/README.md), explicitly as disabled-workflow documentation only.
+- The documented disabled production deployment uses the native `PORT` runtime setting, defaulting to `8081`; `PORT=8082` configures the listener, Traefik backend, and health checks together.
 
 ### Fixed
 
@@ -25,7 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Upgrade the Wilopo fork to upstream Open WebUI 0.12.2 while retaining per-user Composio sessions, static ERP OAuth and current-turn CSV handoff, including deferred Tool Search dispatch. Keep GHCR-only standard-image publishing. Back up the database and associated data before deployment; schema migrations require a coordinated restart, not rolling updates. See [`deployment/README.md`](deployment/README.md).
+- Upgrade the Wilopo fork to upstream Open WebUI 0.12.2 while retaining per-user Composio sessions, static ERP OAuth and current-turn CSV handoff, including deferred Tool Search dispatch. Keep GHCR-only standard-image publishing. Any future production deployment requires a database and associated-data backup; schema migrations require a coordinated restart, not rolling updates. See [`deployment/README.md`](deployment/README.md).
+- Use Blacksmith's Ubuntu 24.04 x64 runner for the standard GHCR-only `linux/amd64` image workflow, and disable all other GitHub Actions workflows, including production deployment and release automation.
 
 ## [0.12.2] - 2026-10-14
 
