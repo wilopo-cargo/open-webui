@@ -47,7 +47,6 @@
 	import ChatItem from './ChatItem.svelte';
 	import FolderHoverPreview from './FolderHoverPreview.svelte';
 	import FolderMenu from './Folders/FolderMenu.svelte';
-	import FolderShareModal from './Folders/FolderShareModal.svelte';
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import FolderModal from './Folders/FolderModal.svelte';
 	import Emoji from '$lib/components/common/Emoji.svelte';
@@ -73,7 +72,6 @@
 
 	let openPreview = false;
 	let showFolderModal = false;
-	let showShareModal = false;
 	let edit = false;
 
 	let showCreateSubFolderModal = false;
@@ -84,15 +82,7 @@
 
 	let clickTimer = null;
 
-	$: if (
-		$mobile ||
-		edit ||
-		dragged ||
-		parentDragged ||
-		draggedOver ||
-		showFolderModal ||
-		showShareModal
-	) {
+	$: if ($mobile || edit || dragged || parentDragged || draggedOver || showFolderModal) {
 		openPreview = false;
 	}
 
@@ -742,8 +732,6 @@
 	onSubmit={createSubFolderHandler}
 />
 
-<FolderShareModal bind:show={showShareModal} folder={folders[folderId]} />
-
 {#if dragged && x && y}
 	<DragGhost {x} {y}>
 		<div class=" bg-black/80 backdrop-blur-2xl px-2 py-1 rounded-lg w-fit max-w-40">
@@ -757,7 +745,12 @@
 	</DragGhost>
 {/if}
 
-<div bind:this={folderElement} class="relative {className}" draggable={!folders[folderId]?.shared}>
+<div
+	bind:this={folderElement}
+	class="relative {className}"
+	role="listitem"
+	draggable={!folders[folderId]?.shared}
+>
 	{#if draggedOver}
 		<div
 			class="absolute top-0 left-0 w-full h-full rounded-xs bg-gray-100/50 dark:bg-gray-700/20 bg-opacity-50 dark:bg-opacity-10 z-50 pointer-events-none touch-none"
@@ -785,6 +778,10 @@
 			>
 				<button
 					class="text-gray-600 dark:text-gray-400 transition-all p-1 hover:bg-gray-100 dark:hover:bg-gray-900 rounded-lg"
+					aria-label={open
+						? $i18n.t('Collapse {{name}}', { name: folders[folderId]?.name })
+						: $i18n.t('Expand {{name}}', { name: folders[folderId]?.name })}
+					aria-expanded={open}
 					on:click={(e) => {
 						e.stopPropagation();
 						e.stopImmediatePropagation();
@@ -917,17 +914,15 @@
 				</div>
 
 				{#if isWritable}
-					<button
+					<div
 						class="absolute z-10 right-2 hover-reveal self-center flex items-center dark:text-gray-300"
+						role="presentation"
 						on:pointerdown={() => (openPreview = false)}
 					>
 						<FolderMenu
-							canShare={$user?.role === 'admin' || !folders[folderId]?.shared}
+							onNewChat={openFolderHandler}
 							onEdit={() => {
 								showFolderModal = true;
-							}}
-							onShare={() => {
-								showShareModal = true;
 							}}
 							onDelete={() => {
 								showDeleteConfirm = true;
@@ -947,7 +942,7 @@
 								<MoreHorizontal className="size-3.5" strokeWidth="2" />
 							</div>
 						</FolderMenu>
-					</button>
+					</div>
 				{/if}
 			</div>
 		</div>
@@ -967,27 +962,31 @@
 								})
 							)}
 
-						{#each children as childFolder (`${folderId}-${childFolder.id}`)}
-							<svelte:self
-								bind:folderRegistry
-								{folders}
-								folderId={childFolder.id}
-								{shiftKey}
-								parentDragged={dragged}
-								{onItemMove}
-								{onDelete}
-								{onFolderUnreadCounts}
-								on:import={(e) => {
-									dispatch('import', e.detail);
-								}}
-								on:update={(e) => {
-									dispatch('update', e.detail);
-								}}
-								on:change={(e) => {
-									dispatch('change', e.detail);
-								}}
-							/>
-						{/each}
+						{#if children.length > 0}
+							<div role="list">
+								{#each children as childFolder (`${folderId}-${childFolder.id}`)}
+									<svelte:self
+										bind:folderRegistry
+										{folders}
+										folderId={childFolder.id}
+										{shiftKey}
+										parentDragged={dragged}
+										{onItemMove}
+										{onDelete}
+										{onFolderUnreadCounts}
+										on:import={(e) => {
+											dispatch('import', e.detail);
+										}}
+										on:update={(e) => {
+											dispatch('update', e.detail);
+										}}
+										on:change={(e) => {
+											dispatch('change', e.detail);
+										}}
+									/>
+								{/each}
+							</div>
+						{/if}
 					{/if}
 
 					{#if chats === null && chatsLoading}
@@ -1008,29 +1007,37 @@
 						</div>
 					{/if}
 
-					{#each chats ?? [] as chat (chat.id)}
-						<ChatItem
-							id={chat.id}
-							title={chat.title}
-							createdAt={chat.created_at}
-							updatedAt={chat.updated_at}
-							lastReadAt={chat.last_read_at}
-							active={chat.active ?? false}
-							ownerName={chat.owner_name ?? null}
-							participants={chat.participants ?? []}
-							ownerUserId={folders[folderId]?.showOwnerInfo ||
-							folders[folderId]?.shared ||
-							chat.user_id !== $user?.id
-								? chat.user_id
-								: null}
-							readonly={chat.user_id !== $user?.id}
-							{shiftKey}
-							onReadStateChange={applyReadState}
-							on:change={(e) => {
-								dispatch('change', e.detail);
-							}}
-						/>
-					{/each}
+					{#if (chats ?? []).length > 0}
+						<div role="list">
+							{#each chats ?? [] as chat (chat.id)}
+								<div role="listitem">
+									<ChatItem
+										id={chat.id}
+										title={chat.title}
+										createdAt={chat.created_at}
+										updatedAt={chat.updated_at}
+										lastReadAt={chat.last_read_at}
+										active={chat.active ?? false}
+										ownerName={chat.owner_name ?? null}
+										participants={chat.participants ?? []}
+										ownerUserId={folders[folderId]?.showOwnerInfo ||
+										folders[folderId]?.shared ||
+										chat.user_id !== $user?.id
+											? chat.user_id
+											: null}
+										readonly={chat.user_id !== $user?.id}
+										canMove={folders[folderId]?.user_id === $user?.id}
+										canRename={folders[folderId]?.user_id === $user?.id}
+										{shiftKey}
+										onReadStateChange={applyReadState}
+										on:change={(e) => {
+											dispatch('change', e.detail);
+										}}
+									/>
+								</div>
+							{/each}
+						</div>
+					{/if}
 
 					{#if hasMoreChats}
 						<button

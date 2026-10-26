@@ -5,6 +5,7 @@
 	import Dropdown from '$lib/components/common/Dropdown.svelte';
 	import DropdownMenu from '$lib/components/common/DropdownMenu.svelte';
 	import Icon from './Icon.svelte';
+	import Check from '$lib/components/icons/Check.svelte';
 
 	export let dragType = 'application/x-terminal-file-move';
 	const i18n: any = getContext('i18n');
@@ -13,6 +14,8 @@
 	export let selectedFile: string | null = null;
 	export let loading = false;
 	export let writable = true;
+	export let viewMode: 'grid' | 'list' | null = null;
+	export let onViewModeChange: (mode: 'grid' | 'list') => void = () => {};
 
 	export let onNavigate: (path: string) => void = () => {};
 	export let onRefresh: () => void = () => {};
@@ -245,27 +248,27 @@
 				<DropdownMenu className="min-w-[9.375rem] z-[9999999]">
 					<button
 						type="button"
-						class="select-none flex h-7 w-full items-center gap-2 rounded-lg px-2 text-xs hover:bg-gray-50/40 dark:hover:bg-white/4 transition disabled:opacity-40 disabled:hover:bg-transparent"
-						on:click={() => {
-							onNewFolder();
-							actionsMenuOpen = false;
-						}}
-						disabled={!writable}
-					>
-						<Icon name="folder" size={12} strokeWidth={1.4} />
-						<span>{$i18n.t('New Folder')}</span>
-					</button>
-					<button
-						type="button"
-						class="select-none flex h-7 w-full items-center gap-2 rounded-lg px-2 text-xs hover:bg-gray-50/40 dark:hover:bg-white/4 transition disabled:opacity-40 disabled:hover:bg-transparent"
+						class="select-none flex h-[1.6875rem] w-full cursor-pointer items-center gap-2 rounded-xl bg-transparent px-2 text-xs hover:text-gray-900 dark:hover:text-gray-100 disabled:opacity-40"
 						on:click={() => {
 							onNewFile();
 							actionsMenuOpen = false;
 						}}
 						disabled={!writable}
 					>
-						<Icon name="empty-page" size={12} strokeWidth={1.4} />
+						<Icon name="file-plus" size={14} strokeWidth={1.5} />
 						<span>{$i18n.t('New File')}</span>
+					</button>
+					<button
+						type="button"
+						class="select-none flex h-[1.6875rem] w-full cursor-pointer items-center gap-2 rounded-xl bg-transparent px-2 text-xs hover:text-gray-900 dark:hover:text-gray-100 disabled:opacity-40"
+						on:click={() => {
+							onNewFolder();
+							actionsMenuOpen = false;
+						}}
+						disabled={!writable}
+					>
+						<Icon name="folder-plus" size={14} strokeWidth={1.5} />
+						<span>{$i18n.t('New Folder')}</span>
 					</button>
 					<button
 						type="button"
@@ -276,7 +279,7 @@
 						}}
 						disabled={!writable}
 					>
-						<Icon name="upload" size={12} strokeWidth={1.4} />
+						<Icon name="upload-tray" size={14} strokeWidth={1.5} />
 						<span>{$i18n.t('Upload')}</span>
 					</button>
 					{#if onUploadFolder}
@@ -289,7 +292,7 @@
 								onUploadFolder?.();
 							}}
 						>
-							<Icon name="upload" size={12} strokeWidth={1.4} />
+							<Icon name="folder-upload" size={14} strokeWidth={1.5} />
 							<span>{$i18n.t('Upload Folder')}</span>
 						</button>
 					{/if}
@@ -301,7 +304,7 @@
 							actionsMenuOpen = false;
 						}}
 					>
-						<Icon name="download" size={12} strokeWidth={1.4} />
+						<Icon name="download-tray" size={14} strokeWidth={1.5} />
 						<span>{$i18n.t('Download')}</span>
 					</button>
 					<button
@@ -312,9 +315,31 @@
 							actionsMenuOpen = false;
 						}}
 					>
-						<Icon name="eye" size={12} strokeWidth={1.4} />
+						<Icon name={showHidden ? 'eye-off' : 'eye'} size={14} strokeWidth={1.5} />
 						<span>{showHidden ? $i18n.t('Hide Hidden Files') : $i18n.t('Show Hidden Files')}</span>
 					</button>
+					{#if viewMode !== null}
+						<div class="my-1 border-t border-gray-100 dark:border-white/10" role="separator"></div>
+						{#each ['grid', 'list'] as mode}
+							<button
+								type="button"
+								class="select-none flex h-7 w-full items-center gap-2 rounded-lg px-2 text-xs hover:bg-gray-50/40 dark:hover:bg-white/4 transition"
+								aria-pressed={viewMode === mode}
+								on:click={() => {
+									onViewModeChange(mode === 'grid' ? 'grid' : 'list');
+									actionsMenuOpen = false;
+								}}
+							>
+								<Icon name={mode} size={12} strokeWidth={1.4} />
+								<span class="flex-1 text-left"
+									>{mode === 'grid' ? $i18n.t('Grid view') : $i18n.t('List view')}</span
+								>
+								{#if viewMode === mode}
+									<Check className="size-3.5 shrink-0" strokeWidth="2" />
+								{/if}
+							</button>
+						{/each}
+					{/if}
 				</DropdownMenu>
 			</div>
 		</Dropdown>

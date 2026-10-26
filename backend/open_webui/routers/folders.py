@@ -12,10 +12,11 @@ from open_webui.config import UPLOAD_DIR
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_session
-from open_webui.models.shared_chats import ChatShareMode
+from open_webui.models.access_grants import AccessGrants
+from open_webui.models.automations import Automations
 from open_webui.models.chat_messages import ChatMessages
-from open_webui.models.config import Config
 from open_webui.models.chats import Chats
+from open_webui.models.config import Config
 from open_webui.models.folders import (
     FolderForm,
     FolderModel,
@@ -23,17 +24,16 @@ from open_webui.models.folders import (
     Folders,
     FolderUpdateForm,
 )
-from open_webui.models.access_grants import AccessGrants
-from open_webui.models.automations import Automations
 from open_webui.models.groups import Groups
+from open_webui.models.shared_chats import ChatShareMode
 from open_webui.models.users import Users
-from open_webui.utils.access_control import has_permission
+from open_webui.tasks import has_active_tasks
 from open_webui.utils.access_control import (
-    filter_allowed_access_grants,
+    has_permission,
+    validate_access_grants,
 )
 from open_webui.utils.access_control.files import can_read_all_folder_files, get_accessible_folder_files
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.tasks import has_active_tasks
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -267,19 +267,22 @@ async def get_shared_folders(
     ]
 
     # Also include child folders of shared folders (inheritance)
-    seen_ids = {folder.id for folder in shared_folders}
+    result_by_id = {folder['id']: folder for folder in results}
     for folder in shared_folders:
         children = await Folders.get_children_folders_by_id_and_user_id(folder.id, folder.user_id, db=db)
         for child in children or []:
-            if child.id not in seen_ids:
-                seen_ids.add(child.id)
-                results.append(
-                    {
-                        **child.model_dump(),
-                        'owner_name': owner_names.get(child.user_id, 'Unknown'),
-                        'permission': 'write' if child.user_id == user.id else folder_perms[folder.id],
-                    }
-                )
+            permission = 'write' if folder.user_id == user.id or child.user_id == user.id else folder_perms[folder.id]
+            if child.id in result_by_id:
+                # A weaker direct grant must not hide inherited write access.
+                if permission == 'write':
+                    result_by_id[child.id]['permission'] = 'write'
+            else:
+                result_by_id[child.id] = {
+                    **child.model_dump(),
+                    'owner_name': owner_names.get(child.user_id, 'Unknown'),
+                    'permission': permission,
+                }
+                results.append(result_by_id[child.id])
 
     return results
 
@@ -552,12 +555,12 @@ async def update_folder_access_by_id(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    form_data.access_grants = await filter_allowed_access_grants(
+    form_data.access_grants = await validate_access_grants(
         await Config.get('user.permissions'),
         user.id,
         user.role,
         form_data.access_grants,
-        None,
+        resource_type='folder',
         db=db,
     )
 

@@ -36,6 +36,7 @@ from open_webui.utils.access_control import (
     filter_allowed_access_grants,
     has_connection_access,
     has_permission,
+    validate_access_grants,
 )
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.plugin import (
@@ -421,7 +422,7 @@ async def create_new_tools(
                 user.id,
                 user.role,
                 form_data.access_grants,
-                'sharing.public_tools',
+                resource_type='tool',
             )
 
             form_data.content = replace_imports(form_data.content)
@@ -572,22 +573,10 @@ async def _update_tool(request, id, form_data, user, db, version_id=None):
 
         specs = get_local_tool_specs(tool_module)
 
-        if version_id is None:
-            form_data.access_grants = await filter_allowed_access_grants(
-                await Config.get('user.permissions'),
-                user.id,
-                user.role,
-                form_data.access_grants,
-                'sharing.public_tools',
-            )
-
         updated = {
-            **form_data.model_dump(exclude={'id'}),
+            **form_data.model_dump(exclude={'id', 'access_grants'}),
             'specs': specs,
         }
-
-        if version_id is not None:
-            updated.pop('access_grants', None)
 
         tools = await Tools.update_tool_by_id(
             id,
@@ -664,12 +653,12 @@ async def update_tool_access_by_id(
             detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
 
-    form_data.access_grants = await filter_allowed_access_grants(
+    form_data.access_grants = await validate_access_grants(
         await Config.get('user.permissions'),
         user.id,
         user.role,
         form_data.access_grants,
-        'sharing.public_tools',
+        resource_type='tool',
     )
 
     await AccessGrants.set_access_grants('tool', id, form_data.access_grants, db=db)

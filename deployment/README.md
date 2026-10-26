@@ -41,7 +41,7 @@ Provision each host and its dedicated `/.../open-webui` directory before deploym
 
 Create a dedicated PostgreSQL database and login for this Open WebUI installation. The encrypted runtime environment must define nonempty `WEBUI_SECRET_KEY`, `DATABASE_URL`, `WEBUI_URL`, and `APP_HOST` values. `WEBUI_SECRET_KEY` must be a long-lived stable key; changing it can invalidate sessions and tokens. `DATABASE_URL` must use the dedicated PostgreSQL database. `WEBUI_URL` must be the application's HTTPS URL and `APP_HOST` its DNS host. Keep this environment file private; deployment never prints its contents. The deployment script decrypts it under `umask 077`, validates required settings and Compose configuration, then stores it as mode `0600` before any existing app is stopped.
 
-For an existing installation, preserve its effective signing key, database, and data volume rather than treating this as a fresh install. An existing persisted WebUI URL can override the environment default: set the production URL through Admin → Settings before using Composio callbacks. This workflow does not move or change the laptop installation. Before upgrading to Open WebUI 0.12.2, take and verify a restorable backup of the database and all associated application data, including the named volume and any external file, object, or vector stores in use.
+For an existing installation, preserve its effective signing key, database, and data volume rather than treating this as a fresh install. An existing persisted WebUI URL can override the environment default: set the production URL through Admin → Settings before using Composio callbacks. This workflow does not move or change the laptop installation. Before upgrading to Open WebUI 0.12.4, take and verify a restorable backup of the database and all associated application data, including the named volume and any external file, object, or vector stores in use. Stop all instances together before starting the upgraded image; mixed-version rolling updates are unsupported.
 
 Compose uses project name `wilopo-open-webui-prod`, one `app` service, and the dedicated named `open_webui_data` volume. It does not start Ollama, run a separate migration service, or remove volumes/images. Do not share this project name or data volume with another application.
 
@@ -52,6 +52,20 @@ If deliberately re-enabled after review and setup, publishing the matching produ
 The host logs in to GHCR using the workflow token, pulls the image before stopping the current app, then stops the single app and starts it with Compose `--wait` (up to 300 seconds). Health requires both `/ready` and `/health/db`; the container allows a five-minute startup grace period for migrations. If pull or validation fails, the running app is not stopped. If startup/readiness fails after replacement, the workflow reports failure but does not restore the old binary or roll back database changes. Inspect service logs and assess migration/database compatibility first; a manual previous-image redeploy is only safe after that assessment. No automatic database backup, destructive cleanup, or rollback is performed. Restore the matching pre-upgrade database and associated data backup before redeploying the previous image if migrations ran; never assume an image-only rollback is safe.
 
 ## Verification
+
+### Open WebUI 0.12.4 upgrade
+
+This fork incorporates upstream [v0.12.4](https://github.com/open-webui/open-webui/releases/tag/v0.12.4), including its security fixes, while preserving Wilopo's Composio and ERP MCP integrations. The MCP SDK now uses `httpx2`; Composio's MCP transport retains TLS certificate verification and scoped dependency-log filtering.
+
+Pre-merge verification on 2026-10-26 passed:
+
+- The production frontend build using Node 22.
+- All 232 Composio/ERP integration checks, including loopback MCP HTTP transport, untrusted TLS rejection, OAuth, and CSV ownership/security cases. Run them in a fresh process with `PYTHONPATH=backend PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m pytest -q backend/tests/test_composio_tool_router.py` from the repository root.
+- Parsing all 64 locale files and confirming `docker.yaml` is the only enabled workflow.
+- Starting the built application with a disposable SQLite database, applying migrations, checking `/api/version` reports `0.12.4`, and receiving HTTP 200 from `/ready` and `/health/db`. Browser verification reached the Create Admin Account form without captured browser errors.
+
+This verifies a fresh isolated installation, not migration of the production PostgreSQL database, real Composio/ERP consent or tool execution, model inference, image publication, or production rollout. Production deployment remains disabled.
+
 
 For the disabled workflow only, run `actionlint .github/workflows/production-deployment.yml.disabled`, `shellcheck deployment/deploy.sh`, and `bash -n deployment/deploy.sh` before deliberately re-enabling it.
 

@@ -43,13 +43,14 @@ from open_webui.models.users import (
 )
 from open_webui.socket.main import (
     emit_to_users,
+    encryption,
     enter_room_for_users,
     get_user_ids_from_room,
     leave_room_for_users,
     sio,
 )
 from open_webui.tasks import create_task
-from open_webui.utils.access_control import filter_allowed_access_grants, has_permission
+from open_webui.utils.access_control import filter_allowed_access_grants, has_permission, validate_access_grants
 from open_webui.utils.apps import (
     check_app_channel_access,
     create_app_message,
@@ -333,7 +334,7 @@ async def create_new_channel(
         user.id,
         user.role,
         form_data.access_grants,
-        'sharing.public_channels',
+        resource_type='channel',
     )
 
     try:
@@ -657,6 +658,7 @@ async def update_is_active_member_by_id_and_user_id(
     if not await Channels.is_user_channel_member(channel.id, user.id, db=db):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
 
+    await encryption.invalidate(id)
     await Channels.update_member_active_status(channel.id, user.id, form_data.is_active, db=db)
     await publish_event(
         request,
@@ -753,6 +755,7 @@ async def remove_members_by_id(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT())
 
     try:
+        await encryption.invalidate(id)
         deleted = await Channels.remove_members_from_channel(channel.id, form_data.user_ids, db=db)
         if channel.type == 'group':
             await leave_room_for_users(f'channel:{channel.id}', form_data.user_ids)
@@ -792,26 +795,9 @@ async def update_channel_by_id(
     if channel.user_id != user.id and user.role != 'admin':
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT())
 
-    form_data.access_grants = await filter_allowed_access_grants(
-        await Config.get('user.permissions'),
-        user.id,
-        user.role,
-        form_data.access_grants,
-        'sharing.public_channels',
-    )
-
-    previous_access_grants = channel.access_grants
-
     try:
+        await encryption.invalidate(id)
         channel = await Channels.update_channel_by_id(id, form_data, db=db)
-        # Group and DM channels use membership instead of access grants.
-        if form_data.access_grants is not None and channel.type not in ['group', 'dm']:
-            revoked_user_ids = await AccessGrants.get_revoked_user_ids_by_resource(
-                'channel', id, previous_access_grants, db=db
-            )
-            revoked_user_ids.discard(channel.user_id)
-            await leave_room_for_users(f'channel:{id}', list(revoked_user_ids))
-
         await publish_event(
             request,
             EVENTS.CHANNEL_UPDATED,
@@ -823,6 +809,48 @@ async def update_channel_by_id(
     except Exception as e:
         log.exception(e)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.DEFAULT())
+
+
+class ChannelAccessGrantsForm(BaseModel):
+    access_grants: list[dict]
+
+
+@router.post('/{id}/access/update', response_model=ChannelModel)
+async def update_channel_access_by_id(
+    request: Request,
+    id: str,
+    form_data: ChannelAccessGrantsForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    await check_channels_access(request, user)
+    channel = await Channels.get_channel_by_id(id, db=db)
+    if not channel:
+        raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
+    if channel.user_id != user.id and user.role != 'admin':
+        raise HTTPException(status_code=403, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+    # Group and DM channels manage access through membership instead.
+    if channel.type in ['group', 'dm']:
+        raise HTTPException(status_code=403, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+    grants = await validate_access_grants(
+        await Config.get('user.permissions'),
+        user.id,
+        user.role,
+        form_data.access_grants,
+        resource_type='channel',
+        db=db,
+    )
+    previous_access_grants = channel.access_grants
+    await encryption.invalidate(id)
+    channel.access_grants = await AccessGrants.set_access_grants('channel', id, grants, db=db)
+    revoked_user_ids = await AccessGrants.get_revoked_user_ids_by_resource('channel', id, previous_access_grants, db=db)
+    revoked_user_ids.discard(channel.user_id)
+    await leave_room_for_users(f'channel:{id}', list(revoked_user_ids))
+    await publish_event(
+        request, EVENTS.CHANNEL_UPDATED, actor=user, subject_id=id, data={'name': channel.name, 'type': channel.type}
+    )
+    return channel
 
 
 ############################
@@ -847,6 +875,7 @@ async def delete_channel_by_id(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT())
 
     try:
+        await encryption.invalidate(id)
         await Channels.delete_channel_by_id(id, db=db)
         await sio.close_room(f'channel:{id}')
         await publish_event(
@@ -1476,12 +1505,11 @@ async def post_new_message(
         except Exception as e:
             log.debug(e)
 
-        active_user_ids = await get_user_ids_from_room(f'channel:{channel.id}')
-
         # NOTE: We intentionally do NOT pass db to background_handler.
         # Background tasks should manage their own short-lived sessions to avoid
         # holding database connections during slow operations (e.g., LLM calls).
         async def background_handler():
+            active_user_ids = await get_user_ids_from_room(f'channel:{channel.id}')
             await create_task(None, app_channel_reply_handler(channel.id, message.id, user.id))
             await model_response_handler(request, channel, message, user)
             await send_notification(
@@ -1680,6 +1708,8 @@ async def get_channel_thread_messages(
     message_id: str,
     skip: int = 0,
     limit: int = 50,
+    around: str | None = None,
+    before: str | None = None,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
@@ -1695,7 +1725,9 @@ async def get_channel_thread_messages(
         if user.role != 'admin' and not await channel_has_access(user.id, channel, permission='read', db=db):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT())
 
-    message_list = await Messages.get_messages_by_parent_id(id, message_id, skip, limit, db=db)
+    message_list = await Messages.get_messages_by_parent_id(
+        id, message_id, skip, min(max(limit, 1), 100), db=db, around=around, before=before
+    )
 
     if not message_list:
         return []
@@ -2004,6 +2036,7 @@ async def delete_message_by_id(
 
     try:
         await Messages.delete_message_by_id(message_id, db=db)
+        await Messages.delete_replies_by_id(message_id, db=db)
         await sio.emit(
             'events:channel',
             {

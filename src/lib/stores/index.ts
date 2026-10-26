@@ -1,3 +1,9 @@
+import {
+	CONTROL_LABELS,
+	isControlVisible,
+	type ControlId,
+	type Visibility
+} from '$lib/utils/ui-visibility';
 import { APP_NAME } from '$lib/constants';
 import { type Writable, derived, writable } from 'svelte/store';
 import type { ModelConfig } from '$lib/apis';
@@ -128,9 +134,20 @@ export const visiblePinnedModels = derived([pinnedModels, models], ([$pinnedMode
 	)
 );
 
+export const visibleControls = derived(
+	[config, user],
+	([$config, $user]) =>
+		Object.fromEntries(
+			(Object.keys(CONTROL_LABELS) as ControlId[]).map((id) => [
+				id,
+				isControlVisible(id, { config: $config, user: $user })
+			])
+		) as Record<ControlId, boolean>
+);
+
 export const audioQueue = writable<AudioQueue | null>(null);
 export const chatRequestQueues: Writable<
-	Record<string, { id: string; prompt: string; files: any[] }[]>
+	Record<string, { id: string; prompt: string; files: any[]; error?: string }[]>
 > = writable({});
 
 export type ChannelQueuedMessage = {
@@ -265,6 +282,7 @@ type Settings = {
 	hapticFeedback?: boolean;
 	responseAutoCopy?: any;
 	richTextInput?: boolean;
+	showFormattingToolbar?: boolean;
 	params?: any;
 	userLocation?: any;
 	webSearch?: any;
@@ -367,6 +385,7 @@ type Config = {
 	default_prompt_suggestions: PromptSuggestion[] | null;
 	default_prompt_suggestions_i18n?: Record<string, { suggestion_prompts: PromptSuggestion[] }>;
 	features: {
+		enable_encrypted_channels?: boolean;
 		slim?: boolean;
 		auth: boolean;
 		auth_trusted_header: boolean;
@@ -379,6 +398,7 @@ type Config = {
 		enable_google_drive_integration: boolean;
 		enable_onedrive_integration: boolean;
 		enable_image_generation: boolean;
+		enable_code_interpreter: boolean;
 		enable_admin_export: boolean;
 		enable_admin_chat_access: boolean;
 		enable_admin_analytics: boolean;
@@ -386,12 +406,22 @@ type Config = {
 		enable_tool_permissions?: boolean;
 		enable_community_sharing: boolean;
 		enable_memories: boolean;
+		enable_notes?: boolean;
+		enable_channels?: boolean;
+		enable_user_webhooks?: boolean;
+		enable_automations?: boolean;
+		enable_calendar?: boolean;
+		enable_subagents?: boolean;
 		enable_plugins?: boolean;
 		enable_tools?: boolean;
 		enable_functions?: boolean;
 		enable_tool_servers?: boolean;
+		enable_terminal_servers?: boolean;
 		enable_apps?: boolean;
 		enable_autocomplete_generation: boolean;
+		enable_title_generation: boolean;
+		enable_follow_up_generation: boolean;
+		enable_tags_generation: boolean;
 		enable_direct_connections: boolean;
 		enable_direct_integrations?: boolean;
 		enable_version_update_check: boolean;
@@ -407,6 +437,7 @@ type Config = {
 	};
 	ui?: {
 		default_interface_settings?: Record<string, unknown>;
+		visibility?: Visibility;
 		pending_user_overlay_title?: string;
 		pending_user_overlay_content?: string;
 		response_watermark?: string;

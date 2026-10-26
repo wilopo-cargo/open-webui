@@ -333,7 +333,7 @@ export const removeMembersById = async (
 export const updateChannelById = async (
 	token: string = '',
 	channel_id: string,
-	channel: ChannelForm
+	channel: Omit<ChannelForm, 'access_grants'>
 ) => {
 	let error = null;
 
@@ -344,7 +344,7 @@ export const updateChannelById = async (
 			'Content-Type': 'application/json',
 			authorization: `Bearer ${token}`
 		},
-		body: JSON.stringify({ ...channel })
+		body: JSON.stringify({ ...channel, access_grants: undefined })
 	})
 		.then(async (res) => {
 			if (!res.ok) throw await res.json();
@@ -479,12 +479,13 @@ export const getChannelThreadMessages = async (
 	channel_id: string,
 	message_id: string,
 	skip: number = 0,
-	limit: number = 50
+	limit: number = 50,
+	anchor: { around?: string; before?: string } = {}
 ) => {
 	let error = null;
 
 	const res = await fetch(
-		`${WEBUI_API_BASE_URL}/channels/${channel_id}/messages/${message_id}/thread?skip=${skip}&limit=${limit}`,
+		`${WEBUI_API_BASE_URL}/channels/${channel_id}/messages/${message_id}/thread?skip=${skip}&limit=${limit}&${new URLSearchParams(anchor)}`,
 		{
 			method: 'GET',
 			headers: {
@@ -1032,6 +1033,35 @@ export const removeAppFromChannel = async (
 		})
 		.catch((err) => {
 			error = err?.detail ?? err;
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const updateChannelAccessGrants = async (token: string, id: string, accessGrants: any[]) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/channels/${id}/access/update`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify({ access_grants: accessGrants })
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail;
 			console.error(err);
 			return null;
 		});

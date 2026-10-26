@@ -4,6 +4,7 @@
 
 	import {
 		WEBUI_NAME,
+		artifactContents,
 		banners,
 		chatId,
 		config,
@@ -36,11 +37,13 @@
 	import ChatCheck from '../icons/ChatCheck.svelte';
 	import Knobs from '../icons/Knobs.svelte';
 	import { isTemporaryChatId } from '$lib/utils/chatId';
+	import ChatParticipants from '$lib/components/common/ChatParticipants.svelte';
 
 	const i18n: any = getContext('i18n');
 
 	export let initNewChat: Function;
 	export let readOnly: boolean = false;
+	export let liveParticipants: { id: string; name: string }[] = [];
 	export let shareEnabled: boolean = false;
 	export let scrollTop = 0;
 	export let scrollToTop: (() => void) | null = null;
@@ -113,17 +116,19 @@
 				{/if}
 
 				<div
-					class="flex-1 overflow-hidden max-w-full mt-0.5 py-0.5 pl-1 {$showSidebar ? 'ml-1' : ''}"
+					class="flex-1 min-w-0 overflow-hidden max-w-full mt-0.5 py-0.5 pl-1 {$showSidebar
+						? 'ml-1'
+						: ''}"
 				>
 					{#if chat?.id}
 						<div class="flex max-w-full min-w-0 items-center gap-2 mr-2">
-							<div
+							<h1
 								class="min-w-0 truncate py-1 text-left text-[0.9375rem] font-normal text-gray-700 dark:text-gray-300"
 							>
 								{title || chat?.chat?.title || $i18n.t('New Chat')}
-							</div>
+							</h1>
 
-							{#if shareEnabled && chat && (chat.id || $temporaryChatEnabled)}
+							{#if shareEnabled && chat && (chat.id || $temporaryChatEnabled) && (scrollToTop || ($artifactContents ?? []).length > 0 || (!readOnly && !$temporaryChatEnabled) || $user?.role === 'admin' || ($user?.permissions?.chat?.export ?? true))}
 								<Menu
 									{chat}
 									{shareEnabled}
@@ -164,6 +169,7 @@
 							{/if}
 						</div>
 					{:else}
+						<h1 class="sr-only">{$i18n.t('New Chat')}</h1>
 						<div class="pointer-events-none invisible flex max-w-full min-w-0 items-center gap-2">
 							<div
 								class="min-w-0 truncate py-1 text-left text-[0.9375rem] font-normal text-gray-700 dark:text-gray-300"
@@ -174,7 +180,7 @@
 					{/if}
 				</div>
 
-				<div class="lg:mr-1 flex flex-none items-center gap-2 self-center">
+				<div class="lg:mr-1 flex flex-none items-center gap-3 self-center">
 					<!-- <div class="md:hidden flex self-center w-[0.0625rem] h-5 mx-2 bg-gray-300 dark:bg-stone-700" /> -->
 
 					{#if $user?.role === 'user' ? ($user?.permissions?.chat?.temporary ?? true) && !($user?.permissions?.chat?.temporary_enforced ?? false) : true}
@@ -241,6 +247,14 @@
 								<ChatPlus className="size-4.5" strokeWidth="1.5" />
 							</button>
 						</Tooltip>
+					{/if}
+
+					{#if liveParticipants.length > 0}
+						<ChatParticipants
+							participants={liveParticipants}
+							mode="presence"
+							avatarClass="size-5"
+						/>
 					{/if}
 
 					{#if $user?.role === 'admin' || ($user?.permissions.chat?.controls ?? true)}

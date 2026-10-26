@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import redis
 import requests
 from authlib.integrations.starlette_client import OAuth
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool, TypeAdapter
 
 from open_webui.env import (
     USE_SLIM,
@@ -1745,6 +1745,12 @@ except Exception as e:
 
 DEFAULT_INTERFACE_SETTINGS = default_interface_settings if isinstance(default_interface_settings, dict) else {}
 
+try:
+    UI_VISIBILITY = TypeAdapter(dict[str, StrictBool]).validate_json(os.getenv('UI_VISIBILITY', '{}'))
+except Exception as e:
+    log.exception(f'Error loading UI_VISIBILITY: {e}')
+    UI_VISIBILITY = {}
+
 DEFAULT_USER_ROLE = os.getenv('DEFAULT_USER_ROLE', 'pending')
 
 DEFAULT_GROUP_ID = os.getenv('DEFAULT_GROUP_ID', '')
@@ -1784,6 +1790,10 @@ USER_PERMISSIONS_WORKSPACE_MODELS_IMPORT = (
 
 USER_PERMISSIONS_WORKSPACE_MODELS_EXPORT = (
     os.getenv('USER_PERMISSIONS_WORKSPACE_MODELS_EXPORT', 'False').lower() == 'true'
+)
+
+USER_PERMISSIONS_WORKSPACE_MODELS_HIDDEN = (
+    os.getenv('USER_PERMISSIONS_WORKSPACE_MODELS_HIDDEN', 'False').lower() == 'true'
 )
 
 USER_PERMISSIONS_WORKSPACE_PROMPTS_IMPORT = (
@@ -1949,6 +1959,10 @@ USER_PERMISSIONS_FEATURES_NOTES = os.getenv('USER_PERMISSIONS_FEATURES_NOTES', '
 
 USER_PERMISSIONS_FEATURES_CHANNELS = os.getenv('USER_PERMISSIONS_FEATURES_CHANNELS', 'True').lower() == 'true'
 
+USER_PERMISSIONS_FEATURES_ENCRYPTED_CHANNELS = (
+    os.getenv('USER_PERMISSIONS_FEATURES_ENCRYPTED_CHANNELS', 'False').lower() == 'true'
+)
+
 USER_PERMISSIONS_FEATURES_API_KEYS = os.getenv('USER_PERMISSIONS_FEATURES_API_KEYS', 'False').lower() == 'true'
 
 USER_PERMISSIONS_FEATURES_MEMORIES = os.getenv('USER_PERMISSIONS_FEATURES_MEMORIES', 'True').lower() == 'true'
@@ -1974,6 +1988,7 @@ DEFAULT_USER_PERMISSIONS = {
         'skills': USER_PERMISSIONS_WORKSPACE_SKILLS_ACCESS,
         'models_import': USER_PERMISSIONS_WORKSPACE_MODELS_IMPORT,
         'models_export': USER_PERMISSIONS_WORKSPACE_MODELS_EXPORT,
+        'models_hidden': USER_PERMISSIONS_WORKSPACE_MODELS_HIDDEN,
         'prompts_import': USER_PERMISSIONS_WORKSPACE_PROMPTS_IMPORT,
         'prompts_export': USER_PERMISSIONS_WORKSPACE_PROMPTS_EXPORT,
         'tools_import': USER_PERMISSIONS_WORKSPACE_TOOLS_IMPORT,
@@ -2032,6 +2047,7 @@ DEFAULT_USER_PERMISSIONS = {
         'notes': USER_PERMISSIONS_FEATURES_NOTES,
         'folders': USER_PERMISSIONS_FEATURES_FOLDERS,
         'channels': USER_PERMISSIONS_FEATURES_CHANNELS,
+        'encrypted_channels': USER_PERMISSIONS_FEATURES_ENCRYPTED_CHANNELS,
         'direct_tool_servers': USER_PERMISSIONS_FEATURES_DIRECT_TOOL_SERVERS,
         # Chat features
         'web_search': USER_PERMISSIONS_FEATURES_WEB_SEARCH,
@@ -2053,7 +2069,19 @@ ENABLE_FOLDERS = os.getenv('ENABLE_FOLDERS', 'True').lower() == 'true'
 
 FOLDER_MAX_FILE_COUNT = os.getenv('FOLDER_MAX_FILE_COUNT', '')
 
+ENABLE_SKILL_LAZY_LOADING = os.getenv('ENABLE_SKILL_LAZY_LOADING', 'False').lower() == 'true'
+
+SKILL_CONTENT_MAX_CHARS = int(os.environ['SKILL_CONTENT_MAX_CHARS']) if os.getenv('SKILL_CONTENT_MAX_CHARS') else None
+if SKILL_CONTENT_MAX_CHARS is not None and SKILL_CONTENT_MAX_CHARS <= 0:
+    raise ValueError('SKILL_CONTENT_MAX_CHARS must be a positive integer or unset')
+
+SKILL_PREVIEW_MAX_CHARS = int(os.environ['SKILL_PREVIEW_MAX_CHARS']) if os.getenv('SKILL_PREVIEW_MAX_CHARS') else None
+if SKILL_PREVIEW_MAX_CHARS is not None and SKILL_PREVIEW_MAX_CHARS <= 0:
+    raise ValueError('SKILL_PREVIEW_MAX_CHARS must be a positive integer or unset')
+
 ENABLE_CHANNELS = os.getenv('ENABLE_CHANNELS', 'False').lower() == 'true'
+
+ENABLE_ENCRYPTED_CHANNELS = os.getenv('ENABLE_ENCRYPTED_CHANNELS', 'False').lower() == 'true'
 
 ENABLE_APPS = os.getenv('ENABLE_APPS', 'False').lower() == 'true'
 
@@ -2860,6 +2888,8 @@ LDAP_SERVER_PORT = int(os.getenv('LDAP_SERVER_PORT', '389'))
 
 LDAP_ATTRIBUTE_FOR_MAIL = os.getenv('LDAP_ATTRIBUTE_FOR_MAIL', 'mail')
 
+LDAP_DEFAULT_EMAIL_DOMAIN = os.getenv('LDAP_DEFAULT_EMAIL_DOMAIN', '')
+
 LDAP_ATTRIBUTE_FOR_USERNAME = os.getenv('LDAP_ATTRIBUTE_FOR_USERNAME', 'uid')
 
 LDAP_APP_DN = os.getenv('LDAP_APP_DN', '')
@@ -2885,6 +2915,9 @@ ENABLE_LDAP_GROUP_CREATION = os.getenv('ENABLE_LDAP_GROUP_CREATION', 'False').lo
 LDAP_ATTRIBUTE_FOR_GROUPS = os.getenv('LDAP_ATTRIBUTE_FOR_GROUPS', 'memberOf')
 
 DEFAULT_CONFIG = {
+    'skills.lazy_loading.enable': ENABLE_SKILL_LAZY_LOADING,
+    'skills.content_max_chars': SKILL_CONTENT_MAX_CHARS,
+    'skills.preview_max_chars': SKILL_PREVIEW_MAX_CHARS,
     'direct.enable': ENABLE_DIRECT_CONNECTIONS,
     'direct.integrations.enable': ENABLE_DIRECT_INTEGRATIONS,
     'ollama.enable': ENABLE_OLLAMA_API,
@@ -3164,6 +3197,7 @@ DEFAULT_CONFIG = {
     'ui.default_models': DEFAULT_MODELS,
     'ui.default_pinned_models': DEFAULT_PINNED_MODELS,
     'ui.default_interface_settings': DEFAULT_INTERFACE_SETTINGS,
+    'ui.visibility': UI_VISIBILITY,
     'ui.i18n': {},
     'ui.prompt_suggestions': DEFAULT_PROMPT_SUGGESTIONS,
     'ui.prompt_suggestions_i18n': DEFAULT_PROMPT_SUGGESTIONS_I18N,
@@ -3179,6 +3213,7 @@ DEFAULT_CONFIG = {
     'folders.enable': ENABLE_FOLDERS,
     'folders.max_file_count': FOLDER_MAX_FILE_COUNT,
     'channels.enable': ENABLE_CHANNELS,
+    'channels.encryption.enable': ENABLE_ENCRYPTED_CHANNELS,
     'apps.enable': ENABLE_APPS,
     'channels.model_response_mode': CHANNEL_MODEL_RESPONSE_MODE,
     'calendar.enable': ENABLE_CALENDAR,
@@ -3298,6 +3333,7 @@ DEFAULT_CONFIG = {
     'ldap.server.host': LDAP_SERVER_HOST,
     'ldap.server.port': LDAP_SERVER_PORT,
     'ldap.server.attribute_for_mail': LDAP_ATTRIBUTE_FOR_MAIL,
+    'ldap.server.default_email_domain': LDAP_DEFAULT_EMAIL_DOMAIN,
     'ldap.server.attribute_for_username': LDAP_ATTRIBUTE_FOR_USERNAME,
     'ldap.server.app_dn': LDAP_APP_DN,
     'ldap.server.app_password': LDAP_APP_PASSWORD,

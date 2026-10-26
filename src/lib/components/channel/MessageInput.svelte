@@ -411,7 +411,7 @@
 		const compressImageHandler = async (imageUrl: string, settings: any = {}, config: any = {}) => {
 			// Quick shortcut so we don’t do unnecessary work.
 			const settingsCompression =
-				(settings?.imageCompression && settings?.imageCompressionInChannels) ?? false;
+				(settings?.imageCompression ?? false) && (settings?.imageCompressionInChannels ?? true);
 			const configWidth = config?.file?.image_compression?.width ?? null;
 			const configHeight = config?.file?.image_compression?.height ?? null;
 
@@ -674,7 +674,8 @@
 		}
 
 		await tick();
-		if (!isDestroyed && targetQueueKey === queueKey) chatInputElement?.focus();
+		if (!isDestroyed && targetQueueKey === queueKey)
+			chatInputElement?.focus({ preventScroll: true });
 	};
 
 	$: if (content) {
@@ -710,6 +711,24 @@
 				: []),
 			{
 				char: '/',
+				command: ({ editor, range, props }) => {
+					if (props?.type === 'prompt') {
+						void insertTextAtCursor(props.content ?? '');
+						return;
+					}
+
+					editor
+						.chain()
+						.focus()
+						.insertContentAt(range, [
+							{
+								type: 'mention',
+								attrs: { ...props, mentionSuggestionChar: '/' }
+							},
+							{ type: 'text', text: ' ' }
+						])
+						.run();
+				},
 				render: getSuggestionRenderer(CommandSuggestionList, {
 					i18n,
 					onSelect: (e) => {
@@ -945,7 +964,11 @@
 						<div
 							id="message-input-container"
 							class="flex-1 flex flex-col relative w-full shadow-sm rounded-2xl border border-gray-100/60 dark:border-gray-800/50 hover:border-gray-100 focus-within:border-gray-100 hover:dark:border-gray-800 focus-within:dark:border-gray-800 transition bg-white dark:bg-gray-400/5 dark:text-gray-100"
-							dir={$settings?.chatDirection ?? 'auto'}
+							dir={$settings?.chatDirection === 'RTL'
+								? 'rtl'
+								: $settings?.chatDirection === 'LTR'
+									? 'ltr'
+									: 'auto'}
 						>
 							{#if replyToMessage !== null}
 								<div class="px-3 pt-2 text-left w-full flex flex-col z-10">
@@ -1073,6 +1096,10 @@
 											}}
 											on:keydown={async (e) => {
 												e = e.detail.event;
+												// IME confirmation must finish before a shortcut can send and clear the editor.
+												if (e.isComposing || e.keyCode === 229 || inputEditor?.view.composing)
+													return;
+
 												const isCtrlPressed = e.ctrlKey || e.metaKey; // metaKey is for Cmd key on Mac
 
 												const suggestionsContainerElement =

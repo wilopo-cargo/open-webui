@@ -11,6 +11,7 @@
 	import { equalEditorJSON } from '$lib/utils/editorJson';
 
 	import { goto, onNavigate } from '$app/navigation';
+	import { page } from '$app/stores';
 
 	import dayjs from '$lib/dayjs';
 	import calendar from 'dayjs/plugin/calendar';
@@ -87,6 +88,29 @@
 	export let id: null | string = null;
 
 	let editor = null;
+	let revealedSearch = '';
+	$: if (editor && note?.id === id && $page.url.searchParams.get('search')) {
+		const query = $page.url.searchParams.get('search')!.trim().toLowerCase();
+		const key = `${id}:${query}`;
+		if (query && revealedSearch !== key) {
+			revealedSearch = key;
+			tick().then(() => {
+				if (!editor || note?.id !== id) return;
+				let found = false;
+				editor.state.doc.descendants((node, position) => {
+					if (found || !node.isText) return;
+					const text = (node.text ?? '').toLowerCase();
+					const term = [query, ...query.split(/\s+/)].find((term) => text.includes(term));
+					if (term) {
+						const from = position + text.indexOf(term);
+						editor.commands.setTextSelection({ from, to: from + term.length });
+						editor.commands.scrollIntoView();
+						found = true;
+					}
+				});
+			});
+		}
+	}
 	let autoFormat = true;
 	let note = null;
 
@@ -119,6 +143,11 @@
 
 	let wordCount = 0;
 	let charCount = 0;
+
+	$: if (editor) {
+		wordCount = editor.storage.characterCount.words();
+		charCount = editor.storage.characterCount.characters();
+	}
 
 	let versionIdx = null;
 	let selectedModelId = null;
@@ -670,8 +699,20 @@ ${content}
 
 		input.onchange = async () => {
 			const inputFiles = Array.from(input.files ?? []);
-			if (inputFiles.length > 0) {
-				await inputFilesHandler(inputFiles);
+			for (const file of inputFiles) {
+				const fileItem = await inputFileHandler(file);
+				if (fileItem?.type === 'image' && editor) {
+					editor
+						.chain()
+						.insertContentAt(editor.state.selection.$anchor.pos, {
+							type: 'image',
+							attrs: {
+								src: `data://${fileItem.id}`
+							}
+						})
+						.focus()
+						.run();
+				}
 			}
 		};
 	};
@@ -1093,6 +1134,7 @@ ${content}
 											<div class="flex items-center gap-0.5 self-center min-w-fit" dir="ltr">
 												<button
 													class="self-center p-1 hover:enabled:bg-black/5 dark:hover:enabled:bg-white/5 dark:hover:enabled:text-white hover:enabled:text-black rounded-md transition disabled:cursor-not-allowed disabled:text-gray-500 disabled:hover:text-gray-500"
+													aria-label={$i18n.t('Undo')}
 													on:click={() => {
 														editor.chain().focus().undo().run();
 														// versionNavigateHandler('prev');
@@ -1104,6 +1146,7 @@ ${content}
 
 												<button
 													class="self-center p-1 hover:enabled:bg-black/5 dark:hover:enabled:bg-white/5 dark:hover:enabled:text-white hover:enabled:text-black rounded-md transition disabled:cursor-not-allowed disabled:text-gray-500 disabled:hover:text-gray-500"
+													aria-label={$i18n.t('Redo')}
 													on:click={() => {
 														editor.chain().focus().redo().run();
 														// versionNavigateHandler('next');
@@ -1177,9 +1220,13 @@ ${content}
 										}}
 									>
 										<Tooltip content={$i18n.t('Record')} placement="top">
-											<div class="p-1 bg-transparent hover:bg-white/5 transition rounded-lg">
+											<button
+												type="button"
+												class="p-1 bg-transparent hover:bg-white/5 transition rounded-lg"
+												aria-label={$i18n.t('Record')}
+											>
 												<Mic className="size-4" />
-											</div>
+											</button>
 										</Tooltip>
 									</RecordMenu>
 								{/if}
@@ -1225,20 +1272,26 @@ ${content}
 										pinnedNotes.set(await getPinnedNoteList(localStorage.token).catch(() => []));
 									}}
 								>
-									<div class="p-1 bg-transparent hover:bg-white/5 transition rounded-lg">
+									<button
+										type="button"
+										class="p-1 bg-transparent hover:bg-white/5 transition rounded-lg"
+										aria-label={$i18n.t('Note Menu')}
+									>
 										<EllipsisHorizontal className="size-5" />
-									</div>
+									</button>
 								</NoteMenu>
 
 								{#if note?.write_access}
-									<div class="ml-1.5">
-										<AccessButton
-											on:click={() => {
-												showAccessControlModal = true;
-											}}
-											disabled={note?.user_id !== $user?.id && $user?.role !== 'admin'}
-										/>
-									</div>
+									{#if $user?.permissions?.sharing?.notes || $user?.role === 'admin'}
+										<div class="ml-1.5">
+											<AccessButton
+												on:click={() => {
+													showAccessControlModal = true;
+												}}
+												disabled={note?.user_id !== $user?.id && $user?.role !== 'admin'}
+											/>
+										</div>
+									{/if}
 								{:else}
 									<div class="shrink-0 text-xs text-gray-500 px-2 py-1">
 										{$i18n.t('Read-Only Access')}
@@ -1385,11 +1438,6 @@ ${content}
 									lastLocalContentChangeAt = Date.now();
 									note.data.content.html = content.html;
 									note.data.content.md = content.md;
-
-									if (editor) {
-										wordCount = editor.storage.characterCount.words();
-										charCount = editor.storage.characterCount.characters();
-									}
 								}}
 								fileHandler={true}
 								onFileDrop={(currentEditor, files, pos) => {
