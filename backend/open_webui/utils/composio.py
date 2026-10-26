@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from urllib.parse import quote, urlsplit
 
 import httpx
+import httpx2
 from open_webui.env import AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
@@ -95,7 +96,10 @@ class _ComposioDependencyLogFilter(logging.Filter):
         return not (
             _log_scope.get()
             and (
-                any(record.name == name or record.name.startswith(f'{name}.') for name in ('httpx', 'httpcore', 'mcp'))
+                any(
+                    record.name == name or record.name.startswith(f'{name}.')
+                    for name in ('httpx', 'httpcore', 'httpx2', 'httpcore2', 'mcp')
+                )
                 or record.name == 'open_webui.utils.mcp.client'
             )
         )
@@ -152,6 +156,17 @@ def create_composio_httpx_client(headers=None, timeout=None, auth=None):
     if auth is not None:
         kwargs['auth'] = auth
     return httpx.AsyncClient(**kwargs)
+
+
+def create_composio_mcp_httpx_client(headers=None, auth=None):
+    """Use the MCP SDK's transport and timeouts without inheriting native-server TLS overrides."""
+    return httpx2.AsyncClient(
+        headers=headers,
+        auth=auth,
+        verify=True,
+        follow_redirects=False,
+        timeout=httpx2.Timeout(30, read=300),
+    )
 
 
 def _callback_url(webui_url: str | None) -> str:

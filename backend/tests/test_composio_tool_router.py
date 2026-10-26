@@ -65,9 +65,10 @@ def _restore_test_environment():
 atexit.register(_restore_test_environment)
 
 import httpx
-from httpx import AsyncClient as _HTTPX_ASYNC_CLIENT
+import httpx2
 import pytest
 import pytest_asyncio
+from httpx import AsyncClient as _HTTPX_ASYNC_CLIENT
 from pydantic import ValidationError
 
 
@@ -166,6 +167,8 @@ async def test_composio_dependency_logs_are_scoped_and_native_logs_survive(app_m
         with composio.composio_log_scope():
             logging.getLogger('httpx').info('HTTP request to %s with %s', private_url, project_key)
             logging.getLogger('httpcore.connection').debug('transport %s', private_url)
+            logging.getLogger('httpx2').info('MCP HTTP request to %s with %s', private_url, project_key)
+            logging.getLogger('httpcore2.connection').debug('MCP transport %s', private_url)
             try:
                 raise RuntimeError(f'{private_url} {project_key}')
             except RuntimeError:
@@ -179,11 +182,15 @@ async def test_composio_dependency_logs_are_scoped_and_native_logs_survive(app_m
     async def native_transport_logs():
         await composio_started.wait()
         logging.getLogger('httpx').info('native HTTP request to https://native.example/mcp')
+        logging.getLogger('httpx2').info('native MCP HTTP request to https://native.example/mcp')
+        logging.getLogger('httpcore2.connection').debug('native MCP transport logging')
         logging.getLogger('mcp.client.streamable_http').info('native MCP transport connected')
         native_finished.set()
 
     await asyncio.gather(composio_transport_logs(), native_transport_logs())
     assert 'native.example' in caplog.text
+    assert 'native MCP HTTP request' in caplog.text
+    assert 'native MCP transport logging' in caplog.text
     assert 'native MCP transport connected' in caplog.text
     assert 'native logging after Composio scope reset' in caplog.text
     assert 'safe Composio diagnostic' in caplog.text
@@ -612,8 +619,9 @@ async def test_callback_url_is_required_and_restricted_to_secure_or_loopback_ori
     assert len(calls) == 4
 
 
+@pytest.mark.parametrize('factory_name', ['create_composio_httpx_client', 'create_composio_mcp_httpx_client'])
 @pytest.mark.asyncio
-async def test_composio_http_factory_does_not_follow_real_local_redirect(app_modules):
+async def test_composio_http_factory_does_not_follow_real_local_redirect(app_modules, factory_name):
     class RedirectHandler(BaseHTTPRequestHandler):
         destination = ''
         destination_hits = 0
@@ -638,7 +646,7 @@ async def test_composio_http_factory_does_not_follow_real_local_redirect(app_mod
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        async with app_modules.composio.create_composio_httpx_client(
+        async with getattr(app_modules.composio, factory_name)(
             headers={'x-api-key': 'test-project-key'}
         ) as client:
             response = await client.get(f'http://127.0.0.1:{server.server_port}/redirect')
@@ -697,75 +705,6 @@ def test_policy_normalizes_inputs_and_accepts_exact_maximum(app_modules):
         {'toolkits': {'googledrive': {'tools': [f'GOOGLEDRIVE_TOOL_{index}' for index in range(1000)]}}}
     )
     assert len(maximum.toolkits['googledrive'].tools) == 1000
-
-
-@pytest.mark.parametrize(
-    ('ssl_enabled', 'expected_factory'),
-    [
-        (True, 'secure'),
-        (False, 'native-insecure-setting'),
-    ],
-)
-@pytest.mark.asyncio
-async def test_mcp_client_keeps_native_factory_selection_and_accepts_composio_override(
-    app_modules, monkeypatch, ssl_enabled, expected_factory
-):
-    from open_webui.utils.mcp import client as mcp_client
-
-    factories = []
-    auths = []
-
-    class Context:
-        def __init__(self, result):
-            self.result = result
-
-        async def __aenter__(self):
-            return self.result
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class Session:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-        async def initialize(self):
-            return SimpleNamespace(instructions=None)
-
-    def streamablehttp_client(url, headers=None, auth=None, httpx_client_factory=None):
-        factories.append(httpx_client_factory)
-        auths.append(auth)
-        return Context((object(), object(), None))
-
-    monkeypatch.setattr(mcp_client, 'streamablehttp_client', streamablehttp_client)
-    monkeypatch.setattr(mcp_client, 'ClientSession', lambda *_args, **_kwargs: Session())
-    monkeypatch.setattr(mcp_client, 'AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL', ssl_enabled)
-
-    native_client = mcp_client.MCPClient()
-    native_auth = httpx.BasicAuth('test-user', 'test-password')
-    await native_client.connect('https://native.example/mcp', auth=native_auth)
-    assert auths[-1] is native_auth
-    native_factory = factories[-1]
-    assert native_factory is (
-        mcp_client.create_httpx_client if expected_factory == 'secure' else mcp_client.create_insecure_httpx_client
-    )
-    assert native_client.instructions is None
-    await native_client.disconnect()
-
-    def custom_factory(**_kwargs):
-        return None
-
-    composio_client = mcp_client.MCPClient()
-    await composio_client.connect(
-        'https://backend.composio.dev/session',
-        headers={'x-api-key': 'local-test-key'},
-        httpx_client_factory=custom_factory,
-    )
-    assert factories[-1] is custom_factory
-    await composio_client.disconnect()
 
 
 @pytest.mark.asyncio
@@ -916,7 +855,6 @@ def _in_process_mcp_client_class(
         async def connect(self, url, headers=None, auth=None, *, httpx_client_factory=None):
             self.url = url
             self.headers = headers or {}
-            self.httpx_client_factory = httpx_client_factory
             self.auth = auth
             if url == 'https://native.example/mcp':
                 self.account_id = 'native'
@@ -1670,33 +1608,6 @@ async def test_session_redirect_never_forwards_project_key_or_connects_mcp(app_m
     assert client_class.instances == []
 
 
-def test_composio_http_factory_always_verifies_tls_and_preserves_sdk_timeout(app_modules, monkeypatch):
-    seen = []
-
-    def client_constructor(**kwargs):
-        seen.append(kwargs)
-        return SimpleNamespace()
-
-    composio = app_modules.composio
-    monkeypatch.setattr(composio.httpx, 'AsyncClient', client_constructor)
-    monkeypatch.setattr(composio, 'AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER', None)
-    composio.create_composio_httpx_client()
-    assert seen[-1] == {'verify': True, 'follow_redirects': False, 'timeout': 30.0}
-    monkeypatch.setattr(composio, 'AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER', 17)
-    composio.create_composio_httpx_client()
-    assert seen[-1]['timeout'] == 17.0
-    timeout = httpx.Timeout(4.0)
-    auth = httpx.BasicAuth('fixture', 'fixture')
-    composio.create_composio_httpx_client(headers={'x-api-key': 'fixture-key'}, timeout=timeout, auth=auth)
-    assert seen[-1] == {
-        'verify': True,
-        'follow_redirects': False,
-        'timeout': timeout,
-        'auth': auth,
-        'headers': {'x-api-key': 'fixture-key'},
-    }
-
-
 @pytest.mark.parametrize('failure', ['transport', 'timeout', 'invalid-json'])
 @pytest.mark.asyncio
 async def test_session_transport_and_json_errors_are_safe_without_retry(app_modules, monkeypatch, caplog, failure):
@@ -1859,7 +1770,6 @@ async def test_admin_verification_returns_only_safe_summary_without_external_con
     client = client_class.instances[0]
     assert client.closed
     assert client.calls == []
-    assert client.httpx_client_factory is app_modules.composio.create_composio_httpx_client
     assert 'test-project-key' not in json.dumps(result) and client.url not in json.dumps(result)
 
 
@@ -2012,7 +1922,7 @@ async def test_actual_tool_execution_rejects_hostile_manager_kwargs_and_normaliz
         {'query': 'document', 'unknown': True},
     )
     assert json.loads(native_result['content']) == {'provider': 'native', 'tool': 'GOOGLEDRIVE_FIND_FILE'}
-    assert client_class.instances[0].calls == [('GOOGLEDRIVE_FIND_FILE', {'query': 'document'})]
+    assert client_class.instances[0].calls == [('GOOGLEDRIVE_FIND_FILE', {'query': 'document', 'unknown': True})]
     await app_modules.middleware.disconnect_mcp_clients(metadata['mcp_clients'])
 
 
@@ -2031,7 +1941,6 @@ async def test_native_mcp_listing_failure_still_propagates_and_closes_client(app
         await app_modules.tool_utils.connect_mcp_server(request, 'shared', _user('alice'), {'__metadata__': metadata})
     assert len(client_class.instances) == 1
     assert client_class.instances[0].closed
-    assert client_class.instances[0].httpx_client_factory is None
     assert client_class.sessions == {}
 
 
@@ -2159,8 +2068,8 @@ async def test_real_composio_lifecycle_suppresses_private_dependency_logs_but_no
         def _emit(self, phase):
             self.phases.append(phase)
             key = self.headers.get('x-api-key', 'native-no-project-key')
-            logging.getLogger('httpx').info('%s request to %s with %s', phase, self.url, key)
-            logging.getLogger('httpcore.connection').debug('%s transport at %s', phase, self.url)
+            logging.getLogger('httpx2').info('%s request to %s with %s', phase, self.url, key)
+            logging.getLogger('httpcore2.connection').debug('%s transport at %s', phase, self.url)
             try:
                 raise RuntimeError(f'{phase} exception at {self.url} with {key}')
             except RuntimeError:
@@ -3009,7 +2918,6 @@ async def test_erp_mcp_statement_reconcile_relays_owned_current_turn_bytes(app_m
             async def connect(self, url, headers=None, auth=None, *, httpx_client_factory=None):
                 self.url = url
                 self.headers = headers or {}
-                self.httpx_client_factory = httpx_client_factory
                 self.account_id = 'native'
 
         connection = {
@@ -3149,7 +3057,6 @@ async def test_erp_mcp_statement_reconcile_rejects_untrusted_attachment_referenc
         async def connect(self, url, headers=None, auth=None, *, httpx_client_factory=None):
             self.url = url
             self.headers = headers or {}
-            self.httpx_client_factory = httpx_client_factory
             self.account_id = 'native'
 
     connection = {
@@ -3470,9 +3377,9 @@ async def test_native_mcp_retains_instructions_long_names_elicitation_and_live_s
 
     def transport(http_request):
         authorizations.append(http_request.headers['Authorization'])
-        return httpx.Response(200)
+        return httpx2.Response(200)
 
-    async with _HTTPX_ASYNC_CLIENT(transport=httpx.MockTransport(transport), auth=client.auth) as http:
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(transport), auth=client.auth) as http:
         await http.post('https://native.example/mcp', json={})
         await http.post('https://native.example/mcp', json={})
     assert authorizations == ['Bearer first-token', 'Bearer refreshed-token']
@@ -3495,3 +3402,213 @@ async def test_full_config_import_preserves_upstream_mfa_authorization_guard(app
     )
     assert response.status_code == 403
     assert await Config.get_all() == before
+
+
+@pytest.mark.parametrize('composio_mode', [False, True])
+@pytest.mark.asyncio
+async def test_mcp_httpx2_transport_negotiates_legacy_tools_and_blocks_cross_origin_redirects(
+    app_modules, monkeypatch, composio_mode
+):
+    from open_webui.utils.mcp import client as mcp_client
+
+    monkeypatch.setenv('NO_PROXY', '*')
+    received = []
+    redirected = []
+    arguments = {'query': 'account document', 'server_owned': {'enabled': True}}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            message = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            if self.path == '/redirect':
+                self.send_response(307)
+                self.send_header('Location', f'http://localhost:{self.server.server_port}/collect')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            if self.path == '/collect':
+                redirected.append(dict(self.headers))
+            received.append((message, self.headers))
+            method = message['method']
+            if method == 'notifications/initialized':
+                self.send_response(202)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            response = {'jsonrpc': '2.0', 'id': message['id']}
+            if method == 'server/discover':
+                response['error'] = {'code': -32601, 'message': 'Legacy server'}
+            elif method == 'initialize':
+                response['result'] = {
+                    'protocolVersion': '2025-06-18',
+                    'capabilities': {'tools': {}},
+                    'serverInfo': {'name': 'fixture', 'version': '1'},
+                    'instructions': 'Use account-scoped tools.',
+                }
+            elif method == 'tools/list':
+                response['result'] = {
+                    'tools': [{'name': 'echo', 'inputSchema': {'type': 'object', 'additionalProperties': True}}]
+                }
+            elif method == 'tools/call':
+                response['result'] = {
+                    'content': [{'type': 'text', 'text': json.dumps(message['params']['arguments'])}],
+                    'structuredContent': message['params']['arguments'],
+                }
+            else:
+                response['error'] = {'code': -32601, 'message': 'Unknown method'}
+            body = json.dumps(response).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = mcp_client.MCPClient()
+    factory = app_modules.composio.create_composio_mcp_httpx_client if composio_mode else None
+    headers = {'x-api-key': 'test-project-key'} if composio_mode else None
+    auth = None if composio_mode else httpx2.BasicAuth('fixture', 'password')
+    url = f'http://127.0.0.1:{server.server_port}'
+    try:
+        await client.connect(f'{url}/mcp', headers=headers, auth=auth, httpx_client_factory=factory)
+        assert client.instructions == 'Use account-scoped tools.'
+        assert [spec['name'] for spec in await client.list_tool_specs()] == ['echo']
+        result = await client.call_tool('echo', arguments)
+        assert len(result) == 1
+        assert json.loads(result[0]['text']) == arguments
+        assert any(message['method'] == 'initialize' for message, _headers in received)
+        for _message, request_headers in received:
+            if composio_mode:
+                assert request_headers['x-api-key'] == 'test-project-key'
+                assert request_headers.get('Authorization') is None
+            else:
+                assert request_headers['Authorization'] == 'Basic Zml4dHVyZTpwYXNzd29yZA=='
+                assert request_headers.get('x-api-key') is None
+        await client.disconnect()
+        with pytest.raises(RuntimeError, match='not connected'):
+            await client.call_tool('echo', arguments)
+        with pytest.raises(Exception):
+            await client.connect(f'{url}/redirect', headers=headers, auth=auth, httpx_client_factory=factory)
+        assert redirected == []
+    finally:
+        await client.disconnect()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize('factory_name', ['create_composio_httpx_client', 'create_composio_mcp_httpx_client'])
+@pytest.mark.asyncio
+async def test_composio_transport_rejects_untrusted_tls_despite_native_override(
+    app_modules, monkeypatch, tmp_path, factory_name
+):
+    import ipaddress
+    import ssl
+    from datetime import datetime, timedelta, timezone
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    from open_webui.utils.mcp import client as mcp_client
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'localhost')])
+    now = datetime.now(timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address('127.0.0.1'))]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = tmp_path / 'server.pem'
+    key_path = tmp_path / 'server-key.pem'
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        )
+    )
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-Length', '2')
+            self.end_headers()
+            self.wfile.write(b'ok')
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(cert_path), str(key_path))
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv('NO_PROXY', '*')
+    monkeypatch.setattr(mcp_client, 'AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL', False)
+    url = f'https://127.0.0.1:{server.server_port}/mcp'
+    try:
+        async with mcp_client.create_httpx_client() as native:
+            assert (await native.get(url)).text == 'ok'
+        async with getattr(app_modules.composio, factory_name)() as composio:
+            with pytest.raises((httpx.ConnectError, httpx2.ConnectError)):
+                await composio.get(url)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize('dispatch', ['native', 'legacy'])
+@pytest.mark.parametrize('tool_type', ['mcp', 'local'])
+@pytest.mark.asyncio
+async def test_tool_dispatch_preserves_server_owned_mcp_arguments(app_modules, monkeypatch, dispatch, tool_type):
+    middleware = app_modules.middleware
+    received = []
+    arguments = {'declared': 'value', 'server_owned': {'enabled': True}}
+
+    async def tool(**kwargs):
+        received.append(kwargs)
+        return [{'type': 'text', 'text': 'ok'}]
+
+    tools = {
+        'echo': {
+            'spec': {'name': 'echo', 'parameters': {'type': 'object', 'properties': {'declared': {'type': 'string'}}}},
+            'callable': tool,
+            'type': tool_type,
+        }
+    }
+    body = {'model': 'fixture', 'messages': [{'role': 'user', 'content': 'Echo the arguments.'}]}
+    if dispatch == 'native':
+        await middleware.execute_tool_call(
+            body, {'tools': tools}, None, {'function': {'name': 'echo', 'arguments': json.dumps(arguments)}}
+        )
+    else:
+        async def config_get_many(*_keys):
+            return {'task.model.default': None, 'task.model.external': None, 'task.tools.prompt_template': ''}
+
+        async def completion(*_args, **_kwargs):
+            return {'choices': [{'message': {'content': json.dumps({'name': 'echo', 'parameters': arguments})}}]}
+
+        monkeypatch.setattr(middleware.Config, 'get_many', staticmethod(config_get_many))
+        monkeypatch.setattr(middleware, 'generate_chat_completion', completion)
+        await middleware.chat_completion_tools_handler(
+            None,
+            body,
+            {'__event_call__': None, '__event_emitter__': None, '__metadata__': {}},
+            _user('alice'),
+            {'fixture': {'owned_by': 'openai'}},
+            tools,
+        )
+    assert received == [arguments if tool_type == 'mcp' else {'declared': 'value'}]

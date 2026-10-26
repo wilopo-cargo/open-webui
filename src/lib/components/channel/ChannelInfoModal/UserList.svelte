@@ -106,13 +106,13 @@
 	}
 </script>
 
-<div class="flex flex-col justify-center">
+<div class="flex min-h-0 flex-col">
 	{#if users === null || total === null}
 		<div class="my-10">
 			<Spinner className="size-5" />
 		</div>
 	{:else}
-		<div class="flex items-center justify-between px-2 mb-1">
+		<div class="flex shrink-0 items-center justify-between px-2 mb-1">
 			<div class="flex gap-1 items-center">
 				<span class="text-sm">
 					{$i18n.t('Members')}
@@ -124,10 +124,10 @@
 				<div class="">
 					<button
 						type="button"
-						class="flex h-7 shrink-0 items-center justify-center gap-1.5 rounded-lg bg-gray-100 px-2.5 text-xs font-normal text-gray-800 transition hover:bg-gray-100/70 disabled:opacity-60 dark:bg-gray-850 dark:text-white dark:hover:bg-gray-850/60"
+						class="inline-flex h-6 items-center gap-1 rounded-lg px-1.5 text-xs font-normal text-gray-500 transition hover:bg-gray-100 hover:text-gray-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-100"
 						on:click={onAdd}
 					>
-						<Plus className="size-3.5 " />
+						<Plus className="size-3" />
 						<span>{$i18n.t('Add Member')}</span>
 					</button>
 				</div>
@@ -136,7 +136,7 @@
 		<!-- <hr class="my-1 border-gray-100/5- dark:border-gray-850/50" /> -->
 
 		{#if search}
-			<div class="flex gap-1 px-1 mb-1">
+			<div class="flex shrink-0 gap-1 px-1 mb-1">
 				<div class=" flex w-full space-x-2">
 					<div class="flex flex-1 items-center">
 						<div class=" self-center ml-1 mr-3">
@@ -165,7 +165,9 @@
 		{/if}
 
 		{#if users.length > 0 || filteredApps.length > 0}
-			<div class="scrollbar-hidden relative whitespace-nowrap w-full max-w-full">
+			<div
+				class="min-h-0 overflow-y-auto overscroll-contain relative whitespace-nowrap w-full max-w-full"
+			>
 				<div class=" text-sm text-left text-gray-500 dark:text-gray-400 w-full max-w-full">
 					<!-- <div
 						class="text-xs text-gray-800 uppercase bg-transparent dark:text-gray-200 w-full mb-0.5"
@@ -325,7 +327,9 @@
 			</div>
 
 			{#if total > 30}
-				<Pagination bind:page count={total} perPage={30} />
+				<div class="shrink-0">
+					<Pagination bind:page count={total} perPage={30} />
+				</div>
 			{/if}
 		{:else}
 			<div class="text-gray-500 text-xs text-center py-5 px-10">

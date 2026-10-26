@@ -15,7 +15,7 @@ from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.composio import (
     ComposioPolicy,
     composio_log_scope,
-    create_composio_httpx_client,
+    create_composio_mcp_httpx_client,
     create_composio_session,
 )
 from open_webui.utils.headers import bearer_auth_header, get_custom_headers
@@ -37,7 +37,7 @@ from open_webui.utils.tools import (
     set_terminal_servers,
     set_tool_servers,
 )
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, StrictBool, ValidationError, model_validator
 
 router = APIRouter()
 
@@ -148,6 +148,24 @@ async def export_config(user=Depends(get_admin_user)):
 @router.get('/namespace/{namespace}', response_model=dict)
 async def get_config_namespace(namespace: str, user=Depends(get_admin_user)):
     return await Config.get_namespace(namespace)
+
+
+class InterfaceVisibilityForm(BaseModel):
+    visibility: dict[str, StrictBool]
+
+
+@router.post('/interface/visibility', response_model=InterfaceVisibilityForm)
+async def set_interface_visibility(request: Request, form_data: InterfaceVisibilityForm, user=Depends(get_admin_user)):
+    await Config.upsert({'ui.visibility': form_data.visibility})
+    await publish_event(
+        request,
+        EVENTS.CONFIG_UPDATED,
+        actor=user,
+        subject_id='interface',
+        subject_type='config',
+        data={'keys': ['ui.visibility']},
+    )
+    return form_data
 
 
 ############################
@@ -656,7 +674,7 @@ async def verify_tool_servers_config(request: Request, form_data: ToolServerConn
                     await client.connect(
                         url=session['url'],
                         headers=session['headers'],
-                        httpx_client_factory=create_composio_httpx_client,
+                        httpx_client_factory=create_composio_mcp_httpx_client,
                     )
                     specs = await client.list_tool_specs()
                     specs = [
