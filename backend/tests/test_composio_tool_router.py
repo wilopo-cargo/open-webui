@@ -19,6 +19,7 @@ _TEST_DATA_DIR = tempfile.TemporaryDirectory(prefix='open-webui-composio-tests-'
 _TEST_DATA_PATH = Path(_TEST_DATA_DIR.name).resolve()
 _TEST_ENV = {
     'DATA_DIR': str(_TEST_DATA_PATH),
+    'STATIC_DIR': str(_TEST_DATA_PATH / 'static'),
     'DATABASE_URL': f'sqlite:///{_TEST_DATA_PATH / "test.db"}',
     # Empty overrides also prevent load_dotenv from restoring real credentials.
     'DATABASE_TYPE': '',
@@ -875,6 +876,7 @@ def _in_process_mcp_client_class(
                 if self.account_id == 'native' and native_specs is not None
                 else (app_specs if app_specs is not None else _APP_TOOL_SPECS)
             )
+            self.tool_definitions = {spec['name']: copy.deepcopy(spec) for spec in specs}
             return copy.deepcopy(specs)
 
         async def call_tool(self, function_name, function_args):
@@ -1553,16 +1555,17 @@ def _native_connection(server_id='shared'):
 
 async def _execute_tool_output(app_modules, request, form_data, metadata, user, name, arguments):
     tool_call = {
-        'id': 'test-call',
-        'type': 'function',
-        'function': {'name': name, 'arguments': json.dumps(arguments)},
+        'call_id': 'test-call',
+        'type': 'function_call',
+        'name': name,
+        'arguments': json.dumps(arguments),
     }
     _params, result, tool, tool_type, direct = await app_modules.middleware.execute_tool_call(
         form_data, metadata, None, tool_call
     )
     if tool:
         result, _files, _embeds = await app_modules.middleware.process_tool_result(
-            request, tool_call['function']['name'], result, tool_type, direct, metadata, user
+            request, name, result, tool_type, direct, metadata, user
         )
     return {'content': app_modules.middleware.tool_result_content(result)}
 
@@ -2958,7 +2961,10 @@ async def test_erp_mcp_statement_reconcile_relays_owned_current_turn_bytes(app_m
                     'arguments': json.dumps({'tool_name': tool['spec']['name'], 'params': json.dumps(arguments)}),
                 }
             }
-            _params, result, *_ = await app_modules.middleware.execute_tool_call(form_data, metadata, None, call)
+            assert app_modules.middleware.resolve_tool_call(call, metadata['tools']) is None
+            _params, result, *_ = await app_modules.middleware.execute_tool_call(
+                form_data, metadata, None, call['function']
+            )
             return result
 
         result = await invoke_reconcile()
@@ -3295,7 +3301,9 @@ async def test_deferred_composio_dispatch_keeps_user_scope_and_rejects_hostile_m
         assert app_name in metadata['deferred_tools'] and manager_name in metadata['deferred_tools']
 
         def tool_call(name, params):
-            return {'function': {'name': name, 'arguments': json.dumps(params)}}
+            call = {'function': {'name': name, 'arguments': json.dumps(params)}}
+            assert app_modules.middleware.resolve_tool_call(call, metadata['tools']) is None
+            return call['function']
 
         _params, found, *_ = await app_modules.middleware.execute_tool_call(
             form_data, metadata, None, tool_call('search_tools', {'query': 'GOOGLEDRIVE_FIND_FILE'})
@@ -3431,6 +3439,12 @@ async def test_mcp_httpx2_transport_negotiates_legacy_tools_and_blocks_cross_ori
             if self.path == '/collect':
                 redirected.append(dict(self.headers))
             received.append((message, self.headers))
+            if message['method'] == 'tools/call' and message['params']['arguments'].get('fail_transport'):
+                import socket
+
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+                return
             method = message['method']
             if method == 'notifications/initialized':
                 self.send_response(202)
@@ -3488,6 +3502,10 @@ async def test_mcp_httpx2_transport_negotiates_legacy_tools_and_blocks_cross_ori
             else:
                 assert request_headers['Authorization'] == 'Basic Zml4dHVyZTpwYXNzd29yZA=='
                 assert request_headers.get('x-api-key') is None
+        with pytest.raises(Exception):
+            await client.call_tool('echo', {'fail_transport': True})
+        await asyncio.sleep(0)
+        assert asyncio.current_task().cancelling() == 0
         await client.disconnect()
         with pytest.raises(RuntimeError, match='not connected'):
             await client.call_tool('echo', arguments)
@@ -3592,7 +3610,7 @@ async def test_tool_dispatch_preserves_server_owned_mcp_arguments(app_modules, m
     body = {'model': 'fixture', 'messages': [{'role': 'user', 'content': 'Echo the arguments.'}]}
     if dispatch == 'native':
         await middleware.execute_tool_call(
-            body, {'tools': tools}, None, {'function': {'name': 'echo', 'arguments': json.dumps(arguments)}}
+            body, {'tools': tools}, None, {'name': 'echo', 'arguments': json.dumps(arguments)}
         )
     else:
         async def config_get_many(*_keys):
