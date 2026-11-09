@@ -1008,7 +1008,6 @@ def _prepare_chat_payload(
     monkeypatch.setattr(middleware, 'get_event_call', no_result)
     monkeypatch.setattr(middleware, 'get_system_oauth_token', no_result)
     monkeypatch.setattr(middleware, 'get_task_model_id', lambda model_id, *_args: model_id)
-    monkeypatch.setattr(middleware, 'resolve_system_prompt', no_result)
     monkeypatch.setattr(Groups, 'get_groups_by_member_id', staticmethod(no_groups))
 
     model = {
@@ -1886,7 +1885,7 @@ async def test_actual_tool_execution_rejects_hostile_manager_kwargs_and_normaliz
         {'toolkits': ['notion']},
         {'toolkits': ['googledrive'], 'session_id': 'foreign-session'},
         {'toolkits': ['googledrive'], 'unknown': True},
-        {'toolkits': ['googledrive'], 'reinitiate_all': 'true'},
+        {'toolkits': ['googledrive'], 'reinitiate_all': 'not-a-boolean'},
     ):
         result = await _execute_tool_output(app_modules, request, form_data, metadata, user, manager_name, arguments)
         assert json.loads(result['content'])['error']

@@ -43,7 +43,7 @@ Create a dedicated PostgreSQL database and login for this Open WebUI installatio
 
 For an existing installation, preserve its effective signing key, database, and data volume rather than treating this as a fresh install. An existing persisted WebUI URL can override the environment default: set the production URL through Admin → Settings before using Composio callbacks. This workflow does not move or change the laptop installation.
 
-Open WebUI 0.13.0 includes database migrations for resource comments, persistent tool enabled states, and notifications. Before upgrading, take and verify a restorable backup of the database and all associated application data, including the named volume and any external file, object, or vector stores in use. Stop every instance and worker before starting the upgraded image. Upgrade all instances together; mixed-version rolling updates are unsupported and can fail because the schemas differ. If rollback is necessary after migrations run, restore the matching database and associated data backup before starting the previous image.
+Open WebUI 0.13.3 adds database migrations for renewable authentication sessions, private per-user chat views, and channel lookup indexes on top of 0.13.0's schema. Before upgrading, take and verify a restorable backup of the database and all associated application data, including the named volume and any external file, object, or vector stores in use. Stop every instance and worker before starting the upgraded image. Upgrade all instances together; mixed-version rolling updates are unsupported and can fail because the schemas differ. If rollback is necessary after migrations run, restore the matching database and associated data backup before starting the previous image.
 
 Compose uses project name `wilopo-open-webui-prod`, one `app` service, and the dedicated named `open_webui_data` volume. It does not start Ollama, run a separate migration service, or remove volumes/images. Do not share this project name or data volume with another application.
 
@@ -59,9 +59,9 @@ Start from the current fork `wilopo/main`. In the maintainer checkout, `origin` 
 
 ```bash
 git fetch wilopo main
-git fetch origin tag v0.13.0
-git worktree add -b chore/upgrade-openwebui-v0.13.0 ../open-webui-upgrade-v0.13.0 wilopo/main
-git -C ../open-webui-upgrade-v0.13.0 merge --no-ff --no-commit v0.13.0
+git fetch origin tag v0.13.3
+git worktree add -b chore/upgrade-openwebui-v0.13.3 ../open-webui-upgrade-v0.13.3 wilopo/main
+git -C ../open-webui-upgrade-v0.13.3 merge --no-ff --no-commit v0.13.3
 ```
 
 Resolve conflicts without dropping per-user Composio sessions and policies, ERP MCP static OAuth and owned current-turn CSV handoff, or deferred Tool Search. Keep upstream security fixes and MCP session isolation. Review added upstream workflow files as well as conflicts: `docker.yaml` must remain the sole active workflow, publishing only the standard GHCR `linux/amd64` image on Blacksmith. Keep production deployment, releases, and all other workflows disabled.
@@ -71,6 +71,24 @@ Use separate installed environments for the new worktree. Do not update another 
 After verification, update this document with results and limitations and commit the merge locally. Pushing, opening or merging a PR, publishing an image, and deploying are separate operator actions.
 
 ## Verification
+
+### Open WebUI 0.13.3 upgrade
+
+This fork merges exact upstream [v0.13.3](https://github.com/open-webui/open-webui/releases/tag/v0.13.3), commit `b0e6098e940942281d9c83f3529ea117287a3a22`, onto freshly fetched Wilopo fork main `00f8d3e9062dfd226303ae750c4ed4348d393e13`. GitHub identifies this release as published, non-draft, and non-prerelease. Per-user Composio identity, session/toolkit policy, TLS verification and scoped logging remain intact, as do ERP MCP static OAuth, owned current-turn CSV handoff, deferred Tool Search, and upstream MCP session-task isolation.
+
+The intervening [0.13.1 release](https://github.com/open-webui/open-webui/releases/tag/v0.13.1) includes security fixes and schema changes. It also changes behavior operators should review: native-function-calling models now need their Files tool or explicitly enabled Preload files to read attachments; custom pipes can receive a hidden tool result as their last message; `RAG_TOP_K` and `RAG_TOP_K_RERANKER` now default to 10 and `CHUNK_SIZE` to 1024 unless already saved; and side chats are saved unless temporary mode applies. Tool Search now uses discovery instructions without listing hidden tools and supports batched dispatch. Saved configuration values remain authoritative.
+
+Local pre-merge verification on 2026-11-09 passed:
+
+- `npm ci --no-audit --no-fund` and `npm run build`, run through `npm exec --yes --package=node@22.23.3 -- ...` with separate worktree dependencies. Encryption artifact verification, Pyodide preparation, and the production frontend build completed.
+- All 232 Composio/ERP behavioral checks in a fresh Python 3.11.16 process: `PYTHONPATH=backend PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m pytest -q backend/tests/test_composio_tool_router.py`. This covers per-user identity and policies, deferred dispatch, owned CSV relay, loopback HTTP transport, disconnect isolation, and untrusted TLS rejection. The fixtures no longer patch a removed upstream prompt resolver and use a malformed boolean value rather than rejecting upstream's supported boolean-string normalization. Five dependency deprecation warnings remain.
+- Parsing all 64 locale JSON files and structurally verifying that `docker.yaml` is the only enabled workflow, with one standard `linux/amd64` build on `blacksmith-4vcpu-ubuntu-2404` and GHCR-only login. Updated upstream action versions are retained; PyPI publishing stays removed and production deployment, releases and other workflows stay disabled.
+- Starting the actual application with fresh disposable SQLite data and migrating a separate data copy seeded through the actual 0.13.0 application. The migration chain was `e42c8f710a36` → `8bc7e5a902d1` → `6a23bd107e54` → `9f6c2a8d1b43`; both databases passed SQLite integrity checks.
+- Signing in after migration with the seeded account and preserving its ID and role, unchanged stored chat/message rows, saved tool source and inactive state, user interface settings, disabled Composio toolkit policy, encrypted ERP static-OAuth client metadata, and deferred Tool Search configuration.
+- Both fresh and migrated apps returned HTTP 200 from `/health`, `/ready`, `/health/db`, and `/api/version`, which reported `0.13.3`. Their built frontend HTML and all 92 referenced assets returned HTTP 200; both JavaScript application entry modules were nonempty.
+- A browser smoke check in Yab rendered "Welcome to your AI home". Clicking Get started displayed Name, Email and Password inputs, a password visibility control, and Create Admin Account. No account was created in the fresh database.
+
+These checks used an isolated copy of the prior Python environment and disposable data, with dotenv loading, model APIs, telemetry and remote model downloads disabled. They do not verify PostgreSQL migrations or backup restoration, real Composio/ERP consent or execution, model inference, image publication, or production rollout. Existing local runtimes and their data were not migrated. Production deployment remains disabled.
 
 ### Open WebUI 0.13.0 upgrade
 
