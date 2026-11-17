@@ -81,7 +81,7 @@ def app_modules():
     from open_webui import env
     from open_webui.internal import db
     from open_webui.routers import configs, tools
-    from open_webui.utils import composio, erp_mcp, middleware
+    from open_webui.utils import composio, composio_files, erp_mcp, middleware
     from open_webui.utils import tools as tool_utils
 
     assert env.DATA_DIR.resolve() == _TEST_DATA_PATH
@@ -96,6 +96,7 @@ def app_modules():
         yield SimpleNamespace(
             configs=configs,
             composio=composio,
+            composio_files=composio_files,
             erp_mcp=erp_mcp,
             middleware=middleware,
             tools=tools,
@@ -3629,3 +3630,674 @@ async def test_tool_dispatch_preserves_server_owned_mcp_arguments(app_modules, m
             tools,
         )
     assert received == [arguments if tool_type == 'mcp' else {'declared': 'value'}]
+
+
+_DRIVE_UPLOAD_SPEC = {
+    'name': 'GOOGLEDRIVE_UPLOAD_FILE',
+    'description': 'Upload a new file to Google Drive.',
+    'parameters': {
+        'type': 'object',
+        'properties': {
+            'file_to_upload': {'$ref': '#/$defs/FileUploadable'},
+            'folder_to_upload_to': {'type': 'string', 'description': 'Destination Drive folder ID.'},
+        },
+        'required': ['file_to_upload'],
+        'additionalProperties': False,
+        '$defs': {
+            'FileUploadable': {
+                'type': 'object',
+                'properties': {name: {'type': 'string'} for name in ('name', 'mimetype', 's3key')},
+                'required': ['name', 'mimetype', 's3key'],
+                'file_uploadable': True,
+            }
+        },
+    },
+}
+
+
+@pytest.fixture
+def composio_attachment(app_modules, monkeypatch, tmp_path):
+    module = app_modules.composio_files
+    content = b'%PDF-1.7\n\x00binary attachment\xff\n'
+    path = tmp_path / 'stored-file'
+    path.write_bytes(content)
+    file_id = 'current-upload-file'
+    record = SimpleNamespace(
+        id=file_id,
+        user_id='alice',
+        filename='report.pdf',
+        path=str(path),
+        meta={'size': len(content), 'content_type': 'application/pdf'},
+    )
+    state = SimpleNamespace(
+        module=module,
+        content=content,
+        path=path,
+        file_id=file_id,
+        record=record,
+        rows={file_id: record},
+        readable=True,
+        lookups=[],
+        authorizations=[],
+        storage_reads=[],
+        delegated=[],
+    )
+
+    class FileStore:
+        async def get_file_by_id(self, requested_id):
+            state.lookups.append(requested_id)
+            return state.rows.get(requested_id)
+
+    class StorageStore:
+        @staticmethod
+        def get_file(stored_path):
+            state.storage_reads.append(stored_path)
+            return stored_path
+
+    async def authorize(requested_id, access_type, user):
+        state.authorizations.append((requested_id, access_type, user.id))
+        return state.readable
+
+    async def delegate(**kwargs):
+        state.delegated.append(copy.deepcopy(kwargs))
+        return {'successful': True}
+
+    state.delegate = delegate
+    monkeypatch.setattr(module, 'UPLOAD_DIR', tmp_path)
+    monkeypatch.setattr(module, 'Files', FileStore())
+    monkeypatch.setattr(module, 'Storage', StorageStore())
+    monkeypatch.setattr(module, 'has_access_to_file', authorize)
+    return state
+
+
+def _bind_composio_attachment(attachment, *, user_message=None, delegate=None, spec=None):
+    return attachment.module.bind_composio_upload_tool(
+        'test-project-key',
+        _user('alice'),
+        user_message if user_message is not None else {'files': [{'type': 'file', 'id': attachment.file_id}]},
+        spec if spec is not None else _DRIVE_UPLOAD_SPEC,
+        delegate or attachment.delegate,
+    )
+
+
+@pytest.mark.parametrize('requires_approval', [False, True])
+@pytest.mark.asyncio
+async def test_composio_attachment_upload_honors_approval_review_and_display_labels(
+    app_modules, composio_attachment, monkeypatch, requires_approval
+):
+    from open_webui.utils.tool_calling import add_tool_call_metadata
+
+    async def config_get_many(*_keys):
+        return {
+            'chat.tool_permissions.enable': True,
+            'chat.tool_permissions.auto.enable': True,
+            'chat.tool_permissions.auto.engine': '',
+        }
+
+    monkeypatch.setattr(app_modules.middleware.Config, 'get_many', staticmethod(config_get_many))
+    spec, callable_ = _bind_composio_attachment(composio_attachment)
+    tools = {spec['name']: {'spec': spec, 'callable': callable_, 'type': 'mcp'}}
+    add_tool_call_metadata(tools, labels=True, approval=True)
+    staged_file = {'name': 'approved.pdf', 'mimetype': 'application/pdf', 's3key': 'already-staged-key'}
+    labels = {'running': 'Uploading report', 'completed': 'Uploaded report'}
+    call = {
+        'name': spec['name'],
+        'arguments': json.dumps(
+            {
+                'file_to_upload': staged_file,
+                '__approval__': {'required': requires_approval},
+                '__labels__': labels,
+            }
+        ),
+    }
+    metadata = {'tools': tools, 'params': {'tool_approval_mode': 'auto'}}
+    await app_modules.middleware.execute_tool_call({'messages': []}, metadata, None, call)
+    assert call['display_labels'] == labels
+    assert call['status'] == ('failed' if requires_approval else 'completed')
+    assert composio_attachment.delegated == ([] if requires_approval else [{'file_to_upload': staged_file}])
+    assert composio_attachment.lookups == composio_attachment.storage_reads == []
+
+
+@pytest.mark.parametrize(
+    'mutation',
+    [
+        lambda schema: schema['properties'].pop('file_to_upload'),
+        lambda schema: schema['properties'].update({'file_id': {'type': 'string'}}),
+        lambda schema: schema.update({'required': []}),
+        lambda schema: schema.update({'anyOf': [{'required': ['file_to_upload']}]}),
+        lambda schema: schema.update({'properties': []}),
+        lambda schema: schema.update({'required': 'file_to_upload'}),
+    ],
+)
+def test_composio_attachment_upload_fails_closed_on_provider_schema_drift(composio_attachment, mutation):
+    spec = copy.deepcopy(_DRIVE_UPLOAD_SPEC)
+    mutation(spec['parameters'])
+    with pytest.raises(ValueError):
+        _bind_composio_attachment(composio_attachment, spec=spec)
+    assert composio_attachment.lookups == []
+
+
+@pytest.mark.parametrize(
+    ('attachment_type', 'filename', 'mimetype'),
+    [('file', 'report.pdf', 'application/pdf'), ('image', 'photo.png', 'image/png')],
+)
+@pytest.mark.parametrize(('storage_backend', 'deferred'), [('s3', False), ('azure_blob_storage', True)])
+@pytest.mark.asyncio
+async def test_composio_attachment_upload_preserves_bytes_folder_user_session_and_approval(
+    app_modules,
+    composio_attachment,
+    monkeypatch,
+    caplog,
+    storage_backend,
+    deferred,
+    attachment_type,
+    filename,
+    mimetype,
+):
+    import hashlib
+
+    from open_webui.utils import tool_search
+
+    caplog.set_level(logging.DEBUG)
+    if attachment_type == 'image':
+        composio_attachment.content = b'\x89PNG\r\n\x1a\nsaved image bytes\x00\xff'
+        composio_attachment.path.write_bytes(composio_attachment.content)
+    composio_attachment.record.filename = filename
+    composio_attachment.record.meta = {'size': len(composio_attachment.content), 'content_type': mimetype}
+    if deferred:
+
+        async def search_config():
+            return {'defer_threshold': 0, 'always_loaded': [], 'defer_builtin_tools': False}
+
+        monkeypatch.setattr(tool_search, 'get_tool_search_config', search_config)
+    base_client = _in_process_mcp_client_class(app_specs=[_DRIVE_UPLOAD_SPEC, _APP_TOOL_SPECS[-1]])
+
+    class UploadClient(base_client):
+        async def call_tool(self, function_name, function_args):
+            if function_name != 'GOOGLEDRIVE_UPLOAD_FILE':
+                return await super().call_tool(function_name, function_args)
+            self.calls.append((function_name, copy.deepcopy(function_args)))
+            return {'uploaded_by': self.sessions[self.url]['account_id'], 'drive_file_id': 'drive-result'}
+
+    connection = _connection(
+        {'googledrive': {'tools': ['GOOGLEDRIVE_UPLOAD_FILE']}},
+        server_id='uploads',
+        grants=_user_read_grant('alice') + _user_read_grant('bob'),
+    )
+    sessions = _install_user_bound_sessions(monkeypatch, app_modules, UploadClient)
+    chats = []
+    for user_id in ('alice', 'bob'):
+        _request, form, metadata, _client_class = await _process_chat_with_servers(
+            monkeypatch,
+            app_modules,
+            [connection],
+            _user(user_id),
+            ['server:composio:uploads'],
+            hostile_metadata={
+                'user_id': 'mallory',
+                'composio_user_id': 'mallory',
+                'user_message': {
+                    'files': [
+                        {
+                            'type': attachment_type,
+                            'id': composio_attachment.file_id,
+                            'name': 'untrusted-name.exe',
+                            'content_type': 'text/html',
+                            'path': '/etc/passwd',
+                            'url': 'https://attacker.example/payload',
+                            'size': 1,
+                        }
+                    ]
+                },
+            },
+            client_class=UploadClient,
+        )
+        chats.append((form, metadata))
+    assert [json.loads(request.content)['user_id'] for request in sessions] == ['openwebui:alice', 'openwebui:bob']
+    assert composio_attachment.lookups == []
+    stage_requests = []
+    puts = []
+    private_key = 'projects/private-project/requests/googledrive/private-staged-file'
+    private_url = f'https://storage.composio.dev/{private_key}?signature=private-upload-signature'
+
+    def handler(request):
+        if request.method == 'POST':
+            stage_requests.append(request)
+            assert str(request.url) == 'https://backend.composio.dev/api/v3.1/files/upload/request'
+            assert request.headers['x-api-key'] == 'test-project-key'
+            assert 'authorization' not in request.headers and 'cookie' not in request.headers
+            assert json.loads(request.content) == {
+                'toolkit_slug': 'googledrive',
+                'tool_slug': 'GOOGLEDRIVE_UPLOAD_FILE',
+                'filename': filename,
+                'mimetype': mimetype,
+                'md5': hashlib.md5(composio_attachment.content, usedforsecurity=False).hexdigest(),
+            }
+            # The PUT must use the already-read bytes, even if storage changes after hashing.
+            composio_attachment.path.write_bytes(b'changed after the upload request')
+            return httpx.Response(
+                200,
+                json={
+                    'key': private_key,
+                    'new_presigned_url': private_url,
+                    'metadata': {'storage_backend': storage_backend},
+                },
+            )
+        assert request.method == 'PUT'
+        puts.append(request)
+        assert str(request.url) == private_url
+        assert request.content == composio_attachment.content
+        assert request.headers['Content-Type'] == mimetype
+        assert not {'x-api-key', 'authorization', 'cookie'} & set(request.headers)
+        expected_blob_type = 'BlockBlob' if storage_backend == 'azure_blob_storage' else None
+        assert request.headers.get('x-ms-blob-type') == expected_blob_type
+        composio_attachment.path.write_bytes(composio_attachment.content)
+        return httpx.Response(201 if storage_backend == 'azure_blob_storage' else 200)
+
+    def async_client(*args, **kwargs):
+        assert kwargs['verify'] is True
+        assert kwargs['follow_redirects'] is False
+        kwargs['transport'] = httpx.MockTransport(handler)
+        return _HTTPX_ASYNC_CLIENT(*args, **kwargs)
+
+    monkeypatch.setattr(app_modules.composio.httpx, 'AsyncClient', async_client)
+    tool_name = _composio_function_name('uploads', 'GOOGLEDRIVE_UPLOAD_FILE')
+
+    async def invoke(form, metadata):
+        arguments = {'file_to_upload': {'file_id': composio_attachment.file_id}, 'folder_to_upload_to': 'target-folder'}
+        call = {'function': {'name': tool_name, 'arguments': json.dumps(arguments)}}
+        if deferred:
+            assert tool_name in metadata['deferred_tools']
+            call['function'] = {
+                'name': 'call_tool',
+                'arguments': json.dumps({'tool_name': tool_name, 'params': json.dumps(arguments)}),
+            }
+            assert app_modules.middleware.resolve_tool_call(call, metadata['tools']) is None
+        return await app_modules.middleware.execute_tool_call(form, metadata, None, call['function'])
+
+    async def require_approval(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(app_modules.middleware, 'requires_tool_approval', require_approval)
+    _params, denied, *_rest = await invoke(*chats[0])
+    assert app_modules.middleware._is_tool_result_error(denied)
+    assert stage_requests == puts == composio_attachment.lookups == []
+
+    async def approved(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(app_modules.middleware, 'requires_tool_approval', approved)
+    for (form, metadata), user_id, client in zip(chats, ('alice', 'bob'), UploadClient.instances):
+        params, result, *_rest = await invoke(form, metadata)
+        assert params == {
+            'file_to_upload': {'file_id': composio_attachment.file_id},
+            'folder_to_upload_to': 'target-folder',
+        }
+        assert result == {'uploaded_by': user_id, 'drive_file_id': 'drive-result'}
+        assert client.calls == [
+            (
+                'GOOGLEDRIVE_UPLOAD_FILE',
+                {
+                    'file_to_upload': {'name': filename, 'mimetype': mimetype, 's3key': private_key},
+                    'folder_to_upload_to': 'target-folder',
+                },
+            )
+        ]
+        assert private_key not in json.dumps([metadata['tools'][tool_name]['spec'], params, result])
+    assert len(stage_requests) == len(puts) == 2
+    assert composio_attachment.authorizations == [
+        (composio_attachment.file_id, 'read', 'alice'),
+        (composio_attachment.file_id, 'read', 'bob'),
+    ]
+    assert UploadClient.instances[0].session_id != UploadClient.instances[1].session_id
+    assert private_key not in caplog.text and private_url not in caplog.text
+    await app_modules.middleware.disconnect_mcp_clients(
+        {f'server:composio:uploads-{index}': client for index, client in enumerate(UploadClient.instances)}
+    )
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        'historical',
+        'readable-knowledge-only',
+        'missing-record',
+        'unreadable',
+        'revoked-after-binding',
+        'url',
+        'uppercase-url',
+        'path-id',
+        'windows-path-id',
+        'data',
+        'text',
+        'unsaved-image',
+        'base64-image',
+        'external-image',
+        'missing-image-record',
+        'unreadable-image',
+        'missing-type',
+        'malformed-files',
+        'metadata-oversize',
+        'actual-oversize',
+        'empty',
+        'size-mismatch',
+        'invalid-size',
+        'filesystem',
+        'symlink',
+        'missing-path',
+    ],
+)
+@pytest.mark.asyncio
+async def test_composio_attachment_upload_rejects_untrusted_files_before_staging(
+    composio_attachment, monkeypatch, tmp_path, case
+):
+    attachment = composio_attachment
+    file_id = attachment.file_id
+    entry = {'type': 'file', 'id': file_id}
+    reference_ids = {
+        'url': 'https://attacker.example/file',
+        'uppercase-url': 'HTTPS://attacker.example/file',
+        'data': 'data:application/pdf;base64,Zm9v',
+        'path-id': '/etc/passwd',
+        'windows-path-id': 'C:\\private\\file.pdf',
+        'base64-image': 'data:image/png;base64,iVBORw0KGgo=',
+        'external-image': 'https://attacker.example/image.png',
+    }
+    if case in reference_ids:
+        file_id = reference_ids[case]
+        entry['id'] = file_id
+        entry['type'] = 'image' if case in ('base64-image', 'external-image') else 'file'
+        attachment.rows[file_id] = attachment.record
+    elif case == 'text':
+        entry['type'] = 'text'
+    elif case == 'unsaved-image':
+        entry = {'type': 'image', 'url': 'data:image/png;base64,iVBORw0KGgo='}
+    elif case in ('missing-image-record', 'unreadable-image'):
+        entry['type'] = 'image'
+    elif case == 'missing-type':
+        entry.pop('type')
+    user_message = {'files': [] if case in ('historical', 'readable-knowledge-only') else [entry]}
+    if case == 'malformed-files':
+        user_message['files'] = 42
+    _spec, callable_ = _bind_composio_attachment(attachment, user_message=user_message)
+    if case in ('missing-record', 'missing-image-record'):
+        attachment.rows.clear()
+    elif case in ('unreadable', 'revoked-after-binding', 'unreadable-image'):
+        attachment.readable = False
+    elif case == 'metadata-oversize':
+        attachment.record.meta['size'] = attachment.module.MAX_COMPOSIO_UPLOAD_BYTES + 1
+    elif case == 'actual-oversize':
+        attachment.path.write_bytes(b'x' * (attachment.module.MAX_COMPOSIO_UPLOAD_BYTES + 1))
+    elif case == 'empty':
+        attachment.path.write_bytes(b'')
+    elif case == 'size-mismatch':
+        attachment.record.meta['size'] += 1
+    elif case == 'invalid-size':
+        attachment.record.meta['size'] = True
+    elif case == 'filesystem':
+        attachment.record.path = str(Path(attachment.module.__file__).resolve())
+    elif case == 'symlink':
+        link = tmp_path / 'link'
+        link.symlink_to(attachment.path)
+        attachment.record.path = str(link)
+    elif case == 'missing-path':
+        attachment.record.path = str(tmp_path / 'missing-file')
+    external_attempts = []
+
+    def forbidden_client(*_args, **_kwargs):
+        external_attempts.append(True)
+        raise AssertionError('Rejected attachments must not be staged')
+
+    monkeypatch.setattr(attachment.module, 'create_composio_httpx_client', forbidden_client)
+    with pytest.raises(ValueError):
+        await callable_(file_to_upload={'file_id': file_id}, folder_to_upload_to='target-folder')
+    assert external_attempts == []
+    assert attachment.delegated == []
+
+
+@pytest.mark.asyncio
+async def test_composio_attachment_upload_rechecks_record_and_snapshots_current_ids(composio_attachment):
+    attachment = composio_attachment
+    user_message = {'files': [{'type': 'file', 'id': attachment.file_id}]}
+    _spec, callable_ = _bind_composio_attachment(attachment, user_message=user_message)
+    user_message['files'].append({'type': 'file', 'id': 'added-after-binding'})
+    attachment.rows['added-after-binding'] = attachment.record
+    with pytest.raises(ValueError):
+        await callable_(file_to_upload={'file_id': 'added-after-binding'})
+    assert attachment.lookups == []
+    replacement = copy.deepcopy(attachment.record)
+    replacement.meta['size'] = attachment.module.MAX_COMPOSIO_UPLOAD_BYTES + 1
+    attachment.rows[attachment.file_id] = replacement
+    with pytest.raises(ValueError):
+        await callable_(file_to_upload={'file_id': attachment.file_id})
+    assert attachment.authorizations == [(attachment.file_id, 'read', 'alice')]
+    assert attachment.storage_reads == attachment.delegated == []
+
+
+@pytest.mark.asyncio
+async def test_composio_attachment_upload_accepts_exact_byte_limit_and_trusted_storage_metadata(
+    composio_attachment, monkeypatch
+):
+    attachment = composio_attachment
+    content = b'x' * attachment.module.MAX_COMPOSIO_UPLOAD_BYTES
+    attachment.path.write_bytes(content)
+    attachment.record.meta = {'size': len(content)}
+    attachment.record.filename = 'archive.unknown-extension'
+    _spec, callable_ = _bind_composio_attachment(attachment)
+    staged = []
+
+    async def stage(api_key, filename, mimetype, actual_bytes):
+        staged.append((api_key, filename, mimetype, actual_bytes))
+        return (
+            {'name': filename, 'mimetype': mimetype, 's3key': 'private-boundary-key'},
+            'https://storage.composio.dev/file',
+        )
+
+    monkeypatch.setattr(attachment.module, '_stage_attachment', stage)
+    assert await callable_(file_to_upload={'file_id': attachment.file_id}) == {'successful': True}
+    assert staged == [('test-project-key', 'archive.unknown-extension', 'application/octet-stream', content)]
+
+
+@pytest.mark.parametrize(
+    'arguments',
+    [
+        {},
+        {
+            'file_id': 'current-upload-file',
+            'file_to_upload': {'name': 'report.pdf', 'mimetype': 'application/pdf', 's3key': 'private'},
+        },
+        {'file_id': None},
+        {'file_to_upload': {'file_id': None}},
+        {'file_to_upload': {'file_id': 'current-upload-file', 's3key': 'private'}},
+        {'file_to_upload': {'file_id': 'current-upload-file', 'name': 'untrusted.pdf'}},
+        {
+            'file_to_upload': {
+                'file_id': 'current-upload-file',
+                'name': 'report.pdf',
+                'mimetype': 'application/pdf',
+                's3key': 'private',
+            }
+        },
+        {'file_to_upload': '/etc/passwd'},
+        {'file_to_upload': 'https://attacker.example/file'},
+        {'file_to_upload': {'name': 'report.pdf', 'mimetype': 'application/pdf'}},
+        {'file_to_upload': {'name': 'report.pdf', 'mimetype': 'application/pdf', 's3key': ''}},
+    ],
+)
+@pytest.mark.asyncio
+async def test_composio_attachment_upload_rejects_ambiguous_or_unstaged_input(composio_attachment, arguments):
+    _spec, callable_ = _bind_composio_attachment(composio_attachment)
+    with pytest.raises(ValueError):
+        await callable_(**arguments)
+    assert composio_attachment.lookups == composio_attachment.storage_reads == composio_attachment.delegated == []
+
+
+@pytest.mark.asyncio
+async def test_composio_attachment_upload_preserves_existing_staged_payload_without_local_access(composio_attachment):
+    _spec, callable_ = _bind_composio_attachment(composio_attachment, user_message={'files': []})
+    staged = {'name': 'existing.pdf', 'mimetype': 'application/pdf', 's3key': 'existing-provider-key'}
+    assert await callable_(file_to_upload=staged, folder_to_upload_to='existing-folder') == {'successful': True}
+    assert composio_attachment.delegated == [{'file_to_upload': staged, 'folder_to_upload_to': 'existing-folder'}]
+    assert composio_attachment.lookups == composio_attachment.authorizations == composio_attachment.storage_reads == []
+
+
+@pytest.mark.parametrize(
+    'failure',
+    [
+        'api-status',
+        'api-redirect',
+        'api-network',
+        'invalid-json',
+        'missing-key',
+        'empty-key',
+        'missing-url',
+        'missing-metadata',
+        'unknown-backend',
+        'http-url',
+        'foreign-url',
+        'suffix-url',
+        'userinfo-url',
+        'port-url',
+        'fragment-url',
+        'loopback-url',
+        'azure-tenant-url',
+        's3-tenant-url',
+        'put-status',
+        'put-redirect',
+        'put-network',
+    ],
+)
+@pytest.mark.asyncio
+async def test_composio_attachment_upload_blocks_staging_failures_without_leaking_credentials(
+    app_modules, composio_attachment, monkeypatch, caplog, failure
+):
+    caplog.set_level(logging.DEBUG)
+    private_key = 'projects/private-project/requests/googledrive/private-failure-key'
+    private_url = f'https://storage.composio.dev/{private_key}?signature=private-failure-signature'
+    payload = {'key': private_key, 'new_presigned_url': private_url, 'metadata': {'storage_backend': 's3'}}
+    invalid_urls = {
+        'http-url': private_url.replace('https:', 'http:'),
+        'foreign-url': 'https://attacker.example/upload',
+        'suffix-url': 'https://storage.composio.dev.attacker.example/upload',
+        'userinfo-url': 'https://storage.composio.dev@attacker.example/upload',
+        'port-url': 'https://storage.composio.dev:8443/upload',
+        'fragment-url': private_url + '#fragment',
+        'loopback-url': 'https://127.0.0.1/upload',
+        'azure-tenant-url': 'https://attacker.blob.core.windows.net/upload',
+        's3-tenant-url': 'https://attacker.s3.amazonaws.com/upload',
+    }
+    if failure in invalid_urls:
+        payload['new_presigned_url'] = invalid_urls[failure]
+    elif failure == 'missing-key':
+        payload.pop('key')
+    elif failure == 'empty-key':
+        payload['key'] = ' '
+    elif failure == 'missing-url':
+        payload.pop('new_presigned_url')
+    elif failure == 'missing-metadata':
+        payload.pop('metadata')
+    elif failure == 'unknown-backend':
+        payload['metadata']['storage_backend'] = 'unsupported'
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        logging.getLogger('httpx').info('private upload %s %s', private_key, private_url)
+        if request.method == 'POST':
+            if failure == 'api-status':
+                return httpx.Response(401, text=f'{private_key} {private_url} test-project-key')
+            if failure == 'api-redirect':
+                return httpx.Response(307, headers={'Location': 'https://attacker.example/api'})
+            if failure == 'api-network':
+                raise httpx.ConnectError(f'{private_key} {private_url}', request=request)
+            if failure == 'invalid-json':
+                return httpx.Response(200, text=f'{private_key} not-json {private_url}')
+            return httpx.Response(200, json=payload)
+        assert request.method == 'PUT'
+        assert str(request.url) == private_url
+        assert 'x-api-key' not in request.headers
+        if failure == 'put-redirect':
+            return httpx.Response(307, headers={'Location': 'https://attacker.example/file'})
+        if failure == 'put-network':
+            raise httpx.ConnectError(f'{private_key} {private_url}', request=request)
+        return httpx.Response(403, text=f'{private_key} {private_url}')
+
+    _install_composio_transport(monkeypatch, app_modules.composio, handler)
+    _spec, callable_ = _bind_composio_attachment(composio_attachment)
+    with pytest.raises(ValueError) as error:
+        await callable_(file_to_upload={'file_id': composio_attachment.file_id}, folder_to_upload_to='target-folder')
+    assert [request.method for request in requests] == (['POST', 'PUT'] if failure.startswith('put-') else ['POST'])
+    assert composio_attachment.delegated == []
+    visible = str(error.value) + caplog.text
+    assert private_key not in visible and private_url not in visible and 'test-project-key' not in visible
+    assert not any(record.exc_info for record in caplog.records)
+
+
+@pytest.mark.parametrize('result_type', ['structured', 'mcp-app', 'exception'])
+@pytest.mark.parametrize('escaped_key', [False, True])
+@pytest.mark.asyncio
+async def test_composio_attachment_upload_redacts_provider_echoes(
+    composio_attachment, monkeypatch, result_type, escaped_key
+):
+    from open_webui.utils.mcp.apps import MCPAppResult
+
+    private_key = 'projects/private-project/requests/googledrive/private-result-key'
+    if escaped_key:
+        private_key += '/quote"and\\backslash\n'
+    private_url = f'https://storage.composio.dev/{private_key}?signature=private-result-signature'
+
+    async def stage(_api_key, filename, mimetype, _content):
+        return {'name': filename, 'mimetype': mimetype, 's3key': private_key}, private_url
+
+    async def delegate(**arguments):
+        if result_type == 'exception':
+            raise RuntimeError(f'private failure {private_key} {private_url}')
+        result = {'error': f'provider rejected {private_key} at {private_url}', 'successful': False}
+        if result_type == 'mcp-app':
+            return MCPAppResult(embed={'arguments': arguments, 'result': result}, context=[result])
+        return [{'type': 'text', 'text': json.dumps(result)}, {'structured': result}]
+
+    monkeypatch.setattr(composio_attachment.module, '_stage_attachment', stage)
+    _spec, callable_ = _bind_composio_attachment(composio_attachment, delegate=delegate)
+    if result_type == 'exception':
+        with pytest.raises(ValueError) as error:
+            await callable_(file_to_upload={'file_id': composio_attachment.file_id})
+        visible = str(error.value)
+    else:
+        result = await callable_(file_to_upload={'file_id': composio_attachment.file_id})
+        visible = json.dumps({'embed': result.embed, 'context': result.context} if result_type == 'mcp-app' else result)
+        assert 'provider rejected' in visible and '[redacted]' in visible
+    assert private_key not in visible and private_url not in visible and 'private-result-signature' not in visible
+    assert json.dumps(private_key)[1:-1] not in visible
+
+
+@pytest.mark.parametrize('excluded_by', ['policy', 'function-filter'])
+@pytest.mark.asyncio
+async def test_composio_attachment_upload_does_not_expand_policy_or_filters(
+    app_modules, composio_attachment, monkeypatch, excluded_by
+):
+    client_class = _in_process_mcp_client_class(app_specs=[*_APP_TOOL_SPECS, _DRIVE_UPLOAD_SPEC])
+    _install_user_bound_sessions(monkeypatch, app_modules, client_class)
+    allowed = ['GOOGLEDRIVE_FIND_FILE']
+    if excluded_by == 'function-filter':
+        allowed.append('GOOGLEDRIVE_UPLOAD_FILE')
+    connection = _connection(
+        {'googledrive': {'tools': allowed}}, server_id='policy-test', grants=_user_read_grant('alice')
+    )
+    connection['config']['function_name_filter_list'] = 'GOOGLEDRIVE_FIND_FILE'
+    _request, _form, metadata, _client = await _process_chat_with_servers(
+        monkeypatch,
+        app_modules,
+        [connection],
+        _user('alice'),
+        ['server:composio:policy-test'],
+        hostile_metadata={'user_message': {'files': [{'type': 'file', 'id': composio_attachment.file_id}]}},
+        client_class=client_class,
+    )
+    assert set(metadata['tools']) == {
+        _composio_function_name('policy-test', slug)
+        for slug in ('GOOGLEDRIVE_FIND_FILE', 'COMPOSIO_MANAGE_CONNECTIONS')
+    }
+    assert composio_attachment.lookups == composio_attachment.storage_reads == []
+    assert client_class.instances[0].calls == []
+    await app_modules.middleware.disconnect_mcp_clients({'server:composio:policy-test': client_class.instances[0]})

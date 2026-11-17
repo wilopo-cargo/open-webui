@@ -97,6 +97,7 @@ from open_webui.utils.composio import (
     create_composio_session,
     validate_composio_connection_arguments,
 )
+from open_webui.utils.composio_files import bind_composio_upload_tool
 from open_webui.utils.context_compaction import apply_summary_checkpoint, compact_messages_for_request
 from open_webui.utils.erp_mcp import bind_statement_reconcile_tool
 from open_webui.utils.files import (
@@ -2899,6 +2900,10 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                             if is_manager:
                                 manager_name = function_name
                         callable_ = _make_mcp_tool_function(client, original_name, session)
+                        if is_composio and original_name == 'GOOGLEDRIVE_UPLOAD_FILE':
+                            spec, callable_ = bind_composio_upload_tool(
+                                session['headers']['x-api-key'], user, metadata.get('user_message'), spec, callable_
+                            )
                         if erp_connection is not None and original_name == 'statement_reconcile':
                             spec, callable_ = await bind_statement_reconcile_tool(
                                 request,
