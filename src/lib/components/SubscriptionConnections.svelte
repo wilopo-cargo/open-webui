@@ -3,7 +3,11 @@
 	import { config, models, settings } from '$lib/stores';
 	import { getModels } from '$lib/apis';
 	import AccessControlModal from '$lib/components/workspace/common/AccessControlModal.svelte';
+	import Modal from '$lib/components/common/Modal.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
+	import Tooltip from '$lib/components/common/Tooltip.svelte';
+	import Plus from '$lib/components/icons/Plus.svelte';
+	import XMark from '$lib/components/icons/XMark.svelte';
 	import {
 		authorizeSubscriptionConnection,
 		completeSubscriptionConnection,
@@ -32,6 +36,7 @@
 	let showGrants = false;
 	let grantConnection: SubscriptionConnection | null = null;
 	let grantDraft: SubscriptionGrant[] = [];
+	let showConnectionModal = false;
 	$: visibleConnections = admin
 		? connections.filter((connection) => connection.scope === 'shared' && connection.can_manage)
 		: connections;
@@ -88,7 +93,7 @@
 	};
 
 	const complete = async () => {
-		if (!pending || !callback.trim()) return;
+		if (!pending || !callback.trim() || busy !== '') return;
 		const activePending = pending;
 		busy = 'complete';
 		error = '';
@@ -98,6 +103,7 @@
 			pending = null;
 			callback = '';
 			name = '';
+			showConnectionModal = false;
 			await refreshList();
 			await refreshModels();
 			notice = 'Connection added and model list refreshed.';
@@ -106,6 +112,7 @@
 				pending = null;
 				callback = '';
 				name = '';
+				showConnectionModal = false;
 				let refreshError = '';
 				try {
 					await refreshList();
@@ -192,66 +199,40 @@
 </script>
 
 <section class="mt-5 border-t border-gray-100/70 pt-4 text-sm dark:border-white/[0.06]" aria-labelledby="subscription-connections-heading">
-	<div class="mb-3">
-		<h3 id="subscription-connections-heading" class="text-xs font-medium text-gray-700 dark:text-gray-200">
-			{$i18n.t('Codex and Claude subscriptions')}
-		</h3>
-		<p class="mt-1 text-[0.6875rem] leading-relaxed text-gray-500 dark:text-gray-400">
-			{$i18n.t('Connect a provider account. Credentials stay on the server; paste the callback URL or code#state here to finish authorization.')}
-		</p>
+	<div class="mb-3 flex items-start justify-between gap-3">
+		<div>
+			<h3 id="subscription-connections-heading" class="text-xs font-medium text-gray-700 dark:text-gray-200">
+				{$i18n.t('Codex and Claude subscriptions')}
+			</h3>
+			<p class="mt-1 text-[0.6875rem] leading-relaxed text-gray-500 dark:text-gray-400">
+				{$i18n.t('Connect a provider account. Credentials stay on the server; paste the callback URL or code#state here to finish authorization.')}
+			</p>
+		</div>
+		<Tooltip content={$i18n.t('Add subscription connection')}>
+			<button
+				type="button"
+				aria-label={$i18n.t('Add subscription connection')}
+				class="flex size-6 shrink-0 items-center justify-center rounded-lg text-gray-400 transition-colors hover:bg-black/5 hover:text-gray-900 disabled:opacity-50 dark:text-gray-500 dark:hover:bg-white/5 dark:hover:text-white"
+				disabled={busy !== ''}
+				on:click={() => {
+					if (!pending) error = '';
+					showConnectionModal = true;
+				}}
+			>
+				<Plus />
+			</button>
+		</Tooltip>
 	</div>
 
 	{#if !admin}
-		<div class="mb-3 flex flex-wrap items-end gap-2">
-			<label class="min-w-0 flex-1 text-xs text-gray-600 dark:text-gray-300">
-				{$i18n.t('Connection name')}
-				<input bind:value={name} on:keydown={(event) => event.key === 'Enter' && event.preventDefault()} class="mt-1 h-8 w-full rounded-lg border border-gray-200 bg-transparent px-2 text-xs dark:border-gray-700" placeholder="Codex" />
-			</label>
-			<label class="text-xs text-gray-600 dark:text-gray-300">
-				{$i18n.t('Provider')}
-				<select bind:value={provider} class="mt-1 h-8 rounded-lg border border-gray-200 bg-white px-2 text-xs dark:border-gray-700 dark:bg-gray-900">
-					<option value="codex">Codex</option><option value="claude">Claude</option>
-				</select>
-			</label>
-			<button type="button" class="h-8 rounded-lg bg-gray-900 px-3 text-xs text-white disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900" disabled={busy !== ''} on:click={() => run('authorize', connect)}>
-				{busy === 'authorize' ? $i18n.t('Opening…') : $i18n.t('Connect')}
-			</button>
-		</div>
+		<p class="mb-3 text-xs text-gray-500 dark:text-gray-400">{$i18n.t('Connect your personal provider account.')}</p>
 	{:else}
 		<p class="mb-3 text-xs text-gray-500 dark:text-gray-400">{$i18n.t('Create a shared connection that can be granted to selected users or groups.')}</p>
-		<div class="mb-3 flex flex-wrap items-end gap-2">
-			<label class="min-w-0 flex-1 text-xs text-gray-600 dark:text-gray-300">
-				{$i18n.t('Connection name')}
-				<input bind:value={name} on:keydown={(event) => event.key === 'Enter' && event.preventDefault()} class="mt-1 h-8 w-full rounded-lg border border-gray-200 bg-transparent px-2 text-xs dark:border-gray-700" placeholder="Shared connection" />
-			</label>
-			<label class="text-xs text-gray-600 dark:text-gray-300">
-				{$i18n.t('Provider')}
-				<select bind:value={provider} class="mt-1 h-8 rounded-lg border border-gray-200 bg-white px-2 text-xs dark:border-gray-700 dark:bg-gray-900">
-					<option value="codex">Codex</option><option value="claude">Claude</option>
-				</select>
-			</label>
-			<button type="button" class="h-8 rounded-lg bg-gray-900 px-3 text-xs text-white disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900" disabled={busy !== ''} on:click={() => run('authorize', connect)}>
-				{busy === 'authorize' ? $i18n.t('Opening…') : $i18n.t('Create shared')}
-			</button>
-		</div>
 	{/if}
 
-	{#if pending}
-		<div class="mb-3 rounded-lg border border-blue-200 bg-blue-50/50 p-3 dark:border-blue-900 dark:bg-blue-950/20" aria-labelledby="subscription-callback-label">
-			<p id="subscription-callback-label" class="text-xs font-medium text-gray-700 dark:text-gray-200">{$i18n.t('Finish authorization')}</p>
-			<p class="mt-1 break-all text-[0.6875rem] text-gray-500 dark:text-gray-400">{$i18n.t('After approving access, copy the full redirect URL from the address bar, or enter code#state. Redirect:')} <code>{pending.redirect_uri}</code></p>
-			<label class="mt-2 block text-xs text-gray-600 dark:text-gray-300">{$i18n.t('Callback URL or code#state')}
-				<input bind:value={callback} autocomplete="off" on:keydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); complete(); } }} class="mt-1 h-8 w-full rounded-lg border border-gray-200 bg-white px-2 text-xs dark:border-gray-700 dark:bg-gray-900" />
-			</label>
-			<div class="mt-2 flex gap-2">
-				<button type="button" class="h-7 rounded-lg bg-gray-900 px-3 text-xs text-white disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900" disabled={!callback.trim() || busy !== ''} on:click={complete}>{busy === 'complete' ? $i18n.t('Connecting…') : $i18n.t('Complete')}</button>
-				<button type="button" class="h-7 rounded-lg border border-gray-200 px-3 text-xs dark:border-gray-700" on:click={() => { pending = null; callback = ''; }}>{$i18n.t('Cancel')}</button>
-			</div>
-		</div>
-	{/if}
-
-	{#if error}<p class="mb-2 text-xs text-red-600 dark:text-red-400" role="alert">{error}</p>{/if}
+	{#if error && !showConnectionModal}<p class="mb-2 text-xs text-red-600 dark:text-red-400" role="alert">{error}</p>{/if}
 	{#if notice}<p class="mb-2 text-xs text-green-700 dark:text-green-400" role="status">{notice}</p>{/if}
+
 	{#if loading}
 		<div class="flex items-center gap-2 py-3 text-xs text-gray-500" role="status" aria-live="polite"><Spinner className="size-4" /> {$i18n.t('Loading subscription connections…')}</div>
 	{:else if visibleConnections.length === 0}
@@ -286,6 +267,105 @@
 		</ul>
 	{/if}
 </section>
+<Modal
+	ariaLabel={$i18n.t('Add subscription connection')}
+	size="sm"
+	bind:show={showConnectionModal}
+>
+	<div class="px-5 pt-4 pb-4 text-gray-800 dark:text-gray-100">
+		<div class="mb-4 flex items-center justify-between gap-3">
+			<h2 class="text-base font-medium">{$i18n.t('Add subscription connection')}</h2>
+			<button
+				type="button"
+				class="rounded-lg p-1 text-gray-500 hover:bg-black/5 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-white/5 dark:hover:text-white"
+				aria-label={$i18n.t('Close modal')}
+				on:click={() => (showConnectionModal = false)}
+			>
+				<XMark className="size-5" />
+			</button>
+		</div>
+		<form
+			class="space-y-3"
+			on:submit|stopPropagation={(event) => {
+				event.preventDefault();
+				if (!pending && busy === '') run('authorize', connect);
+			}}
+		>
+			<label class="block text-xs text-gray-600 dark:text-gray-300">
+				{$i18n.t('Provider')}
+				<select
+					bind:value={provider}
+					disabled={busy !== '' || pending !== null}
+					class="mt-1 h-9 w-full rounded-lg border border-gray-200 bg-white px-2 text-xs disabled:opacity-50 dark:border-gray-700 dark:bg-gray-900"
+				>
+					<option value="codex">Codex</option>
+					<option value="claude">Claude</option>
+				</select>
+			</label>
+			<label class="block text-xs text-gray-600 dark:text-gray-300">
+				{$i18n.t('Connection name')}
+				<input
+					bind:value={name}
+					disabled={busy !== '' || pending !== null}
+					class="mt-1 h-9 w-full rounded-lg border border-gray-200 bg-transparent px-2 text-xs disabled:opacity-50 dark:border-gray-700"
+					placeholder={provider === 'codex' ? $i18n.t('Codex connection') : $i18n.t('Claude connection')}
+				/>
+			</label>
+			<p class="text-[0.6875rem] leading-relaxed text-gray-500 dark:text-gray-400">
+				{provider === 'codex'
+					? $i18n.t('Sign in to your ChatGPT account in the provider window, then paste the redirect URL here.')
+					: $i18n.t('Sign in to your Claude account in the provider window, then paste the redirect URL here.')}
+			</p>
+			{#if pending}
+				<div class="rounded-lg border border-blue-200 bg-blue-50/50 p-3 dark:border-blue-900 dark:bg-blue-950/20" aria-labelledby="subscription-callback-label">
+					<p id="subscription-callback-label" class="text-xs font-medium text-gray-700 dark:text-gray-200">{$i18n.t('Finish authorization')}</p>
+					<p class="mt-1 break-all text-[0.6875rem] text-gray-500 dark:text-gray-400">{$i18n.t('After approving access, copy the full redirect URL from the address bar, or enter code#state. Redirect:')} <code>{pending.redirect_uri}</code></p>
+					<label class="mt-2 block text-xs text-gray-600 dark:text-gray-300">{$i18n.t('Callback URL or code#state')}
+						<input
+							bind:value={callback}
+							autocomplete="off"
+							disabled={busy !== ''}
+							on:keydown={(event) => {
+								if (event.key === 'Enter') {
+									event.preventDefault();
+									if (!busy) complete();
+								}
+							}}
+							class="mt-1 h-9 w-full rounded-lg border border-gray-200 bg-white px-2 text-xs disabled:opacity-50 dark:border-gray-700 dark:bg-gray-900"
+						/>
+					</label>
+					<div class="mt-3 flex flex-wrap gap-2">
+						<button
+							type="button"
+							class="h-8 rounded-lg bg-gray-900 px-3 text-xs text-white disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900"
+							disabled={!callback.trim() || busy !== ''}
+							on:click={complete}
+						>{busy === 'complete' ? $i18n.t('Connecting…') : $i18n.t('Complete')}</button>
+						<button
+							type="button"
+							class="h-8 rounded-lg border border-gray-200 px-3 text-xs disabled:opacity-50 dark:border-gray-700"
+							disabled={busy !== ''}
+							on:click={() => {
+								pending = null;
+								callback = '';
+								error = '';
+							}}
+						>{$i18n.t('Cancel')}</button>
+					</div>
+				</div>
+			{:else}
+				<div class="flex justify-end">
+					<button
+						type="submit"
+						class="h-8 rounded-lg bg-gray-900 px-3 text-xs text-white disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900"
+						disabled={busy !== ''}
+					>{busy === 'authorize' ? $i18n.t('Opening…') : admin ? $i18n.t('Create shared') : $i18n.t('Connect')}</button>
+				</div>
+			{/if}
+			{#if error}<p class="text-xs text-red-600 dark:text-red-400" role="alert">{error}</p>{/if}
+		</form>
+	</div>
+</Modal>
 
 <AccessControlModal
 	bind:show={showGrants}
@@ -298,3 +378,4 @@
 	allowGroups={true}
 	onChange={saveGrants}
 />
+

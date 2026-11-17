@@ -76,16 +76,18 @@ Subscription connections use direct OAuth and provider protocol adapters based o
 
 ### Connect a personal account
 
-1. Open **Settings → Connections → Codex and Claude subscriptions**. This section is available even when browser-direct API connections are disabled.
-2. Enter a name, choose **Codex** or **Claude**, and click **Connect**. Allow the authorization popup and sign in to the provider.
-3. After consent, copy the **entire callback URL** from the browser address bar and paste it into **Callback URL or code#state** in WebUI. The fixed public OAuth clients use `http://localhost:1455/auth/callback` for Codex and `http://localhost:20128/callback` for Claude. A connection-refused page at that address is expected when nothing listens locally; WebUI exchanges the copied code server-side. Do not substitute the WebUI hostname or paste an access/refresh token.
+1. Open **Settings → Connections → Codex and Claude subscriptions** and click **+**. This section is available even when browser-direct API connections are disabled.
+2. In the dialog, choose **Codex** or **Claude** from the provider dropdown, then enter a connection name and click **Connect**. Allow the authorization popup and sign in to the provider.
+3. After consent, copy the **entire callback URL** from the browser address bar and paste it into **Callback URL or code#state** in the connection dialog. The fixed public OAuth clients use `http://localhost:1455/auth/callback` for Codex and `http://localhost:20128/callback` for Claude. A connection-refused page at that address is expected when nothing listens locally; WebUI exchanges the copied code server-side. Do not substitute the WebUI hostname or paste an access/refresh token.
 4. Click **Complete**. The connection's live model catalog appears in the ordinary model picker. If consent succeeds but discovery fails, the connection is retained; use **Refresh models** on its card.
 
 Use the card to rename, enable/disable, refresh the catalog, or disconnect. Reauthorization requires a new authorization flow; disabling hides the models without deleting credentials. Disconnect removes the connection and its access grants. Expired access tokens refresh on the server; revoked refresh credentials require reconnection.
 
+Existing browser-direct API connections keep their separate **+** button, URL/key dialog and connection controls. Their availability still depends on the administrator's **Direct Connections** setting; subscription connections do not replace or enable them.
+
 ### Admin-managed sharing
 
-Open **Admin Settings → Connections** and create a shared subscription connection. It starts owner-only. Use **Access** to grant read access to specific users or groups; public/wildcard grants and credential-management grants are rejected. A model/preset grant alone does not grant use of its underlying subscription connection. Removing a connection grant blocks subsequent requests even if a client retains the old model ID.
+Open **Admin Settings → Connections** and click **+** beside **Codex and Claude subscriptions**. Choose the provider, enter a name and authorize the shared subscription connection. It starts owner-only. Use **Access** to grant read access to specific users or groups; public/wildcard grants and credential-management grants are rejected. A model/preset grant alone does not grant use of its underlying subscription connection. Removing a connection grant blocks subsequent requests even if a client retains the old model ID.
 
 Personal connections remain owner-only, including against other administrators. Shared connections can be managed by administrators; only their owner and explicitly granted users/groups can use them for inference. Shared usage consumes the connected account's quota; this feature does not establish provider permission to share an account.
 
