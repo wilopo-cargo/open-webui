@@ -55,6 +55,7 @@ from open_webui.utils.access_control.files import has_access_to_file
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.chat_variables import get_chat_variables_schema
 from open_webui.utils.models import get_all_models
+from open_webui.utils.subscriptions import get_model_overlay
 from open_webui.utils.validate import BACKGROUND_IMAGE_MAX_BYTES, validate_background_image
 from open_webui.utils.voice_avatar import (
     ANIMATION_MAX_BYTES,
@@ -84,7 +85,7 @@ async def _check_model_controls(form, previous, user, request):
     if controls:
         if not request.app.state.MODELS:
             await get_all_models(request, user=user)
-        base = request.app.state.MODELS.get(form.base_model_id or form.id, {})
+        base = (await get_model_overlay(request, user)).get(form.base_model_id or form.id, {})
         if 'pipe' in base or base.get('direct') or base.get('owned_by') == 'arena':
             raise HTTPException(400, 'Model controls require a server-managed provider model.')
 
@@ -891,8 +892,9 @@ async def _verify_version_dependencies(request, form, user, db):
                 raise HTTPException(403, f'Referenced {resource_type} is not accessible: {resource_id}')
 
     if form.base_model_id:
-        available = await get_all_models(request, user=user)
-        if not any(model['id'] == form.base_model_id for model in available):
+        await get_all_models(request, user=user)
+        available = await get_model_overlay(request, user)
+        if form.base_model_id not in available:
             raise HTTPException(400, 'The base model is unavailable.')
     for item in form.meta.knowledge or []:
         if not isinstance(item, dict) or not item.get('id') or item.get('legacy'):

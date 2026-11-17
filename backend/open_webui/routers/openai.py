@@ -51,9 +51,11 @@ from open_webui.utils.payload import (
 )
 from open_webui.utils.response import convert_responses_usage_to_chat_completions, get_responses_finish_reason
 from open_webui.utils.session_pool import (
+    can_retry_model_request,
     cleanup_response,
     get_client_timeout,
     get_session,
+    request_model,
     stream_wrapper,
 )
 from pydantic import BaseModel, ConfigDict
@@ -1573,6 +1575,7 @@ async def generate_chat_completion(
     if not is_streaming_request:
         payload.pop('stream_options', None)
 
+    retry_model = not model.get('pipeline') and can_retry_model_request(payload)
     payload = JSONCodec.dumps(payload)
 
     r = None
@@ -1582,7 +1585,8 @@ async def generate_chat_completion(
     try:
         session = await get_session()
 
-        r = await session.request(
+        r, response_stream = await request_model(
+            session,
             method='POST',
             url=request_url,
             data=payload,
@@ -1590,6 +1594,7 @@ async def generate_chat_completion(
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
             timeout=get_client_timeout(stream=is_streaming_request),
+            retry=retry_model,
         )
 
         # Check if response is SSE
@@ -1637,7 +1642,7 @@ async def generate_chat_completion(
 
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r),
+                stream_wrapper(r, stream=response_stream),
                 status_code=r.status,
                 headers=_clean_proxy_headers(r.headers),
             )
@@ -1823,6 +1828,7 @@ async def responses(
     """
     payload = form_data.model_dump(exclude_none=True)
     is_streaming_request = bool(payload.get('stream', False))
+    retry_model = can_retry_model_request(payload)
 
     idx = 0
     model_id = form_data.model
@@ -1838,6 +1844,7 @@ async def responses(
             models = request.app.state.OPENAI_MODELS
         if model_id in models:
             idx = models[model_id]['urlIdx']
+            retry_model = retry_model and not models[model_id].get('pipeline')
 
     url, key, api_config = await get_openai_connection(idx)
 
@@ -1868,7 +1875,8 @@ async def responses(
             request_url = f'{url}/responses'
 
         session = await get_session()
-        r = await session.request(
+        r, response_stream = await request_model(
+            session,
             method='POST',
             url=request_url,
             data=body,
@@ -1876,13 +1884,15 @@ async def responses(
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
             timeout=get_client_timeout(stream=is_streaming_request),
+            retry=retry_model,
+            passthrough=True,
         )
 
         # Check if response is SSE
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, passthrough=True),
+                stream_wrapper(r, passthrough=True, stream=response_stream),
                 status_code=r.status,
                 headers=_clean_proxy_headers(r.headers),
             )
@@ -1947,6 +1957,12 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
         except (JSONCodec.JSONDecodeError, ValueError):
             payload = None
     is_streaming_request = bool(payload.get('stream', False)) if isinstance(payload, dict) else False
+    retry_model = (
+        request.method == 'POST'
+        and path in ('completions', 'chat/completions', 'responses', 'messages')
+        and isinstance(payload, dict)
+        and can_retry_model_request(payload)
+    )
 
     idx = 0
     model_id = payload.get('model') if isinstance(payload, dict) else None
@@ -1958,6 +1974,7 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
             models = request.app.state.OPENAI_MODELS
         if model_id in models:
             idx = models[model_id]['urlIdx']
+            retry_model = retry_model and not models[model_id].get('pipeline')
 
     url, key, api_config = await get_openai_connection(idx)
     base_url = url
@@ -1992,7 +2009,8 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
             request_url = f'{url}/{path}'
 
         session = await get_session()
-        r = await session.request(
+        r, response_stream = await request_model(
+            session,
             method=request.method,
             url=request_url,
             data=body,
@@ -2000,13 +2018,15 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
             timeout=get_client_timeout(stream=is_streaming_request),
+            retry=retry_model,
+            passthrough=True,
         )
 
         # Check if response is SSE
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, passthrough=True),
+                stream_wrapper(r, passthrough=True, stream=response_stream),
                 status_code=r.status,
                 headers=_clean_proxy_headers(r.headers),
             )

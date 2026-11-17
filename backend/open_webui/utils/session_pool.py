@@ -23,7 +23,12 @@ needs cleanup.  The session is closed once during application shutdown
 via ``close_session()``.
 """
 
+import asyncio
 import logging
+import math
+import time
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
 import aiohttp
@@ -83,6 +88,21 @@ async def get_session() -> aiohttp.ClientSession:
     return _session
 
 
+async def get_provider_session() -> aiohttp.ClientSession:
+    """Isolate account cookies while reusing the shared connection pool.
+
+    The caller owns this session and must close it after consuming its response.
+    """
+    shared = await get_session()
+    return aiohttp.ClientSession(
+        connector=shared.connector,
+        connector_owner=False,
+        cookie_jar=aiohttp.DummyCookieJar(),
+        timeout=get_client_timeout(),
+        trust_env=True,
+    )
+
+
 async def close_session():
     """Close the shared session.  Called during application shutdown."""
     global _session
@@ -116,7 +136,85 @@ async def cleanup_response(
                 await result
 
 
-async def stream_wrapper(response, session=None, passthrough=False):
+def can_retry_model_request(payload: dict) -> bool:
+    """Function declarations are model inputs; provider-executed tools are not safe to replay."""
+    tools = payload.get('tools') or []
+    return not payload.get('mcp_servers') and isinstance(tools, list) and all(
+        isinstance(tool, dict) and tool.get('type', 'function') == 'function' for tool in tools
+    )
+
+
+def _model_retry_delay(headers) -> float:
+    for name, scale in (('Retry-After', 1), ('retry-after-ms', 0.001)):
+        value = headers.get(name)
+        if value is None:
+            continue
+        try:
+            delay = float(value) * scale
+        except ValueError:
+            if name != 'Retry-After':
+                continue
+            try:
+                date = parsedate_to_datetime(value)
+                delay = max(0.0, date.replace(tzinfo=date.tzinfo or timezone.utc).timestamp() - time.time())
+            except (ValueError, TypeError, OverflowError):
+                continue
+        if math.isfinite(delay) and delay >= 0:
+            return delay
+    return 1.0
+
+
+async def _prefetched_stream(first, stream):
+    if first is not None:
+        yield first
+    async for chunk in stream:
+        yield chunk
+
+
+async def request_model(session, method, url, *, retry: bool, stream=False, passthrough=False, **kwargs):
+    """Retry a model HTTP request once, before returning any body bytes to its caller.
+
+    Buffer non-streaming bodies and prime streams so read failures before output
+    share the same two-attempt budget as connection and HTTP status failures.
+    After return, the caller owns the response and no stream failure is retried.
+    """
+    if not retry:
+        return await session.request(method, url, **kwargs), None
+
+    for attempt in range(2):
+        response = None
+        try:
+            response = await session.request(method, url, **kwargs)
+            if attempt == 0 and (response.status == 429 or 500 <= response.status < 600):
+                delay = _model_retry_delay(response.headers)
+                await cleanup_response(response)
+                await asyncio.sleep(delay)
+                continue
+
+            chunks = None
+            if response.status < 400:
+                if stream or 'text/event-stream' in response.headers.get('Content-Type', ''):
+                    chunks = response.content.iter_any() if passthrough else stream_chunks_handler(response.content)
+                    first = await anext(chunks, None)
+                    chunks = _prefetched_stream(first, chunks)
+                else:
+                    await response.read()
+            return response, chunks
+        except (aiohttp.ClientSSLError, aiohttp.ServerFingerprintMismatch):
+            await cleanup_response(response)
+            raise
+        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError):
+            await cleanup_response(response)
+            if attempt:
+                raise
+            await asyncio.sleep(1)
+        except BaseException:
+            # Cancellation and validation/application errors must never become retries.
+            await cleanup_response(response)
+            raise
+
+
+async def stream_wrapper(response, session=None, passthrough=False, stream=None):
     """Wrap a stream to ensure cleanup happens even if streaming is interrupted.
 
     This is more reliable than BackgroundTask which may not run if the client
@@ -125,12 +223,11 @@ async def stream_wrapper(response, session=None, passthrough=False):
     ``passthrough=True`` yields raw network chunks (iter_any) instead of
     lines: byte-identical output without a buffer scan, slice and copy per
     line. Only for streams no internal consumer parses line-by-line.
+    ``stream`` may already contain a prefetched first chunk from request_model.
     """
     try:
-        if passthrough:
-            stream = response.content.iter_any()
-        else:
-            stream = stream_chunks_handler(response.content)
+        if stream is None:
+            stream = response.content.iter_any() if passthrough else stream_chunks_handler(response.content)
         async for chunk in stream:
             yield chunk
     finally:

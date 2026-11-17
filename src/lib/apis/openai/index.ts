@@ -1,4 +1,5 @@
 import { OPENAI_API_BASE_URL, WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
+import { fetchModel } from './modelRequest';
 
 export const getErrorMessage = (err: any, fallback = 'Server connection failed') => {
 	if (Array.isArray(err)) return fallback;
@@ -398,12 +399,14 @@ export const verifyOpenAIConnection = async (
 export const chatCompletion = async (
 	token: string = '',
 	body: object,
-	url: string = `${WEBUI_BASE_URL}/api`
+	url: string = `${WEBUI_BASE_URL}/api`,
+	direct: boolean = false
 ): Promise<[Response | null, AbortController]> => {
 	const controller = new AbortController();
 	let error = null;
 
-	const res = await fetch(`${url}/chat/completions`, {
+	const endpoint = `${url}/chat/completions`;
+	const options: RequestInit = {
 		signal: controller.signal,
 		method: 'POST',
 		headers: {
@@ -411,7 +414,11 @@ export const chatCompletion = async (
 			'Content-Type': 'application/json'
 		},
 		body: JSON.stringify(body)
-	}).catch((err) => {
+	};
+	const res = await (direct
+		? fetchModel(endpoint, options, body as Record<string, unknown>)
+		: fetch(endpoint, options)
+	).catch((err) => {
 		console.error(err);
 		error = err;
 		return null;

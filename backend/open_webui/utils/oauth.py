@@ -82,7 +82,7 @@ from open_webui.events import EVENTS, publish_event
 from open_webui.models.auths import Auths
 from open_webui.models.config import Config
 from open_webui.models.groups import GroupForm, GroupModel, Groups, GroupUpdateForm
-from open_webui.models.oauth_sessions import OAuthSessions
+from open_webui.models.oauth_sessions import OAuthSessions, is_subscription_provider
 from open_webui.models.users import Users
 from open_webui.retrieval.web.utils import assert_identity_encoding, get_ssrf_safe_session, validate_url
 from open_webui.utils.auth import (
@@ -148,10 +148,9 @@ async def get_system_oauth_token(request, user):
         # Fallback: no cookie (automation, API key, etc.) — use most recent session
         if oauth_token is None:
             sessions = await OAuthSessions.get_sessions_by_user_id(user.id)
-            # Filter out MCP-provider sessions — their token refresh is handled
-            # separately by oauth_client_manager.  Passing them to the SSO
-            # oauth_manager causes a failed refresh and session deletion (#24618).
-            sessions = [s for s in sessions if not (s.provider or '').startswith('mcp:')]
+            # Non-login providers have dedicated credential lifecycles. Never
+            # pass their tokens to the SSO refresh/delete path.
+            sessions = [s for s in sessions if not (s.provider or '').startswith('mcp:') and not is_subscription_provider(s.provider)]
             if sessions:
                 best = max(sessions, key=lambda s: s.updated_at)
                 oauth_token = await request.app.state.oauth_manager.get_oauth_token(
@@ -1438,14 +1437,11 @@ class OAuthManager:
                 log.warning(f'No OAuth session found for user {user_id}, session {session_id}')
                 return None
 
-            # Guard: MCP-provider sessions must be refreshed by
-            # oauth_client_manager, not the SSO OAuthManager.  If one
-            # reaches here (e.g. via a stale cookie), bail out early
-            # instead of attempting a refresh that will fail and delete
-            # the session (#24618).
-            if (session.provider or '').startswith('mcp:'):
+            # MCP and subscription credentials must never become SSO tokens,
+            # even if an OAuth session cookie is forged or stale.
+            if (session.provider or '').startswith('mcp:') or is_subscription_provider(session.provider):
                 log.debug(
-                    'Skipping MCP session %s (provider=%s) in SSO OAuthManager — handled by oauth_client_manager',
+                    'Skipping non-SSO session %s (provider=%s) in SSO OAuthManager',
                     session.id,
                     session.provider,
                 )

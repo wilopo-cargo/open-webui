@@ -150,6 +150,7 @@ from open_webui.utils.response import (
     update_usage_snapshot,
 )
 from open_webui.utils.sanitize import sanitize_code
+from open_webui.utils.subscriptions import get_model_overlay
 from open_webui.utils.skills import (
     apply_skills_create_prompt,
     extract_skill_ids_from_messages,
@@ -2157,6 +2158,7 @@ def _make_mcp_tool_function(client, function_name: str, composio_session: dict |
 
 
 async def process_chat_payload(request, form_data, user, metadata, model):
+    models = await get_model_overlay(request, user)
     # Ensure chat_id is always a string — external API clients may omit it.
     if not isinstance(metadata.get('chat_id'), str):
         metadata['chat_id'] = ''
@@ -2174,7 +2176,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         if arena_model_ids and arena_filter_mode == 'exclude':
             arena_model_ids = [
                 available_model['id']
-                for available_model in request.app.state.MODELS.values()
+                for available_model in models.values()
                 if available_model.get('owned_by') != 'arena' and available_model['id'] not in arena_model_ids
             ]
 
@@ -2183,12 +2185,12 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         else:
             arena_model_ids = [
                 available_model['id']
-                for available_model in request.app.state.MODELS.values()
+                for available_model in models.values()
                 if available_model.get('owned_by') != 'arena'
             ]
             selected_model_id = random.choice(arena_model_ids)
 
-        selected_model = request.app.state.MODELS.get(selected_model_id)
+        selected_model = models.get(selected_model_id)
         if selected_model:
             model = selected_model
             form_data['model'] = selected_model_id
@@ -2294,7 +2296,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 filter_functions
                 or 'pipeline' in model
                 or model.get('pipe')
-                or get_sorted_filters(form_data['model'], request.app.state.MODELS)
+                or get_sorted_filters(form_data['model'], models)
                 or pending_assistant_message is not None
                 or metadata.get('params', {}).get('function_calling') == 'legacy'
             ):
@@ -2305,7 +2307,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     form_data.get('messages', []),
                     metadata,
                     form_data['model'],
-                    request.app.state.MODELS,
+                    models,
                     chat_system_prompt,
                 )
                 if context_summary:
@@ -2374,8 +2376,6 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         models = {
             request.state.model['id']: request.state.model,
         }
-    else:
-        models = request.app.state.MODELS
 
     task_model_id = get_task_model_id(
         form_data['model'],
@@ -3233,7 +3233,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 compaction_messages,
                 metadata,
                 form_data['model'],
-                request.app.state.MODELS,
+                models,
                 chat_system_prompt,
             )
             if compacted:
@@ -4138,7 +4138,7 @@ async def outlet_filter_handler(ctx):
             await get_filter_functions(request, model, metadata.get('filter_ids', [])) if ENABLE_FUNCTIONS else []
         )
         model_id = model.get('id') if isinstance(model, dict) else model
-        models = request.app.state.MODELS
+        models = await get_model_overlay(request, user)
         has_pipeline_outlet_filters = bool(
             (isinstance(model, dict) and 'pipeline' in model) or get_sorted_filters(model_id, models)
         )
@@ -4500,6 +4500,7 @@ async def streaming_chat_response_handler(response, ctx):
     form_data = ctx['form_data']
 
     user = ctx['user']
+    models = await get_model_overlay(request, user)
     model = ctx['model']
 
     metadata = ctx['metadata']
@@ -5161,6 +5162,7 @@ async def streaming_chat_response_handler(response, ctx):
                                 raw_obj = JSONCodec.loads(data)
                                 raw_error = raw_obj.get('error') if isinstance(raw_obj, dict) else None
                                 if raw_error:
+                                    finish_reason = 'failed'
                                     if save_to_chat:
                                         try:
                                             await Chats.upsert_message_to_chat_by_id_and_message_id(
@@ -5194,6 +5196,9 @@ async def streaming_chat_response_handler(response, ctx):
                                 )
 
                             if data:
+                                if data.get('error'):
+                                    # A later finish chunk cannot make a failed generation's tools executable.
+                                    finish_reason = 'failed'
                                 if 'event' in data and not getattr(request.state, 'direct', False):
                                     await event_emitter(data.get('event', {}))
 
@@ -5217,10 +5222,13 @@ async def streaming_chat_response_handler(response, ctx):
                                 # Check for Responses API events
                                 elif data.get('type', '').startswith('response.') or data.get('type', '') == 'error':
                                     response_data_type = data.get('type', '')
-                                    if response_data_type in {'response.incomplete', 'response.failed', 'error'}:
-                                        finish_reason = 'incomplete'
-                                    elif response_data_type == 'response.completed':
-                                        finish_reason = data.get('response', {}).get('status', 'completed')
+                                    if response_data_type in {'response.failed', 'error'}:
+                                        finish_reason = 'failed'
+                                    elif finish_reason != 'failed':
+                                        if response_data_type == 'response.incomplete':
+                                            finish_reason = 'incomplete'
+                                        elif response_data_type == 'response.completed':
+                                            finish_reason = data.get('response', {}).get('status', 'completed')
                                     response_data_is_delta = response_data_type.endswith('.delta')
                                     output, response_metadata = handle_responses_streaming_event(data, output)
 
@@ -5277,6 +5285,7 @@ async def streaming_chat_response_handler(response, ctx):
                                             response_metadata['usage'] = usage
 
                                         if response_metadata.get('error'):
+                                            finish_reason = 'failed'
                                             log.error(
                                                 'Provider returned error (streaming): %s', response_metadata['error']
                                             )
@@ -5351,7 +5360,7 @@ async def streaming_chat_response_handler(response, ctx):
                                             )
                                         continue
 
-                                    if choices[0].get('finish_reason'):
+                                    if choices[0].get('finish_reason') and finish_reason != 'failed':
                                         finish_reason = choices[0]['finish_reason']
 
                                     delta = choices[0].get('delta', {})
@@ -6430,7 +6439,7 @@ async def streaming_chat_response_handler(response, ctx):
                                         messages,
                                         metadata,
                                         form_data['model'],
-                                        request.app.state.MODELS,
+                                        models,
                                         bypass_system_prompt=True,
                                     )
                                 finally:
@@ -6836,7 +6845,7 @@ async def streaming_chat_response_handler(response, ctx):
                         outlet_enabled = bool(
                             (isinstance(model, dict) and 'pipeline' in model)
                             or get_sorted_filters(
-                                model.get('id') if isinstance(model, dict) else model, request.app.state.MODELS
+                                model.get('id') if isinstance(model, dict) else model, models
                             )
                         )
                     except Exception:

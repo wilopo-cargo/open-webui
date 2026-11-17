@@ -10,10 +10,20 @@ from open_webui.env import OAUTH_SESSION_TOKEN_ENCRYPTION_KEY
 from open_webui.internal.db import Base, get_async_db_context
 from open_webui.utils.json_codec import JSONCodec
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, Index, String, Text, delete, select, update
+from sqlalchemy import BigInteger, Column, Index, String, Text, delete, not_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
+
+
+def is_subscription_provider(provider):
+    return (provider or '').startswith(('subscription:', 'subscription-pending:'))
+
+
+def _login_session_filter():
+    # These encrypted rows are managed only by the subscription lifecycle API,
+    # never SSO consumers, admin token listings, or login-session cleanup.
+    return not_(OAuthSession.provider.like('subscription:%') | OAuthSession.provider.like('subscription-pending:%'))
 
 # DB model
 
@@ -149,7 +159,7 @@ class OAuthSessionTable:
         """Get OAuth session by ID"""
         try:
             async with get_async_db_context(db) as db:
-                result = await db.execute(select(OAuthSession).filter_by(id=session_id))
+                result = await db.execute(select(OAuthSession).filter_by(id=session_id).filter(_login_session_filter()))
                 session = result.scalars().first()
                 if session:
                     return OAuthSessionModel(
@@ -173,7 +183,7 @@ class OAuthSessionTable:
         """Get OAuth session by ID and user ID"""
         try:
             async with get_async_db_context(db) as db:
-                result = await db.execute(select(OAuthSession).filter_by(id=session_id, user_id=user_id))
+                result = await db.execute(select(OAuthSession).filter_by(id=session_id, user_id=user_id).filter(_login_session_filter()))
                 session = result.scalars().first()
                 if session:
                     return OAuthSessionModel(
@@ -200,6 +210,7 @@ class OAuthSessionTable:
                 result = await db.execute(
                     select(OAuthSession)
                     .filter_by(provider=provider, user_id=user_id)
+                    .filter(_login_session_filter())
                     .order_by(OAuthSession.created_at.desc())
                 )
                 session = result.scalars().first()
@@ -223,7 +234,7 @@ class OAuthSessionTable:
         """Get all OAuth sessions for a user"""
         try:
             async with get_async_db_context(db) as db:
-                result = await db.execute(select(OAuthSession).filter_by(user_id=user_id))
+                result = await db.execute(select(OAuthSession).filter_by(user_id=user_id).filter(_login_session_filter()))
                 sessions = result.scalars().all()
 
                 results = []
@@ -264,6 +275,7 @@ class OAuthSessionTable:
                 await db.execute(
                     update(OAuthSession)
                     .filter_by(id=session_id)
+                    .filter(_login_session_filter())
                     .values(
                         token=self._encrypt_token(token),
                         expires_at=token.get('expires_at') or int(time.time() + 3600),
@@ -271,7 +283,7 @@ class OAuthSessionTable:
                     )
                 )
                 await db.commit()
-                result = await db.execute(select(OAuthSession).filter_by(id=session_id))
+                result = await db.execute(select(OAuthSession).filter_by(id=session_id).filter(_login_session_filter()))
                 session = result.scalars().first()
 
                 if session:
@@ -294,7 +306,7 @@ class OAuthSessionTable:
         """Delete an OAuth session"""
         try:
             async with get_async_db_context(db) as db:
-                result = await db.execute(delete(OAuthSession).filter_by(id=session_id))
+                result = await db.execute(delete(OAuthSession).filter_by(id=session_id).filter(_login_session_filter()))
                 await db.commit()
                 return result.rowcount > 0
         except Exception as e:
@@ -318,7 +330,7 @@ class OAuthSessionTable:
         """Delete all OAuth sessions for a specific user and provider"""
         try:
             async with get_async_db_context(db) as db:
-                result = await db.execute(delete(OAuthSession).filter_by(user_id=user_id, provider=provider))
+                result = await db.execute(delete(OAuthSession).filter_by(user_id=user_id, provider=provider).filter(_login_session_filter()))
                 await db.commit()
                 return result.rowcount > 0
         except Exception as e:
@@ -329,7 +341,7 @@ class OAuthSessionTable:
         """Delete all OAuth sessions for a provider"""
         try:
             async with get_async_db_context(db) as db:
-                await db.execute(delete(OAuthSession).filter_by(provider=provider))
+                await db.execute(delete(OAuthSession).filter_by(provider=provider).filter(_login_session_filter()))
                 await db.commit()
                 return True
         except Exception as e:

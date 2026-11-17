@@ -40,6 +40,11 @@ from open_webui.utils.response import (
     convert_ollama_response_to_chat_completions,
     convert_ollama_stream_to_chat_completions,
 )
+from open_webui.utils.subscriptions import (
+    assert_model_access as assert_subscription_model_access,
+    generate_chat_completion as generate_subscription_chat_completion,
+    get_model_overlay,
+)
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
@@ -231,19 +236,7 @@ async def generate_chat_completion(
                 **request.state.metadata,
             }
 
-    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-        # Merge the direct connection model into server models so that
-        # task functions (title, tags, etc.) can resolve a server-side
-        # task model while still having the direct model available.
-        # dict(...items()) is one HGETALL on a Redis-backed pool; ``{**pool}``
-        # would issue HKEYS plus one HGET per model.
-        models = {
-            **dict(request.app.state.MODELS.items()),
-            request.state.model['id']: request.state.model,
-        }
-        log.debug('direct connection to model: %s', request.state.model['id'])
-    else:
-        models = request.app.state.MODELS
+    models = await get_model_overlay(request, user)
 
     model_id = form_data['model']
     # Single lookup — membership check plus getitem would be two Redis
@@ -252,7 +245,7 @@ async def generate_chat_completion(
     if model is None:
         raise Exception('Model not found')
 
-    if getattr(request.state, 'direct', False) and model_id == getattr(request.state, 'model', {}).get('id'):
+    if model.get('owned_by') != 'subscription' and getattr(request.state, 'direct', False) and model_id == getattr(request.state, 'model', {}).get('id'):
         return await generate_direct_chat_completion(request, form_data, user=user, models=models)
     else:
         # Check if user has access to the model
@@ -280,7 +273,7 @@ async def generate_chat_completion(
             if model_ids and filter_mode == 'exclude':
                 model_ids = [
                     available_model['id']
-                    for available_model in list(request.app.state.MODELS.values())
+                    for available_model in models.values()
                     if available_model.get('owned_by') != 'arena' and available_model['id'] not in model_ids
                 ]
 
@@ -289,7 +282,7 @@ async def generate_chat_completion(
             else:
                 model_ids = [
                     available_model['id']
-                    for available_model in list(request.app.state.MODELS.values())
+                    for available_model in models.values()
                     if available_model.get('owned_by') != 'arena'
                 ]
                 selected_model_id = random.choice(model_ids)
@@ -298,7 +291,7 @@ async def generate_chat_completion(
 
             # bypass_filter recursion below skips the line-200 check; gate the resolved model here.
             if not bypass_filter and user.role == 'user':
-                selected_model = request.app.state.MODELS.get(selected_model_id)
+                selected_model = models.get(selected_model_id)
                 if selected_model:
                     await check_model_access(user, selected_model)
 
@@ -337,6 +330,10 @@ async def generate_chat_completion(
                     return response
                 return {**response, 'selected_model_id': selected_model_id}
 
+        if model.get('owned_by') == 'subscription':
+            return await generate_subscription_chat_completion(
+                request, form_data, user, model, bypass_system_prompt=bypass_system_prompt
+            )
         if model.get('pipe'):
             # Below does not require bypass_filter because this is the only route the uses this function and it is already bypassing the filter
             return await generate_function_chat_completion(request, form_data, user=user, models=models)
@@ -380,13 +377,8 @@ async def chat_completed(request: Request, form_data: dict, user: Any):
     if not request.app.state.MODELS:
         await get_all_models(request, user=user)
 
-    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-        models = {
-            **dict(request.app.state.MODELS.items()),
-            request.state.model['id']: request.state.model,
-        }
-    else:
-        models = request.app.state.MODELS
+    models = await get_model_overlay(request, user)
+    await assert_subscription_model_access(user, form_data.get('model'))
 
     data = form_data
 

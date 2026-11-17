@@ -22,6 +22,7 @@
 	import OllamaConnection from './Connections/OllamaConnection.svelte';
 	import AdminSettingRow from './AdminSettingRow.svelte';
 	import AdminSettingSection from './AdminSettingSection.svelte';
+	import SubscriptionConnections from '$lib/components/SubscriptionConnections.svelte';
 
 	const i18n: any = getContext('i18n');
 
@@ -426,6 +427,7 @@
 				</div>
 			</div>
 		{/if}
+		<SubscriptionConnections admin />
 	</div>
 
 	<div class="flex justify-end pt-6 text-sm font-normal">

@@ -83,6 +83,8 @@ def app_modules():
     from open_webui.routers import configs, tools
     from open_webui.utils import composio, composio_files, erp_mcp, middleware
     from open_webui.utils import tools as tool_utils
+    from open_webui.models.models import Model
+    from open_webui.models.oauth_sessions import OAuthSession
 
     assert env.DATA_DIR.resolve() == _TEST_DATA_PATH
     assert env.DATABASE_URL == _TEST_ENV['DATABASE_URL']
@@ -93,6 +95,10 @@ def app_modules():
     assert Path(db.engine.url.database).resolve() == _TEST_DATA_PATH / 'test.db'
     assert Path(db.async_engine.url.database).resolve() == _TEST_DATA_PATH / 'test.db'
     try:
+        # Migrations are disabled: the normal chat overlay reads these tables,
+        # but this Composio fixture intentionally has no subscription accounts or presets.
+        OAuthSession.__table__.create(db.engine, checkfirst=True)
+        Model.__table__.create(db.engine, checkfirst=True)
         yield SimpleNamespace(
             configs=configs,
             composio=composio,
@@ -4301,3 +4307,96 @@ async def test_composio_attachment_upload_does_not_expand_policy_or_filters(
     assert composio_attachment.lookups == composio_attachment.storage_reads == []
     assert client_class.instances[0].calls == []
     await app_modules.middleware.disconnect_mcp_clients({'server:composio:policy-test': client_class.instances[0]})
+
+
+@pytest.mark.parametrize('failure', [None, 'final-answer', 'sse', 'sse-then-finish', 'plain-json', 'responses-error', 'responses-failed-then-completed'])
+@pytest.mark.asyncio
+async def test_stream_error_or_disabled_tool_choice_never_executes_mcp_tool(app_modules, monkeypatch, failure):
+    from starlette.responses import StreamingResponse
+    from open_webui.utils.tool_calling import final_answer_payload
+
+    middleware = app_modules.middleware
+    client_class = _in_process_mcp_client_class()
+    _install_user_bound_sessions(monkeypatch, app_modules, client_class)
+    user = _user('alice')
+    request, form_data, metadata, _ = await _process_chat_with_servers(
+        monkeypatch, app_modules,
+        [_connection(server_id='shared', grants=_user_read_grant('alice'))],
+        user, ['server:composio:shared'], client_class=client_class,
+    )
+    request.app.state.redis = None
+    metadata['message_id'] = 'stream-error-regression'
+    metadata['params']['tool_approval_mode'] = 'full'
+    form_data['metadata'] = metadata
+    if failure == 'final-answer':
+        declarations = copy.deepcopy(form_data['tools'])
+        form_data = final_answer_payload(form_data)
+        assert form_data['tools'] == declarations
+    name = _composio_function_name('shared', 'GOOGLEDRIVE_FIND_FILE')
+    emitted = []
+
+    async def emit(event):
+        emitted.append(copy.deepcopy(event))
+
+    async def no_result(*_args, **_kwargs):
+        return None
+
+    async def follow_up(*_args, **_kwargs):
+        # The next model request is outside this regression; do not make external calls.
+        return {'choices': [{'message': {'content': 'Finished.'}}]}
+
+    monkeypatch.setattr(middleware, 'generate_chat_completion', follow_up)
+    monkeypatch.setattr(middleware, 'outlet_filter_handler', no_result)
+    monkeypatch.setattr(middleware, 'background_tasks_handler', no_result)
+    monkeypatch.setattr(middleware, 'publish_chat_finished_event', no_result)
+
+    error = {'message': 'Provider stopped this generation.'}
+    if failure and failure.startswith('responses-'):
+        item = {'type': 'function_call', 'id': 'fc-stream', 'call_id': 'call-stream', 'name': name,
+                'arguments': '{"query":"document"}', 'status': 'completed'}
+        events = [
+            {'type': 'response.output_item.added', 'output_index': 0, 'item': item},
+            {'type': 'response.output_item.done', 'output_index': 0, 'item': item},
+            {'type': 'error', 'error': error} if failure == 'responses-error' else
+            {'type': 'response.failed', 'response': {'status': 'failed', 'error': error}},
+        ]
+        if failure == 'responses-failed-then-completed':
+            events.append({'type': 'response.completed', 'response': {'status': 'completed'}})
+    else:
+        # Both fragments together form valid JSON before the provider reports failure.
+        events = [
+            {'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': 0, 'id': 'call-stream', 'type': 'function',
+                          'function': {'name': name, 'arguments': '{"query":'}}]}, 'finish_reason': None}]},
+            {'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': 0,
+                          'function': {'arguments': '"document"}'}}]}, 'finish_reason': None}]},
+        ]
+        if failure and failure != 'final-answer':
+            events.append({'error': error})
+        if failure in (None, 'final-answer', 'sse-then-finish'):
+            events.append({'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}]})
+
+    async def chunks():
+        for event in events:
+            prefix = '' if failure == 'plain-json' and 'error' in event else 'data: '
+            yield prefix + json.dumps(event) + '\n\n'
+        yield 'data: [DONE]\n\n'
+
+    ctx = {
+        'request': request, 'form_data': form_data, 'user': user, 'model': request.app.state.MODELS['test-model'],
+        'metadata': metadata, 'events': [], 'tasks': None, 'event_emitter': emit, 'event_caller': None,
+    }
+    try:
+        await middleware.streaming_chat_response_handler(StreamingResponse(chunks(), media_type='text/event-stream'), ctx)
+        calls = client_class.instances[0].calls
+        output = ctx['assistant_message']['output']
+        if failure:
+            assert calls == []
+            assert any(event.get('data', {}).get('error') for event in emitted)
+            assert ctx['assistant_message']['finish_reason'] == ('tool_calls' if failure == 'final-answer' else 'failed')
+            assert any(item.get('type') == 'function_call' and item.get('status') == 'failed' for item in output)
+        else:
+            # Positive control proves this same parsed call reaches the real bound MCP callable.
+            assert calls == [('GOOGLEDRIVE_FIND_FILE', {'query': 'document'})]
+            assert any(item.get('type') == 'function_call_output' and item.get('status') == 'completed' for item in output)
+    finally:
+        await middleware.disconnect_mcp_clients(metadata.get('mcp_clients', {}))

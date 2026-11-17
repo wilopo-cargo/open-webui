@@ -43,7 +43,14 @@ from open_webui.utils.payload import (
     apply_model_params_to_body_openai,
     apply_system_prompt_to_body,
 )
-from open_webui.utils.session_pool import cleanup_response, get_client_timeout, get_session, stream_wrapper
+from open_webui.utils.session_pool import (
+    can_retry_model_request,
+    cleanup_response,
+    get_client_timeout,
+    get_session,
+    request_model,
+    stream_wrapper,
+)
 from pydantic import BaseModel, ConfigDict, validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -103,6 +110,7 @@ async def send_request(
     metadata: dict | None = None,
     api_config: dict | None = None,
     request: Request | None = None,
+    retry: bool = False,
 ):
     r = None
     streaming = False
@@ -111,7 +119,8 @@ async def send_request(
 
         headers, cookies = await get_headers_and_cookies(request, url, key, api_config, metadata, user=user)
 
-        r = await session.request(
+        r, response_stream = await request_model(
+            session,
             method,
             url,
             data=payload,
@@ -119,6 +128,9 @@ async def send_request(
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
             timeout=get_client_timeout(stream=stream),
+            retry=retry,
+            stream=stream,
+            passthrough=passthrough,
         )
 
         if not r.ok:
@@ -161,7 +173,7 @@ async def send_request(
 
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, passthrough=passthrough),
+                stream_wrapper(r, passthrough=passthrough, stream=response_stream),
                 status_code=r.status,
                 headers=response_headers,
             )
@@ -1057,6 +1069,7 @@ async def generate_completion(
         passthrough=True,
         api_config=api_config,
         request=request,
+        retry=True,
     )
 
 
@@ -1195,6 +1208,7 @@ async def generate_chat_completion(
         metadata=metadata,
         api_config=api_config,
         request=request,
+        retry=can_retry_model_request(payload),
     )
 
 
@@ -1288,6 +1302,7 @@ async def generate_openai_completion(
         metadata=metadata,
         api_config=api_config,
         request=request,
+        retry=can_retry_model_request(payload),
     )
 
 
@@ -1394,6 +1409,7 @@ async def generate_openai_chat_completion(
         metadata=metadata,
         api_config=api_config,
         request=request,
+        retry=can_retry_model_request(payload),
     )
 
 
@@ -1447,6 +1463,7 @@ async def generate_anthropic_messages(
         content_type='text/event-stream' if payload.get('stream', False) else None,
         api_config=api_config,
         request=request,
+        retry=can_retry_model_request(payload),
     )
 
 
@@ -1506,6 +1523,7 @@ async def generate_responses(
         content_type='text/event-stream' if payload.get('stream', False) else None,
         api_config=api_config,
         request=request,
+        retry=can_retry_model_request(payload),
     )
 
 
