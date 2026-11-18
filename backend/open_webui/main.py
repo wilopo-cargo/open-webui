@@ -179,6 +179,7 @@ from open_webui.routers import (
     scim,
     search,
     skills,
+    subscriptions,
     tasks,
     terminals,
     tools,
@@ -269,6 +270,10 @@ from open_webui.utils.models import (
     get_all_models,
     get_filtered_models,
 )
+from open_webui.utils.subscriptions import (
+    assert_model_access as assert_subscription_model_access,
+    get_model_overlay,
+)
 from open_webui.utils.payload import apply_model_controls
 from open_webui.utils.oauth import (
     OAuthClientInformationFull,
@@ -285,7 +290,14 @@ from open_webui.utils.oauth import (
 from open_webui.utils.plugin import install_tool_and_function_dependencies
 from open_webui.utils.recurrence import RecurrenceEvaluationTimeout
 from open_webui.utils.redis import get_redis_client
-from open_webui.utils.session_pool import cleanup_response, get_client_timeout, get_session, stream_wrapper
+from open_webui.utils.session_pool import (
+    can_retry_model_request,
+    cleanup_response,
+    get_client_timeout,
+    get_session,
+    request_model,
+    stream_wrapper,
+)
 from open_webui.utils.tool_approval import (
     ResolveToolCallForm,
     build_tool_approval_resume_payload,
@@ -836,6 +848,7 @@ app.include_router(tether.router, prefix='/api/v1/tether', tags=['tether'])
 app.include_router(auths.router, prefix='/api/v1/auths', tags=['auths'])
 app.include_router(mfa.router, prefix='/api/v1/auths/mfa', tags=['auths'])
 app.include_router(users.router, prefix='/api/v1/users', tags=['users'])
+app.include_router(subscriptions.router, prefix='/api/v1/subscriptions', tags=['subscriptions'])
 
 
 app.include_router(apps.router, prefix='/api/v1/apps', tags=['apps'])
@@ -898,6 +911,10 @@ async def get_models(
     # Access-filter first so the per-model payload work below only runs for
     # models the caller can actually see.
     models = await get_filtered_models(models, user)
+    scoped_models = await get_model_overlay(request, user)
+    models.extend(await get_filtered_models(
+        [model for model in scoped_models.values() if model.get('owned_by') == 'subscription'], user
+    ))
 
     for model in models:
         info = model.get('info') if isinstance(model.get('info'), dict) else {}
@@ -1115,6 +1132,10 @@ async def chat_completion(
     request.state.model_id = model_id
     model_item = form_data.pop('model_item', {})
     tasks = form_data.pop('background_tasks', None)
+    scoped_model = await assert_subscription_model_access(user, model_id)
+    models = await get_model_overlay(request, user)
+    if scoped_model is not None:
+        model_item = {}  # A scoped connection is never a browser-direct or terminal-agent connection.
 
     from open_webui.utils.terminals import get_folder_terminal_defaults, initialize_terminal_directory
 
@@ -1154,13 +1175,13 @@ async def chat_completion(
         fallback_model = None
         missing_base_model = False
         if not model_item.get('direct', False):
-            if agent_model is None and model_id not in request.app.state.MODELS:
+            if agent_model is None and model_id not in models:
                 raise Exception('Model not found')
 
-            model = agent_model or request.app.state.MODELS[model_id]
+            model = agent_model or models[model_id]
             model_info = await Models.get_model_by_id(model_id)
             missing_base_model = bool(
-                model_info and model_info.base_model_id and model_info.base_model_id not in request.app.state.MODELS
+                model_info and model_info.base_model_id and model_info.base_model_id not in models
             )
 
             if missing_base_model and ENABLE_CUSTOM_MODEL_FALLBACK:
@@ -1173,7 +1194,7 @@ async def chat_completion(
                     None,
                 )
                 if fallback_model_id:
-                    fallback_model = request.app.state.MODELS.get(fallback_model_id)
+                    fallback_model = models.get(fallback_model_id)
 
             # Check if user has access to the model
             if (
@@ -1882,7 +1903,8 @@ async def chat_completion(
             }
 
             # Resolve the model object for this specific model
-            resolved_model = request.app.state.MODELS.get(target_model_id, model)
+            resolved_model = models.get(target_model_id, model)
+            await assert_subscription_model_access(user, target_model_id)
 
             # Only the first model runs chat-level background tasks;
             # subsequent models only run follow-ups.
@@ -2006,7 +2028,7 @@ async def count_message_tokens(
     return {'input_tokens': await openai.count_anthropic_tokens(request, form_data, user)}
 
 
-async def passthrough_anthropic_messages(request: Request, form_data: dict, user) -> Response | dict:
+async def passthrough_anthropic_messages(request: Request, form_data: dict, user, *, retry: bool) -> Response | dict:
     requested_model, payload, url, key, headers, cookies = await openai.get_anthropic_request_target(
         request, form_data, user
     )
@@ -2016,7 +2038,8 @@ async def passthrough_anthropic_messages(request: Request, form_data: dict, user
 
     try:
         session = await get_session()
-        response = await session.request(
+        response, response_stream = await request_model(
+            session,
             method='POST',
             url=request_url,
             data=JSONCodec.dumps(payload),
@@ -2024,12 +2047,13 @@ async def passthrough_anthropic_messages(request: Request, form_data: dict, user
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
             timeout=get_client_timeout(stream=bool(payload.get('stream'))),
+            retry=retry and can_retry_model_request(payload),
         )
 
         if 'text/event-stream' in response.headers.get('Content-Type', ''):
             streaming = True
             return StreamingResponse(
-                stream_wrapper(response),
+                stream_wrapper(response, stream=response_stream),
                 status_code=response.status,
                 headers=openai._clean_proxy_headers(response.headers),
             )
@@ -2111,7 +2135,7 @@ async def generate_messages(
     if model:
         url, _, api_config = await openai.get_openai_connection(model['urlIdx'])
         if is_anthropic_messages_passthrough(url, api_config):
-            return await passthrough_anthropic_messages(request, form_data, user)
+            return await passthrough_anthropic_messages(request, form_data, user, retry=not model.get('pipeline'))
         passthrough_params = api_config.get('passthrough_params') or []
 
     # Translate Anthropic into OpenAI before sending it through the house plumbing.

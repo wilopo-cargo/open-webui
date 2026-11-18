@@ -70,7 +70,101 @@ Use separate installed environments for the new worktree. Do not update another 
 
 After verification, update this document with results and limitations and commit the merge locally. Pushing, opening or merging a PR, publishing an image, and deploying are separate operator actions.
 
+## Codex and Claude subscription connections
+
+Subscription connections use direct OAuth and provider protocol adapters based on [9router](https://github.com/decolua/9router), with attribution in `LICENSE_NOTICE`. They run through normal WebUI chat processing, not the terminal-agent path: model instructions, attached knowledge, tools, approval policies, and model-request retries remain in the WebUI pipeline.
+
+### Connect a personal account
+
+1. Open **Settings → Connections → Codex and Claude subscriptions** and click **+**. This section is available even when browser-direct API connections are disabled.
+2. In the dialog, choose **Codex** or **Claude** from the provider dropdown, then enter a connection name and click **Connect**. Allow the authorization popup and sign in to the provider.
+3. After consent, copy the **entire callback URL** from the browser address bar and paste it into **Callback URL or code#state** in the connection dialog. The fixed public OAuth clients use `http://localhost:1455/auth/callback` for Codex and `http://localhost:20128/callback` for Claude. A connection-refused page at that address is expected when nothing listens locally; WebUI exchanges the copied code server-side. Do not substitute the WebUI hostname or paste an access/refresh token.
+4. Click **Complete**. The connection's live model catalog appears in the ordinary model picker. If consent succeeds but discovery fails, the connection is retained; use **Refresh models** on its card.
+
+Use the card to rename, enable/disable, refresh the catalog, or disconnect. Reauthorization requires a new authorization flow; disabling hides the models without deleting credentials. Disconnect removes the connection and its access grants. Expired access tokens refresh on the server; revoked refresh credentials require reconnection.
+
+Existing browser-direct API connections keep their separate **+** button, URL/key dialog and connection controls. Their availability still depends on the administrator's **Direct Connections** setting; subscription connections do not replace or enable them.
+
+### Personal connection priority
+
+You can connect multiple personal accounts. Set **Priority** on each personal connection card: lower numbers are preferred, from `0` through `10000`; new and existing connections default to `100`. Equal priorities use the oldest connection first, then the connection ID for a stable tie-break.
+
+For a saved subscription-backed preset such as Leaders, WebUI first checks access to the preset and its configured base connection. It then prefers your highest-priority enabled personal connection whose catalog contains the **same provider and exact provider model ID**. Connections requiring reauthorization are excluded. If none match, the preset uses its configured connection. The preset's saved base, instructions, knowledge, tools and permissions remain unchanged; an administrator does not need to make a separate preset for each user.
+
+This applies only to subscription-backed presets. Directly selecting a connection-specific model pins that connection. Ordinary API-backed models do not automatically map to a subscription by name. Shared connections have no editable personal priority, and this setting grants no new access to a preset or its configured base.
+
+Selection happens before inference and is rechecked at dispatch. An authentication, refresh, quota or inference failure is returned to the caller; WebUI does not try another account or spend shared quota after a personal request fails. Existing transient retries remain on the selected connection.
+
+
+### Admin-managed sharing
+
+Open **Admin Settings → Connections** and click **+** beside **Codex and Claude subscriptions**. Choose the provider, enter a name and authorize the shared subscription connection. It starts owner-only. Use **Access** to grant read access to specific users or groups; public/wildcard grants and credential-management grants are rejected. A model/preset grant alone does not grant use of its underlying subscription connection. Removing a connection grant blocks subsequent requests even if a client retains the old model ID.
+
+Personal connections remain owner-only, including against other administrators. Shared connections can be managed by administrators; only their owner and explicitly granted users/groups can use them for inference. Shared usage consumes the connected account's quota; this feature does not establish provider permission to share an account.
+
+### Storage and runtime constraints
+
+- OAuth credentials and pending PKCE data reuse the encrypted `oauth_session` table. Keep `OAUTH_SESSION_TOKEN_ENCRYPTION_KEY` stable and backed up securely; it defaults to `WEBUI_SECRET_KEY`. Changing the encryption key without migration makes stored connections unreadable. No additional database migration or external router/CLI service is required.
+- Authorization state is user-bound, expires after ten minutes, and is consumed once. Tokens/verifiers are never returned in connection summaries, placed in user settings, exposed through the existing OAuth-session listing, or included in audit request/response bodies.
+- Model catalogs are connection-scoped and request-local, never inserted into global model caches. Existing SSO/MCP OAuth selection and cleanup exclude subscription namespaces.
+- Refresh and metadata updates lock the connection row. PostgreSQL provides per-row locking across workers; SQLite serializes all connection writes during refresh. Cancellation waits for rotated credentials to commit before propagating Stop.
+- Provider requests use cookie-free sessions sharing the existing connection pool, preventing ambient cookies from crossing accounts. Codex remote-image fetching validates public addresses at connection time, disables proxies/redirects, verifies TLS, and enforces time/type/size limits.
+- Claude preserves signed thinking in saved tool continuations, including empty signed blocks and native content order. Newer models bind signatures to prior instructions/tools/messages. Completed reasoning whose bound prefix changed is omitted; changing a bound prefix during an open tool turn fails locally with an actionable error instead of sending invalid history or silently discarding required thinking.
+- Codex forces upstream streaming even for non-streaming callers. Its endpoint rejects output-token caps and sampling parameters, so the adapter removes those fields as 9router does; configured token caps cannot be enforced there. Unsupported functional inputs fail explicitly rather than disappearing from the request.
+
+### Provider restrictions and verification
+
+Technical compatibility is not provider approval. [Anthropic's policy](https://code.claude.com/docs/en/legal-and-compliance) restricts third-party use of subscription OAuth tokens; [OpenAI's official hosted plan-sharing integration](https://developers.openai.com/cookbook/articles/sign-in-with-chatgpt) has its own eligibility requirements. This gateway follows the selected 9router-style route. Account restrictions, endpoint changes, model entitlement, quota enforcement, and real consent must be evaluated separately before rollout.
+
+Run isolated synthetic-provider checks with the installed backend environment:
+
+```bash
+PYTHON_DOTENV_DISABLED=1 python backend/tests/test_subscription_connections.py
+PYTHON_DOTENV_DISABLED=1 python backend/tests/test_subscription_codex.py
+PYTHON_DOTENV_DISABLED=1 python backend/tests/test_claude_subscription.py
+```
+
+## Model request retry
+
+Eligible HTTP chat-model requests make at most two attempts: the initial request and one retry for HTTP 429, HTTP 5xx, connection failures, timeouts, or interrupted response bodies before output is returned. The retry waits for `Retry-After` (seconds or HTTP date), then `retry-after-ms` if provided instead, or one second otherwise. Existing request and stream-idle timeout settings still apply.
+
+Non-streaming responses are buffered. Backend streams are primed before handoff; browser-direct streams return at successful response headers so a slow first chunk does not delay the socket acknowledgement. Browser body reads can still retry before the first output chunk. Once a streaming chunk has been handed off, failures propagate without restarting the response. Authentication/validation failures, backend TLS/certificate failures, application/protocol errors, and cancellation are not retried.
+
+The retry boundary covers OpenAI-compatible chat, Responses, native/translated Anthropic Messages, and Ollama chat/completion requests, including auxiliary chat-model calls. Browser-direct connections use the same attempt limit; same-origin WebUI chat proxy requests rely on the backend retry instead of adding another retry.
+
+WebUI tool execution, function pipes, pipeline models, native CLI-agent turns, and requests containing provider-executed tools are excluded. Ordinary function declarations are eligible because the model only proposes calls; WebUI executes tools outside this retry boundary. Audio, image, embedding, and model-management operations are unchanged. This does not implement subscription authentication.
+
+Browser Fetch reports some network, TLS, and CORS failures through the same `TypeError`; those can receive the single retry without bypassing browser security checks. Cross-origin providers must expose `Retry-After` and `retry-after-ms` with `Access-Control-Expose-Headers` for JavaScript to honor them; otherwise the one-second fallback applies.
+
+Run the isolated loopback regression check with:
+
+```bash
+PYTHONPATH=backend PYTHON_DOTENV_DISABLED=1 python -m pytest -q backend/tests/test_model_request_retry.py
+npm run test:frontend -- --run src/lib/apis/openai/modelRequest.test.ts
+```
+
 ## Verification
+
+### Subscription connections
+
+Local verification on 2026-11-17 passed the Codex, Claude, and connection-lifecycle checks against disposable SQLite data and controlled HTTP providers. Coverage includes OAuth S256/state ownership/expiry/replay, encrypted storage and safe summaries, personal-account isolation, explicit shared grants/revocation, refresh rotation and cancellation-safe persistence, cookie isolation, model catalogs, text/images/reasoning, tool history, streaming/non-streaming responses, sanitized failures, and Codex image-fetch restrictions.
+
+An actual Uvicorn application serving the built frontend exercised both providers through normal saved-chat routes. Uploaded full-context text and preset system instructions reached the provider; injected transient failures on both model rounds still executed the local tool exactly once. Ask-mode approval paused without side effects and resumed once. Auxiliary title generation, foreground subagent dispatch, and manual context compaction used the scoped models; compaction saved checkpoints. Parseable tool arguments followed by provider error or truncated EOF executed no tools for either provider, while successful control cases still executed once. Personal catalogs stayed out of global caches and other users' discovery.
+
+Real Chromium verification completed personal Codex and Claude OAuth flows through controlled consent pages, with browser-direct connections disabled. Admin shared-connection access displayed named, private read grants. A successful authorization followed by a catalog outage retained a visible zero-model connection and actionable message; refreshing after recovery populated the same connection without repeating OAuth. The Node 22 production frontend build passed. The existing Composio/ERP tool and retry suites passed 240 checks, including failed-stream and final-answer tool guards.
+
+All provider responses and account identities were synthetic; no real subscription credentials, consent, entitlements, provider inference, PostgreSQL multi-worker refresh, image publication, or production deployment were exercised. Disposable applications, provider servers, browser tabs, scripts and data were removed after verification.
+
+### Model request retry
+
+Local verification on 2026-11-16 passed the isolated loopback regression check and the frontend build with the repository-supported Node 22 runtime. Real Chromium requests against a controlled loopback provider verified failure-then-success, two-attempt exhaustion, authentication fail-fast, unsafe-tool exclusion, cancellation, first-chunk preservation, and no replay after a partial stream failed. Same-origin WebUI proxy aliases, including a percent-encoded alias, made only one frontend attempt to avoid multiplying backend retries.
+
+A real-loopback frontend regression and Chromium smoke also verified delayed first output: successful headers returned before a simulated acknowledgement deadline while body delivery remained delayed. A connection reset before the first body chunk recovered on the second request; a reset after the first chunk failed without replay.
+
+An actual Uvicorn application and loopback provider passed 27 disposable HTTP scenarios across OpenAI chat, Responses conversion, native/translated Anthropic, and native/compatible Ollama routes. Retry bodies remained identical, successful streams preserved their bytes, and a broken partial stream made only one provider request. A saved-chat tool loop retried the initial and continuation model requests independently while executing a real disposable local tool exactly once. No external network or private configuration/data access occurred in that smoke run.
+
+These checks use synthetic responses and no provider credentials. They do not establish live provider inference, subscription authentication, image publication, or production deployment.
+
 
 ### Open WebUI 0.13.3 upgrade
 

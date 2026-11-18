@@ -393,7 +393,7 @@
 	const getAvailableSettings = (personalTabs: SettingsTab[], administratorTabs: SettingsTab[]) => {
 		const personalSettings = personalTabs.filter((tab) => {
 			if (tab.id === 'connections') {
-				return $config?.features?.enable_direct_connections;
+				return true;
 			}
 
 			if (tab.id === 'tools') {
@@ -403,7 +403,6 @@
 						($user?.role === 'user' && $user?.permissions?.features?.direct_tool_servers))
 				);
 			}
-
 			if (tab.id === 'interface') {
 				return $user?.role === 'admin' || ($user?.permissions?.settings?.interface ?? true);
 			}
@@ -676,7 +675,7 @@
 								<span>{$i18n.t('settings.personal.shortcuts.title')}</span>
 							</button>
 						{:else if tabId === 'connections'}
-							{#if $user?.role === 'admin' || ($user?.role === 'user' && $config?.features?.enable_direct_connections)}
+							{#if $user?.role === 'admin' || $user?.role === 'user'}
 								<button
 									role="tab"
 									aria-controls="tab-connections"

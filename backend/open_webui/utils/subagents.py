@@ -19,6 +19,7 @@ from open_webui.utils.auth import VERIFIED_USER_ROLES, create_token
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import add_or_update_system_message, get_message_list, is_raster_image_content_type
 from open_webui.utils.models import get_filtered_models
+from open_webui.utils.subscriptions import get_model_overlay
 from open_webui.utils.tool_calling import strip_tool_approval_prompt
 from open_webui.utils.tool_search import strip_deferred_tools_manifest
 from starlette.datastructures import Headers
@@ -52,7 +53,8 @@ async def get_subagent_models(request: Request, user: UserModel, model: dict) ->
     model_ids = subagents.get('model_ids') or []
     if not model_ids:
         return []
-    candidates = [model for model_id, model in request.app.state.MODELS.items() if model_id in model_ids]
+    models = await get_model_overlay(request, user)
+    candidates = [model for model_id, model in models.items() if model_id in model_ids]
     return [
         {
             'id': model['id'],

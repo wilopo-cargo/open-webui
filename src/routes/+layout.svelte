@@ -62,7 +62,7 @@
 	import { executeToolServer, getBackendConfig, getModels, getVersion } from '$lib/apis';
 	import { getSessionUser, updateUserTimezone, userSignOut } from '$lib/apis/auths';
 	import { getAllTags } from '$lib/apis/chats';
-	import { chatCompletion } from '$lib/apis/openai';
+	import { chatCompletion, getErrorMessage } from '$lib/apis/openai';
 	import { isTemporaryChatId } from '$lib/utils/chatId';
 	import {
 		addOpenAIConnection,
@@ -708,6 +708,7 @@
 			} else if (type === 'request:chat:completion') {
 				console.log(data, $socket.id);
 				const { session_id, channel, form_data, model } = data;
+				let acknowledged = false;
 
 				try {
 					const directConnections = $settings?.directConnections ?? {};
@@ -728,7 +729,8 @@
 							const [res, controller] = await chatCompletion(
 								OPENAI_API_KEY,
 								form_data,
-								OPENAI_API_URL
+								OPENAI_API_URL,
+								!model?.pipeline && !model?.pipe
 							);
 
 							if (res) {
@@ -738,6 +740,7 @@
 								}
 
 								if (form_data?.stream ?? false) {
+									acknowledged = true;
 									cb({
 										status: true
 									});
@@ -772,6 +775,7 @@
 									await processStream();
 								} else {
 									const data = await res.json();
+									acknowledged = true;
 									cb(data);
 								}
 							} else {
@@ -779,12 +783,19 @@
 							}
 						} catch (error) {
 							console.error('chatCompletion', error);
-							cb(error);
+							if (acknowledged) {
+								$socket?.emit(channel, {
+									error: { message: getErrorMessage(error) }
+								});
+							} else {
+								acknowledged = true;
+								cb(error);
+							}
 						}
 					}
 				} catch (error) {
 					console.error('chatCompletion', error);
-					cb(error);
+					if (!acknowledged) cb(error);
 				} finally {
 					$socket.emit(channel, {
 						done: true

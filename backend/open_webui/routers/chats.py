@@ -48,6 +48,7 @@ from open_webui.utils.context_compaction import compact_chat_branch, get_chat_co
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import get_message_list
 from open_webui.utils.models import get_all_models
+from open_webui.utils.subscriptions import assert_model_access as assert_subscription_model_access, get_model_overlay
 from open_webui.utils.tool_permissions import DEFAULT_TOOL_PERMISSIONS_AUTO_PROMPT, get_tool_permissions_auto_config
 from open_webui.utils.tool_search import DEFAULT_TOOL_SEARCH_DECISIONS_PROMPT, validate_decisions_config
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -1397,7 +1398,9 @@ async def compact_chat_by_id(
     if not model_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='No model found for context compaction.')
 
-    result = await compact_chat_branch(request, user, chat, model_id, request.app.state.MODELS)
+    await assert_subscription_model_access(user, model_id)
+    models = await get_model_overlay(request, user)
+    result = await compact_chat_branch(request, user, chat, model_id, models)
     result['context_usage'] = await get_chat_context_usage(chat, model_id)
     if result.get('compacted'):
         await publish_event(

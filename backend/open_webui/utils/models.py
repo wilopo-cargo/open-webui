@@ -26,6 +26,7 @@ from open_webui.utils.plugin import (
     get_function_module_from_cache,
     get_functions_cache,
 )
+from open_webui.utils.subscriptions import assert_model_access as assert_subscription_model_access, subscription_base_id
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
@@ -219,6 +220,12 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
         enabled_filter_ids = set()
 
     custom_models = await Models.get_all_models()
+    custom_model_infos = {model.id: model for model in custom_models}
+    # Subscription-backed presets are assembled only in authenticated local overlays.
+    custom_models = [
+        model for model in custom_models
+        if subscription_base_id(model.id, custom_model_infos) is None
+    ]
 
     # Single O(1) lookup: Ollama base names first, then exact IDs (exact wins).
     base_model_lookup = {}
@@ -525,6 +532,8 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
 
 
 async def check_model_access(user, model, model_info=None, db=None):
+    if await assert_subscription_model_access(user, model.get('id')) is not None:
+        return
     if model.get('arena'):
         meta = model.get('info', {}).get('meta', {})
         access_grants = meta.get('access_grants', [])
@@ -589,6 +598,19 @@ async def check_model_access(user, model, model_info=None, db=None):
 
 
 async def get_filtered_models(models, user, db=None):
+    # Even admin/model ACL bypasses cannot bypass a credential owner's grants.
+    scoped_models = []
+    ordinary_models = []
+    for model in models:
+        if model.get('owned_by') == 'subscription' or str(model.get('id', '')).startswith('subscription:'):
+            try:
+                if await assert_subscription_model_access(user, model.get('id')) is not None:
+                    scoped_models.append(model)
+            except Exception:
+                continue
+        else:
+            ordinary_models.append(model)
+    models = ordinary_models
     # Filter out models that the user does not have access to
     if (
         user.role == 'user' or (user.role == 'admin' and not BYPASS_ADMIN_ACCESS_CONTROL)
@@ -642,6 +664,6 @@ async def get_filtered_models(models, user, db=None):
                 # only admins can see unconfigured models.
                 filtered_models.append(model)
 
-        return filtered_models
+        return filtered_models + scoped_models
     else:
-        return models
+        return models + scoped_models

@@ -214,7 +214,7 @@ class AuditLoggingMiddleware:
 
         request.state.audit_request_id = str(uuid.uuid4())
         request.state.audit_level = self.audit_level.value
-        capture_body = not (request.url.path.startswith('/api/v1/auths') or request.url.path.startswith('/oauth/'))
+        capture_body = not request.url.path.startswith(('/api/v1/auths', '/oauth/', '/api/v1/subscriptions'))
         async with self._audit_context(request) as context:
 
             async def send_wrapper(message: ASGISendEvent) -> None:

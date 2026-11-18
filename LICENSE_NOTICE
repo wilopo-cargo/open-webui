@@ -9,3 +9,27 @@ This repository contains code governed by multiple licenses based on the date an
 3. All code contributed or modified after commit 60d84a3aae9802339705826e9095e272e3c83623 is licensed under the Open WebUI License (see LICENSE).
 
 For details on which commits are covered by which license, refer to LICENSE_HISTORY.
+
+## 9router subscription adapters
+
+The Codex and Claude subscription adapters reference or adapt provider integration logic from [9router](https://github.com/decolua/9router), licensed under the MIT License:
+
+Copyright (c) 2024-2026 decolua and contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
