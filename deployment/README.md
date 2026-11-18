@@ -95,6 +95,13 @@ This applies only to subscription-backed presets. Directly selecting a connectio
 
 Selection happens before inference and is rechecked at dispatch. An authentication, refresh, quota or inference failure is returned to the caller; WebUI does not try another account or spend shared quota after a personal request fails. Existing transient retries remain on the selected connection.
 
+### Tools in scheduled automations
+
+Attach tools to the model under **Workspace → Models → Edit → Tools**, then select that model in the automation. Scheduled chat and channel runs resolve defaults from the automation owner's scoped model catalog, so subscription-backed presets inherit their attached tools, filters and supported default features. Tool selections made only in an ordinary chat are not saved automation defaults.
+
+MCP/Composio connections must remain enabled and accessible to the automation owner, and any required account authorization must already be complete. This does not grant tools new permissions or bypass approval review. Automations have no separate tool selector or approval-mode override; a run requiring interactive approval may not complete unattended. Browser-dependent code interpreter defaults remain excluded from scheduled execution.
+
+
 
 ### Admin-managed sharing
 

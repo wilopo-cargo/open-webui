@@ -66,6 +66,7 @@ from open_webui.utils.models import (
     get_all_models,
     get_filtered_models,
 )
+from open_webui.utils.subscriptions import get_model_overlay
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -1234,7 +1235,9 @@ async def model_response_handler(request, channel, message, user, db=None):
     if not await get_verified_user_by_id(user.id):
         return
 
-    MODELS = {model['id']: model for model in await get_filtered_models(await get_all_models(request, user=user), user)}
+    await get_all_models(request, user=user)
+    models = await get_model_overlay(request, user)
+    MODELS = {model['id']: model for model in await get_filtered_models(list(models.values()), user)}
 
     mentions = extract_mentions(message.content)
     message_content = replace_mentions(message.content)
@@ -1364,7 +1367,7 @@ async def model_response_handler(request, channel, message, user, db=None):
 
                 # The channel: chat-ID prefix routes pipeline events to the channel socket emitter.
                 form_data = {
-                    **await _resolve_model_defaults(request.app, model_id),
+                    **await _resolve_model_defaults(request, user, model_id, models=MODELS),
                     'model': model_id,
                     'messages': [
                         system_message,
