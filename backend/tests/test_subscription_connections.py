@@ -41,7 +41,7 @@ async def _check():
     from open_webui.models.chats import Chat
     from open_webui.models.config import Config
     from open_webui.models.groups import Group, GroupMember
-    from open_webui.models.models import Model
+    from open_webui.models.models import Model, Models
     from open_webui.models.oauth_sessions import OAuthSession, OAuthSessions
     from open_webui.models.users import User, UserModel
     from open_webui.routers import subscriptions as router
@@ -54,6 +54,7 @@ async def _check():
     from open_webui.utils.chat import generate_chat_completion
     from open_webui.utils.models import check_model_access
     from open_webui.utils.oauth import OAuthManager, get_system_oauth_token
+    from open_webui.utils.payload import apply_model_controls, apply_params_to_form_data
     from open_webui.utils.session_pool import close_session
     from open_webui.utils.subscriptions import claude, codex
     from sqlalchemy import select
@@ -81,6 +82,8 @@ async def _check():
     refresh_without_rotation = set()
     spent = set()
     wire = []
+    wire_authorizations = []
+    inference_failures = {}
     fail_inference_once = set()
 
     async def token_endpoint(request):
@@ -132,6 +135,14 @@ async def _check():
         assert not request.headers.get('Cookie')
         payload = await request.json()
         wire.append((provider, payload))
+        authorization = request.headers['Authorization']
+        wire_authorizations.append(authorization)
+        failure = inference_failures.get(authorization)
+        if failure == 'disconnect':
+            request.transport.close()
+            return web.Response()
+        if failure:
+            return web.Response(status=failure, headers={'Retry-After': '0'})
         if provider in fail_inference_once:
             fail_inference_once.remove(provider)
             return web.Response(status=503, headers={'Retry-After': '0'})
@@ -520,9 +531,286 @@ async def _check():
                 assert await db.get(OAuthSession, shared_id) is None
                 assert (await db.execute(select(AccessGrant).filter_by(resource_type=core.RESOURCE_TYPE, resource_id=shared_id))).scalars().first() is None
             await denied(core.resolve_subscription_model(users['bob'], shared_raw), 404)
+
+            async def check_priorities():
+                # Separate users/connections keep the lifecycle assertions above unchanged.
+                for name in ('priority', 'priority-no-base', 'priority-no-preset'):
+                    users[name] = UserModel(id=name, email=f'{name}@example.test', name=name, role='user',
+                                            last_active_at=0, updated_at=0, created_at=0)
+                async with get_async_db_context() as db:
+                    db.add_all([User(id=name, email=users[name].email, name=name, role='user',
+                                     last_active_at=0, updated_at=0, created_at=0)
+                                for name in ('priority', 'priority-no-base', 'priority-no-preset')])
+                    await db.commit()
+
+                credentials = {}
+
+                async def connect(provider='claude', owner='priority', scope='personal', grants=None):
+                    pending, code = await begin(provider, owner, scope, grants)
+                    response = await finish(pending, code, owner)
+                    assert response.status_code == 200, response.text
+                    value = response.json()
+                    assert value['priority'] == 100
+                    credentials[value['id']] = f'Bearer SECRET-access-{code}'
+                    return value['id']
+
+                async def alter(connection_id, *, created_at=None, owner=None, **changes):
+                    async with get_async_db_context() as db:
+                        row = await db.get(OAuthSession, connection_id)
+                        token = OAuthSessions._decrypt_token(row.token)
+                        for key, value in changes.items():
+                            if value is None:
+                                token['connection'].pop(key, None)
+                            else:
+                                token['connection'][key] = value
+                        if created_at is not None:
+                            row.created_at = created_at
+                        if owner is not None:
+                            row.user_id = owner
+                        core._save(row, token)
+                        await db.commit()
+
+                readers = [{'principal_type': 'user', 'principal_id': name, 'permission': 'read'}
+                           for name in ('priority', 'priority-no-preset')]
+                base = await connect(owner='admin', scope='shared', grants=readers)
+                other_shared = await connect(owner='admin', scope='shared', grants=readers)
+                a, b, legacy = [await connect() for _ in range(3)]
+                wrong_provider = await connect('codex')
+                wrong_model, disabled, reauth = [await connect() for _ in range(3)]
+                foreign = await connect(owner='priority-no-base')
+                catalog = [{'id': 'local-claude', 'name': 'Local Claude', 'capabilities': {'vision': False}}]
+                await alter(base, priority=0, created_at=0)
+                await alter(other_shared, priority=0, created_at=0)
+                await alter(a, priority=10, created_at=30)
+                await alter(b, priority=10, created_at=20)
+                await alter(legacy, priority=None, created_at=1)
+                await alter(wrong_provider, priority=0, models=catalog, created_at=2)
+                await alter(wrong_model, priority=0, models=[{**catalog[0], 'id': 'LOCAL-CLAUDE'}], created_at=3)
+                await alter(disabled, priority=0, enabled=False, created_at=4)
+                await alter(reauth, priority=0, reauth_required=True, created_at=5)
+                await alter(foreign, priority=0)
+
+                # Strict API types, bounds, omission, encryption, and ownership.
+                for value in (0, 10000, 10):
+                    response = await api('PATCH', '/' + a, 'priority', {'priority': value})
+                    assert response.status_code == 200 and response.json()['priority'] == value
+                for value in (None, True, False, 1.5, 1.0, '1', [], {}, -1, 10001):
+                    response = await api('PATCH', '/' + a, 'priority', {'priority': value})
+                    assert response.status_code == 422, (value, response.text)
+                assert (await api('PATCH', '/' + a, 'priority', {'name': 'Priority account'})).json()['priority'] == 10
+                for name in ('priority-no-base', 'admin', 'admin2'):
+                    assert (await api('PATCH', '/' + a, name, {'priority': 0})).status_code == 404
+                for name in ('admin', 'admin2'):
+                    assert (await api('PATCH', '/' + base, name, {'priority': 0})).status_code == 400
+                assert (await api('PATCH', '/' + base, 'priority', {'priority': 0})).status_code == 404
+                async with get_async_db_context() as db:
+                    stored = await db.get(OAuthSession, a)
+                    assert 'SECRET-' not in stored.token and '"priority"' not in stored.token
+                    assert OAuthSessions._decrypt_token(stored.token)['connection']['priority'] == 10
+                    assert 'priority' not in OAuthSessions._decrypt_token((await db.get(OAuthSession, legacy)).token)['connection']
+                    created = {row.id: row.created_at for row in (await db.execute(select(OAuthSession))).scalars()}
+                summaries = (await api('GET', '/', 'priority')).json()
+                assert next(row for row in summaries if row['id'] == legacy)['priority'] == 100
+                assert [(row['priority'], created[row['id']], row['id']) for row in summaries] == sorted(
+                    (row['priority'], created[row['id']], row['id']) for row in summaries)
+                assert [row['id'] for row in summaries if row['scope'] == 'personal' and row['priority'] == 10] == [b, a]
+                assert foreign not in {row['id'] for row in summaries}
+
+                preset_id = 'priority-leaders'
+                base_raw = f'subscription:{base}:local-claude'
+                controls = {'effort': {'label': 'Effort', 'default': 'low',
+                                       'options': {'low': {'label': 'Low', 'params': {'max_tokens': 64}}}}}
+                params = {'system': 'Priority Leaders instructions', 'temperature': 0.25, 'model_controls': controls}
+                meta = {'toolIds': ['priority-tool'], 'knowledge': [{'id': 'priority-knowledge'}]}
+                async with get_async_db_context() as db:
+                    for model_id, upstream, active in [
+                        (preset_id, base_raw, True), ('priority-private', base_raw, True),
+                        ('priority-chain', 'priority-private', True), ('priority-inactive', base_raw, False),
+                        ('priority-api', 'local-claude', True),
+                    ]:
+                        db.add(Model(id=model_id, user_id='admin', base_model_id=upstream, name='Leaders',
+                                     is_active=active, params=params, meta=meta, created_at=0, updated_at=0))
+                    for model_id in (preset_id, 'priority-chain', 'priority-inactive'):
+                        await AccessGrants.replace_access_grants(db, 'model', model_id, [
+                            {'principal_type': 'user', 'principal_id': name, 'permission': 'read'}
+                            for name in ('priority', 'priority-no-base')])
+                    await db.commit()
+
+                async def selected(name='priority', model_id=preset_id):
+                    return await core.assert_model_access(users[name], model_id, prefer_personal=True)
+
+                # One request-local catalog, shared by all presets, not one full query per preset.
+                catalog_reads = 0
+                original_catalog = core.get_subscription_models
+
+                async def counted_catalog(user):
+                    nonlocal catalog_reads
+                    catalog_reads += 1
+                    return await original_catalog(user)
+
+                core.get_subscription_models = counted_catalog
+                try:
+                    overlay = await core.get_model_overlay(request_for('priority'), users['priority'])
+                    assert catalog_reads == 1
+                    await check_model_access(users['priority'], overlay[preset_id])
+                    assert catalog_reads == 1  # Authorization-only callers do not need selection catalogs.
+                finally:
+                    core.get_subscription_models = original_catalog
+                assert overlay[preset_id]['subscription']['connection_id'] == b
+                assert overlay[preset_id]['id'] == preset_id and overlay[preset_id]['name'] == 'Leaders'
+                assert overlay[preset_id]['info']['base_model_id'] == base_raw
+                assert overlay[preset_id]['info']['meta']['toolIds'] == meta['toolIds']
+                assert overlay[preset_id]['info']['meta']['knowledge'] == meta['knowledge']
+                public_control = overlay[preset_id]['info']['params']['model_controls']['effort']
+                assert public_control['label'] == 'Effort' and public_control['default'] == 'low'
+                assert public_control['options'] == {'low': {'label': 'Low'}}  # Private option params stay server-side.
+                for hidden in ('priority-private', 'priority-chain', 'priority-inactive'):
+                    assert hidden not in overlay
+                    await denied(selected(model_id=hidden), 404)
+                assert await selected(model_id='priority-api') is None
+                for name in ('priority-no-base', 'priority-no-preset'):
+                    await denied(selected(name), 404)
+                    assert preset_id not in await core.get_model_overlay(request_for(name), users[name])
+                assert (await selected())['subscription']['connection_id'] == b
+                await alter(a, created_at=20)
+                first, second = sorted((a, b))
+                assert (await selected())['subscription']['connection_id'] == first
+                ordered = (await api('GET', '/', 'priority')).json()
+                assert [row['id'] for row in ordered if row['scope'] == 'personal' and row['priority'] == 10] == [first, second]
+                personal_models = await core.get_subscription_models(users['priority'])
+                assert [model['subscription']['connection_id'] for model in personal_models
+                        if model['subscription']['provider'] == 'claude' and model['subscription']['priority'] == 10] == [first, second]
+
+                # Lower-priority numbers win even when newer; priority-0 nonmatches never qualify.
+                await alter(a, enabled=False)
+                await alter(b, enabled=False)
+                assert (await selected())['subscription']['connection_id'] == legacy
+                await alter(legacy, enabled=False)
+                assert (await selected())['subscription']['connection_id'] == base
+                before = len(wire)
+                response = await client.post('/test/completions', headers={'x-test-user': 'priority'},
+                                             json={'model': preset_id, 'messages': [{'role': 'user', 'content': 'hello'}]})
+                assert response.status_code == 200, response.text
+                assert len(wire) == before + 1 and wire_authorizations[-1] == credentials[base]
+                for connection_id in (a, b, legacy):
+                    await alter(connection_id, enabled=True)
+
+                # Preset and configured base gates remain mandatory despite usable personal matches.
+                for changes, status, restore in [
+                    ({'enabled': False}, 409, {'enabled': True}),
+                    ({'reauth_required': True}, 401, {'reauth_required': False}),
+                    ({'models': []}, 404, {'models': catalog}),
+                ]:
+                    await alter(base, **changes)
+                    await denied(selected(), status)
+                    assert preset_id not in await core.get_model_overlay(request_for('priority'), users['priority'])
+                    await alter(base, **restore)
+                assert (await api('PATCH', '/' + base, 'admin', {'access_grants': []})).status_code == 200
+                await denied(selected(), 404)
+                assert preset_id not in await core.get_model_overlay(request_for('priority'), users['priority'])
+                assert (await api('PATCH', '/' + base, 'admin', {'access_grants': readers})).status_code == 200
+
+                # Fresh dispatch ignores stale overlay/client metadata after a durable priority edit.
+                stale = (await core.get_model_overlay(request_for('priority'), users['priority']))[preset_id]
+                assert stale['subscription']['connection_id'] == first
+                assert (await api('PATCH', '/' + second, 'priority', {'priority': 1})).status_code == 200
+                body = {
+                    'model': preset_id, 'stream': False,
+                    'model_item': {'subscription': {'connection_id': wrong_provider, 'model': 'wrong', 'provider': 'codex'}},
+                    'messages': [{'role': 'system', 'content': 'Priority knowledge context'},
+                                 {'role': 'user', 'content': 'Look up seven'}],
+                    'tools': [{'type': 'function', 'function': {'name': 'lookup', 'description': 'Read a number',
+                               'parameters': {'type': 'object', 'properties': {'value': {'type': 'integer'}}}}}],
+                    'metadata': {'live_tool_handle': LiveToolHandle()},
+                }
+                saved = await Models.get_model_by_id(preset_id)
+                control_params = apply_model_controls({}, saved.params.model_dump()['model_controls'],
+                                                      {'effort': public_control['default']})
+                body = apply_params_to_form_data(body, stale, control_params)
+                before = len(wire)
+                completion = await core.generate_chat_completion(request_for('priority'), body, users['priority'], stale)
+                assert completion['choices'][0]['message']['tool_calls'][0]['function']['name'] == 'lookup'
+                assert len(wire) == before + 1 and wire_authorizations[-1] == credentials[second]
+                provider, upstream = wire[-1]
+                assert provider == 'claude' and upstream['model'] == 'local-claude' and upstream['temperature'] == 0.25
+                assert upstream['max_tokens'] == 64  # The public choice still applies its stored provider parameters.
+                assert upstream['tools'][0]['name'] == 'lookup'
+                assert 'Priority Leaders instructions' in json.dumps(upstream['system'])
+                assert 'Priority knowledge context' in json.dumps(upstream['system'])
+                assert not {'model_item', 'metadata', 'model_controls', 'params'} & upstream.keys()
+                saved = await Models.get_model_by_id(preset_id)
+                assert saved.base_model_id == base_raw and saved.params.model_dump()['model_controls'] == controls
+                assert saved.meta.toolIds == meta['toolIds'] and saved.meta.knowledge == meta['knowledge']
+                assert stale['subscription']['connection_id'] == first and body['model'] == preset_id
+                assert app.state.MODELS == {} and app.state.OPENAI_MODELS == {}
+
+                # Explicit raw connection IDs are never remapped, even with higher-priority matches.
+                pinned = f'subscription:{first}:local-claude'
+                assert (await selected(model_id=pinned))['subscription']['connection_id'] == first
+                response = await client.post('/test/completions', headers={'x-test-user': 'priority'},
+                                             json={'model': pinned, 'messages': [{'role': 'user', 'content': 'hello'}]})
+                assert response.status_code == 200 and wire_authorizations[-1] == credentials[first]
+
+                # Revoke the chosen row between selection and the final token lock. No reroute.
+                original_connection_token = core._connection_token
+                for changes, status, restore, owner in [
+                    ({'models': []}, 404, {'models': catalog}, None),
+                    ({'enabled': False}, 409, {'enabled': True}, None),
+                    ({'reauth_required': True}, 401, {'reauth_required': False}, None),
+                    ({}, 404, {}, 'priority-no-base'),
+                ]:
+                    reached, resume = asyncio.Event(), asyncio.Event()
+
+                    async def paused_token(connection_id, user, **kwargs):
+                        assert connection_id == second
+                        reached.set()
+                        await resume.wait()
+                        return await original_connection_token(connection_id, user, **kwargs)
+
+                    core._connection_token = paused_token
+                    operation = asyncio.create_task(core.generate_chat_completion(
+                        request_for('priority'), {'model': preset_id, 'messages': [{'role': 'user', 'content': 'hello'}]},
+                        users['priority'], stale))
+                    before = len(wire)
+                    try:
+                        await asyncio.wait_for(reached.wait(), 5)
+                        await alter(second, owner=owner, **changes)
+                        resume.set()
+                        await denied(operation, status)
+                        assert len(wire) == before
+                    finally:
+                        resume.set()
+                        await asyncio.gather(operation, return_exceptions=True)
+                        core._connection_token = original_connection_token
+                        await alter(second, owner='priority', **restore)
+
+                # Provider retry2 may repeat the SAME credential, never another connection.
+                for failure, status, attempts in [(429, 429, 2), (503, 503, 2), ('disconnect', 502, 2), (401, 401, 1)]:
+                    inference_failures[credentials[second]] = failure
+                    before = len(wire)
+                    try:
+                        await denied(core.generate_chat_completion(
+                            request_for('priority'), {'model': preset_id, 'messages': [{'role': 'user', 'content': 'hello'}]},
+                            users['priority'], stale), status)
+                        assert len(wire) == before + attempts
+                        assert wire_authorizations[before:] == [credentials[second]] * attempts
+                    finally:
+                        inference_failures.clear()
+                        await alter(second, reauth_required=False)
+                invalid_refresh = 'SECRET-priority-invalid-refresh'
+                refresh_failures.add(invalid_refresh)
+                await expire(second, refresh=invalid_refresh)
+                before = len(wire)
+                await denied(core.generate_chat_completion(
+                    request_for('priority'), {'model': preset_id, 'messages': [{'role': 'user', 'content': 'hello'}]},
+                    users['priority'], stale), 401)
+                assert len(wire) == before and counts[('refresh', invalid_refresh)] == 1
+                assert (await selected())['subscription']['connection_id'] == first  # A later independent request may choose anew.
+
+            await check_priorities()
     await close_session()
     await async_engine.dispose()
-    print('subscription lifecycle, ownership, rotation, and real loopback provider smoke passed')
+    print('subscription lifecycle, ownership, priorities, rotation, and real loopback provider smoke passed')
 
 
 if __name__ == '__main__':

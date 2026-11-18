@@ -115,6 +115,7 @@ async def _summary(db, row, token, user):
         'name': connection['name'],
         'scope': connection['scope'],
         'enabled': connection.get('enabled', True),
+        'priority': connection.get('priority', 100),
         'status': 'reauth_required' if connection.get('reauth_required') else 'connected',
         'expires_at': row.expires_at,
         'models': [{'id': model['id'], 'name': model['name']} for model in connection.get('models', [])],
@@ -205,9 +206,11 @@ async def _valid_token(db, row, token):
     return token
 
 
-async def _connection_token(connection_id, user, *, manage=False, require_enabled=True):
+async def _connection_token(connection_id, user, *, manage=False, require_enabled=True, raw_id=None):
     async def refresh_and_commit():
         async with _locked_connection(connection_id, user, manage=manage, require_enabled=require_enabled) as (db, row, token):
+            if raw_id is not None:
+                _catalog_model(token, raw_id)
             token = await _valid_token(db, row, token)
             await db.commit()
             return row.provider.split(':', 1)[1], token
@@ -247,7 +250,7 @@ async def authorize(user, provider, name, scope, grants):
         await db.execute(delete(OAuthSession).filter(OAuthSession.provider.in_(PENDING_PROVIDERS), OAuthSession.expires_at <= int(time.time())))
         db.add(OAuthSession(
             id=state, user_id=user.id, provider=f'subscription-pending:{provider}',
-            token=OAuthSessions._encrypt_token({'verifier': verifier, 'state': state, 'expires_at': expires_at, 'connection': {'name': name, 'scope': scope, 'enabled': True, 'models': []}, 'access_grants': grants}),
+            token=OAuthSessions._encrypt_token({'verifier': verifier, 'state': state, 'expires_at': expires_at, 'connection': {'name': name, 'scope': scope, 'enabled': True, 'priority': 100, 'models': []}, 'access_grants': grants}),
             expires_at=expires_at, created_at=int(time.time()), updated_at=int(time.time()),
         ))
         await db.commit()
@@ -303,6 +306,7 @@ async def complete(user, state, callback):
     except Exception:
         raise HTTPException(502, 'Provider authorization exchange failed; start a new connection') from None
     connected['connection'] = token['connection']
+    connected['connection'].setdefault('priority', 100)
     connection_id = str(uuid.uuid4())
     async with _transaction() as db:
         row = OAuthSession(id=connection_id, user_id=user.id, provider=f'subscription:{provider}', token='', expires_at=connected['expires_at'], created_at=int(time.time()), updated_at=int(time.time()))
@@ -322,24 +326,29 @@ async def complete(user, state, callback):
 async def list_connections(user):
     groups = {group.id for group in await Groups.get_groups_by_member_id(user.id, include_inherited=True)}
     async with get_async_db_context() as db:
-        rows = (await db.execute(select(OAuthSession).filter(OAuthSession.provider.in_(SESSION_PROVIDERS)).order_by(OAuthSession.created_at))).scalars()
+        rows = (await db.execute(select(OAuthSession).filter(OAuthSession.provider.in_(SESSION_PROVIDERS)))).scalars()
         result = []
         for row in rows:
             token = OAuthSessions._decrypt_token(row.token)
             if _can_manage(row, token, user) or await _can_use(db, row, token, user, groups):
-                result.append(await _summary(db, row, token, user))
-        return result
+                result.append((_metadata(token).get('priority', 100), row.created_at, row.id, await _summary(db, row, token, user)))
+        return [summary for _, _, _, summary in sorted(result)]
 
 
 async def update_connection(user, connection_id, changes):
     async with _locked_connection(connection_id, user, manage=True, require_enabled=False) as (db, row, token):
         connection = _metadata(token)
+        if 'priority' in changes:
+            if connection['scope'] != 'personal' or row.user_id != user.id:
+                raise HTTPException(400, 'Only your personal connections have editable priority')
+            if type(changes['priority']) is not int or not 0 <= changes['priority'] <= 10000:
+                raise HTTPException(400, 'Priority must be an integer from 0 to 10000')
         if 'access_grants' in changes:
             if connection['scope'] != 'shared':
                 raise HTTPException(400, 'Personal connections cannot be shared')
             grants = await validate_grants(db, changes['access_grants'])
             await AccessGrants.replace_access_grants(db, RESOURCE_TYPE, row.id, grants)
-        for key in ('name', 'enabled'):
+        for key in ('name', 'enabled', 'priority'):
             if key in changes:
                 connection[key] = changes[key]
         _save(row, token)
@@ -391,7 +400,8 @@ def _model(row, token, catalog_model):
     return {
         'id': f'subscription:{row.id}:{raw_id}', 'name': f'{_metadata(token)["name"]} · {catalog_model["name"]}',
         'object': 'model', 'created': row.created_at, 'owned_by': 'subscription', 'connection_type': 'external',
-        'subscription': {'connection_id': row.id, 'provider': row.provider.split(':', 1)[1], 'model': raw_id},
+        'subscription': {'connection_id': row.id, 'provider': row.provider.split(':', 1)[1], 'model': raw_id,
+                         'scope': _metadata(token)['scope'], 'priority': _metadata(token).get('priority', 100)},
         'info': {'meta': {'capabilities': {**catalog_model.get('capabilities', {}), 'builtin_tools': True}}},
     }
 
@@ -406,18 +416,24 @@ async def get_subscription_models(user):
             connection = _metadata(token)
             if connection.get('enabled', True) and not connection.get('reauth_required') and await _can_use(db, row, token, user, groups):
                 models.extend(_model(row, token, item) for item in connection.get('models', []))
-        return models
+        return sorted(models, key=lambda model: (
+            model['subscription']['priority'], model['created'], model['subscription']['connection_id'], model['subscription']['model']
+        ))
+
+
+def _catalog_model(token, raw_id):
+    if _metadata(token).get('reauth_required'):
+        raise HTTPException(401, 'Subscription requires reconnection')
+    item = next((item for item in _metadata(token).get('models', []) if item['id'] == raw_id), None)
+    if item is None:
+        raise HTTPException(404, 'Subscription model not found; refresh models in Connections')
+    return item
 
 
 async def resolve_subscription_model(user, model_id):
     connection_id, raw_id = parse_model_id(model_id)
     async with _locked_connection(connection_id, user) as (db, row, token):
-        if _metadata(token).get('reauth_required'):
-            raise HTTPException(401, 'Subscription requires reconnection')
-        item = next((item for item in _metadata(token).get('models', []) if item['id'] == raw_id), None)
-        if item is None:
-            raise HTTPException(404, 'Subscription model not found; refresh models in Connections')
-        return _model(row, token, item)
+        return _model(row, token, _catalog_model(token, raw_id))
 
 
 async def _check_preset_access(user, model_id, infos):
@@ -438,7 +454,7 @@ async def _check_preset_access(user, model_id, infos):
         model_id = info.base_model_id
 
 
-async def assert_model_access(user, model_id, infos=None):
+async def assert_model_access(user, model_id, infos=None, *, models=None, prefer_personal=False):
     if infos is None:
         infos = {}
         current = model_id
@@ -452,7 +468,22 @@ async def assert_model_access(user, model_id, infos=None):
     if base_id is None:
         return None
     await _check_preset_access(user, model_id, infos)
-    return await resolve_subscription_model(user, base_id)
+    # The configured base must remain usable even when a personal match exists.
+    durable = models is None
+    base = await resolve_subscription_model(user, base_id) if durable else models.get(base_id)
+    if base is None:
+        raise HTTPException(404, 'Subscription model not found')
+    if is_subscription_model(model_id) or not prefer_personal:
+        return base  # Authorization-only callers need no full personal catalog.
+    if models is None:
+        models = {model['id']: model for model in await get_subscription_models(user)}
+    subscription = base['subscription']
+    preferred = next((model for model in models.values()
+                      if model['subscription']['scope'] == 'personal'
+                      and model['subscription']['provider'] == subscription['provider']
+                      and model['subscription']['model'] == subscription['model']), base)
+    # A candidate may have changed since discovery; fail closed, never choose another.
+    return await resolve_subscription_model(user, preferred['id']) if durable and preferred['id'] != base_id else preferred
 
 
 async def get_model_overlay(request, user):
@@ -461,18 +492,18 @@ async def get_model_overlay(request, user):
     from open_webui.utils.models import public_model_params
 
     models = dict(request.app.state.MODELS.items())
-    models.update((model['id'], model) for model in await get_subscription_models(user))
+    subscription_models = {model['id']: model for model in await get_subscription_models(user)}
+    models.update(subscription_models)
     infos = {info.id: info for info in await Models.get_all_models()}
     for model_id, info in infos.items():
         base_id = subscription_base_id(model_id, infos)
         if not base_id:
             continue
-        base = models.get(base_id)
         models.pop(model_id, None)
-        if not info.is_active or base is None:
+        if not info.is_active:
             continue
         try:
-            await _check_preset_access(user, model_id, infos)
+            base = await assert_model_access(user, model_id, infos, models=subscription_models, prefer_personal=True)
         except HTTPException:
             continue
         value = copy.deepcopy(base)
@@ -499,11 +530,10 @@ async def generate_chat_completion(request, form_data, user, model, *, bypass_sy
     payload = copy.deepcopy({key: value for key, value in form_data.items() if key != 'metadata'})
     infos = {info.id: info for info in await Models.get_all_models()}
     selected = payload['model']
-    base_id = subscription_base_id(selected, infos)
-    if base_id is None:
-        raise HTTPException(404, 'Subscription model not found')
     # Every dispatch rechecks durable ownership, grants, enabled state, and catalog membership.
-    resolved = await assert_model_access(user, selected, infos)
+    resolved = await assert_model_access(user, selected, infos, prefer_personal=True)
+    if resolved is None:
+        raise HTTPException(404, 'Subscription model not found')
     info = infos.get(selected)
     if info:
         params = info.params.model_dump()
@@ -511,13 +541,14 @@ async def generate_chat_completion(request, form_data, user, model, *, bypass_sy
         payload = apply_model_params_to_body_openai(params, payload)
         if not bypass_system_prompt:
             payload = await apply_system_prompt_to_body(system, payload, metadata, user)
-    connection_id, raw_id = parse_model_id(base_id)
-    _, token = await _connection_token(connection_id, user)
+    subscription = resolved['subscription']
+    connection_id, raw_id = subscription['connection_id'], subscription['model']
+    provider, token = await _connection_token(connection_id, user, raw_id=raw_id)
     payload['model'] = raw_id
     payload.pop('model_item', None)
     payload.pop('params', None)
     session_id = str(metadata.get('chat_id') or metadata.get('session_id') or request.headers.get('x-request-id') or uuid.uuid4())
-    module = get_provider(resolved['subscription']['provider'])
+    module = get_provider(provider)
     try:
         return await module.generate_chat_completion(payload, token, session_id)
     except HTTPException as exc:

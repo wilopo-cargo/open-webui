@@ -40,9 +40,10 @@ class UpdateForm(BaseModel):
     model_config = ConfigDict(extra='forbid')
     name: str | None = Field(default=None, min_length=1, max_length=200)
     enabled: bool | None = None
+    priority: int | None = Field(default=None, strict=True, ge=0, le=10000)
     access_grants: list[Grant] | None = Field(default=None, max_length=1000)
 
-    @field_validator('name', 'enabled', 'access_grants')
+    @field_validator('name', 'enabled', 'priority', 'access_grants')
     @classmethod
     def reject_null(cls, value):
         if value is None:

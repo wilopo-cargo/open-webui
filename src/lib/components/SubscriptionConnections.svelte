@@ -37,6 +37,7 @@
 	let grantConnection: SubscriptionConnection | null = null;
 	let grantDraft: SubscriptionGrant[] = [];
 	let showConnectionModal = false;
+	let priorityDrafts: Record<string, string> = {};
 	$: visibleConnections = admin
 		? connections.filter((connection) => connection.scope === 'shared' && connection.can_manage)
 		: connections;
@@ -145,6 +146,37 @@
 		});
 	};
 
+	const savePriority = async (connection: SubscriptionConnection, input: HTMLInputElement) => {
+		const authoritative = String(connection.priority ?? 100);
+		if (!input.reportValidity()) {
+			priorityDrafts = { ...priorityDrafts, [connection.id]: authoritative };
+			input.value = authoritative;
+			return;
+		}
+		const priority = Number(input.value);
+		if (priority === (connection.priority ?? 100)) {
+			const { [connection.id]: _, ...drafts } = priorityDrafts;
+			priorityDrafts = drafts;
+			return;
+		}
+		let updated = false;
+		await run(`priority:${connection.id}`, async () => {
+			const updatedConnection = await updateSubscriptionConnection(localStorage.token, connection.id, { priority });
+			updated = true;
+			priorityDrafts = {
+				...priorityDrafts,
+				[connection.id]: String(updatedConnection.priority ?? priority)
+			};
+			await refreshList();
+			const { [connection.id]: _, ...drafts } = priorityDrafts;
+			priorityDrafts = drafts;
+			await refreshModels();
+		});
+		if (!updated) {
+			priorityDrafts = { ...priorityDrafts, [connection.id]: authoritative };
+			input.value = authoritative;
+		}
+	};
 	const refreshCatalog = async (connection: SubscriptionConnection) => {
 		await run(`models:${connection.id}`, async () => {
 			await refreshSubscriptionModels(localStorage.token, connection.id);
@@ -225,7 +257,9 @@
 	</div>
 
 	{#if !admin}
-		<p class="mb-3 text-xs text-gray-500 dark:text-gray-400">{$i18n.t('Connect your personal provider account.')}</p>
+		<p class="mb-3 text-xs text-gray-500 dark:text-gray-400">
+			{$i18n.t('For presets, lower numbers prefer your personal accounts with the same provider and model. If none match, use the preset’s configured connection. Requests never switch accounts after a failure.')}
+		</p>
 	{:else}
 		<p class="mb-3 text-xs text-gray-500 dark:text-gray-400">{$i18n.t('Create a shared connection that can be granted to selected users or groups.')}</p>
 	{/if}
@@ -255,6 +289,24 @@
 								<label class="flex items-center gap-1.5 text-[0.6875rem] text-gray-600 dark:text-gray-300">
 									<input type="checkbox" checked={connection.enabled} disabled={busy !== ''} on:change={(event) => toggleEnabled(connection, (event.currentTarget as HTMLInputElement).checked)} /> {$i18n.t('Enabled')}
 								</label>
+								{#if connection.scope === 'personal'}
+									<label class="flex items-center gap-1.5 text-[0.6875rem] text-gray-600 dark:text-gray-300">
+										<span>{$i18n.t('Priority')}</span>
+										<input
+											type="number"
+											min="0"
+											max="10000"
+											step="1"
+											required
+											value={priorityDrafts[connection.id] ?? String(connection.priority ?? 100)}
+											aria-label={$i18n.t('Priority for {{name}}', { name: connection.name })}
+											class="w-20 rounded-md border border-gray-200 bg-transparent px-2 py-1 text-xs dark:border-white/10"
+											disabled={busy !== ''}
+											on:input={(event) => (priorityDrafts = { ...priorityDrafts, [connection.id]: (event.currentTarget as HTMLInputElement).value })}
+											on:change={(event) => savePriority(connection, event.currentTarget as HTMLInputElement)}
+										/>
+									</label>
+								{/if}
 								<button type="button" class="text-[0.6875rem] text-gray-600 underline disabled:opacity-50 dark:text-gray-300" disabled={busy !== ''} on:click={() => { const value = window.prompt('Rename connection', connection.name); if (value?.trim()) updateName(connection, value.trim()); }}>{$i18n.t('Rename')}</button>
 								<button type="button" class="text-[0.6875rem] text-gray-600 underline disabled:opacity-50 dark:text-gray-300" disabled={busy !== ''} on:click={() => refreshCatalog(connection)}>{busy === `models:${connection.id}` ? $i18n.t('Refreshing…') : $i18n.t('Refresh models')}</button>
 								{#if connection.scope === 'shared'}<button type="button" class="text-[0.6875rem] text-gray-600 underline dark:text-gray-300" on:click={() => openGrants(connection)}>{$i18n.t('Access')}</button>{/if}

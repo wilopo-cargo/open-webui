@@ -85,6 +85,17 @@ Use the card to rename, enable/disable, refresh the catalog, or disconnect. Reau
 
 Existing browser-direct API connections keep their separate **+** button, URL/key dialog and connection controls. Their availability still depends on the administrator's **Direct Connections** setting; subscription connections do not replace or enable them.
 
+### Personal connection priority
+
+You can connect multiple personal accounts. Set **Priority** on each personal connection card: lower numbers are preferred, from `0` through `10000`; new and existing connections default to `100`. Equal priorities use the oldest connection first, then the connection ID for a stable tie-break.
+
+For a saved subscription-backed preset such as Leaders, WebUI first checks access to the preset and its configured base connection. It then prefers your highest-priority enabled personal connection whose catalog contains the **same provider and exact provider model ID**. Connections requiring reauthorization are excluded. If none match, the preset uses its configured connection. The preset's saved base, instructions, knowledge, tools and permissions remain unchanged; an administrator does not need to make a separate preset for each user.
+
+This applies only to subscription-backed presets. Directly selecting a connection-specific model pins that connection. Ordinary API-backed models do not automatically map to a subscription by name. Shared connections have no editable personal priority, and this setting grants no new access to a preset or its configured base.
+
+Selection happens before inference and is rechecked at dispatch. An authentication, refresh, quota or inference failure is returned to the caller; WebUI does not try another account or spend shared quota after a personal request fails. Existing transient retries remain on the selected connection.
+
+
 ### Admin-managed sharing
 
 Open **Admin Settings → Connections** and click **+** beside **Codex and Claude subscriptions**. Choose the provider, enter a name and authorize the shared subscription connection. It starts owner-only. Use **Access** to grant read access to specific users or groups; public/wildcard grants and credential-management grants are rejected. A model/preset grant alone does not grant use of its underlying subscription connection. Removing a connection grant blocks subsequent requests even if a client retains the old model ID.

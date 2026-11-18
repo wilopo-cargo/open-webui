@@ -12,6 +12,7 @@ export type SubscriptionConnection = {
 	name: string;
 	scope: 'personal' | 'shared';
 	enabled: boolean;
+	priority: number;
 	status: 'connected' | 'reauth_required';
 	expires_at: number | null;
 	models: { id: string; name: string }[];
@@ -97,7 +98,7 @@ export const completeSubscriptionConnection = (token: string, state: string, cal
 export const updateSubscriptionConnection = (
 	token: string,
 	id: string,
-	body: { name?: string; enabled?: boolean; access_grants?: SubscriptionGrant[] }
+	body: { name?: string; enabled?: boolean; priority?: number; access_grants?: SubscriptionGrant[] }
 ) => request<SubscriptionConnection>(token, `/${encodeURIComponent(id)}`, 'PATCH', body);
 
 export const refreshSubscriptionModels = (token: string, id: string) =>
