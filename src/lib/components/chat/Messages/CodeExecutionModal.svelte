@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { getContext } from 'svelte';
 	import { safeLinkUrl } from '$lib/utils';
+	import { WEBUI_API_BASE_URL } from '$lib/constants';
 	import CodeBlock from './CodeBlock.svelte';
 	import Modal from '$lib/components/common/Modal.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
@@ -10,6 +11,21 @@
 
 	export let show = false;
 	export let codeExecution = null;
+
+	function generatedDownloadName(file: { id?: string; url?: string; name?: string }) {
+		if (!file.id || !file.url || typeof file.name !== 'string') return undefined;
+		try {
+			const url = new URL(file.url, window.location.origin);
+			if (url.origin === window.location.origin &&
+				url.pathname === `${WEBUI_API_BASE_URL}/files/${encodeURIComponent(file.id)}/content` &&
+				url.searchParams.get('attachment') === 'true') {
+				return file.name.split('/').pop() ?? '';
+			}
+		} catch {
+			// Unknown/external file links keep their existing navigation behavior.
+		}
+		return undefined;
+	}
 </script>
 
 <Modal ariaLabel={codeExecution?.name ?? $i18n.t('Code execution')} size="lg" bind:show>
@@ -98,8 +114,9 @@
 						</div>
 						<ul class="mt-1 list-disc pl-4 text-xs">
 							{#each codeExecution?.result?.files as file}
+								{@const downloadName = generatedDownloadName(file)}
 								<li>
-									<a href={safeLinkUrl(file.url)} target="_blank">{file.name}</a>
+									<a href={safeLinkUrl(file.url)} download={downloadName} target={downloadName === undefined ? '_blank' : undefined}>{file.name}</a>
 								</li>
 							{/each}
 						</ul>

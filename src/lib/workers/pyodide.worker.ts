@@ -1,4 +1,10 @@
 import { loadPyodide, type PyodideInterface } from 'pyodide';
+import {
+	createGeneratedFileTracker,
+	GENERATED_FILE_LIMITS,
+	isSafeGeneratedFileName,
+	type GeneratedFileTracker
+} from '$lib/pyodide/generatedFiles';
 
 declare global {
 	interface Window {
@@ -16,6 +22,7 @@ declare global {
 // Pyodide bootstrap
 
 let pyodideReady: Promise<void> | null = null;
+let generatedFiles: GeneratedFileTracker;
 
 async function loadPyodideAndPackages(packages: string[] = []) {
 	self.stdout = null;
@@ -66,6 +73,7 @@ async function loadPyodideAndPackages(packages: string[] = []) {
 	} catch {
 		self.pyodide.FS.mkdirTree(uploadDir);
 	}
+	generatedFiles = createGeneratedFileTracker(self.pyodide.FS, GENERATED_FILE_LIMITS, isSafeGeneratedFileName);
 
 	const micropip = self.pyodide.pyimport('micropip');
 	await micropip.install(packages);
@@ -89,16 +97,15 @@ async function ensurePyodide(packages: string[] = []) {
 }
 
 /**
- * Persist the in-memory FS to IndexedDB (fire-and-forget with logging).
+ * Persist the in-memory FS before handling another filesystem request.
  */
-function persistFS() {
+async function persistFS() {
 	if (!self.pyodide) return;
-	(self.pyodide.FS as any).syncfs(false, (err: Error | null) => {
-		if (err) {
-			console.error('Error syncing to IndexedDB:', err);
-		} else {
-			console.log('Successfully synced to IndexedDB.');
-		}
+	await new Promise<void>((resolve) => {
+		self.pyodide.FS.syncfs(false, (err: Error | null) => {
+			if (err) console.error('Error syncing to IndexedDB:', err);
+			resolve();
+		});
 	});
 }
 
@@ -110,7 +117,6 @@ function fsUploadFiles(files: { name: string; data: ArrayBuffer }[], dir = '/mnt
 	} catch {
 		self.pyodide.FS.mkdirTree(dir);
 	}
-
 	for (const file of files) {
 		self.pyodide.FS.writeFile(`${dir}/${file.name}`, new Uint8Array(file.data));
 	}
@@ -177,13 +183,17 @@ async function executeCode(
 	self.stderr = null;
 	self.result = null;
 
-	// Upload any accompanying files before execution
-	if (files && files.length > 0) {
-		fsUploadFiles(files);
-		persistFS();
-	}
+	const fileErrors: string[] = [];
+	let before: Map<string, string> | null = null;
 
 	try {
+		generatedFiles.stage(files ?? []);
+		try {
+			// Snapshot after staging inputs so unchanged attachments are not exported.
+			before = await generatedFiles.snapshot();
+		} catch (error) {
+			fileErrors.push(`Generated file export unavailable: ${error instanceof Error ? error.message : String(error)}`);
+		}
 		// Install the plotting hook when the source mentions matplotlib and the package is loaded.
 		if (code.includes('matplotlib') && 'matplotlib' in self.pyodide.loadedPackages) {
 			// Override plt.show() to print a PNG data URL to stdout and clear the current figure.
@@ -220,23 +230,35 @@ matplotlib.pyplot.show = show`);
 
 		console.log('Python result:', self.result);
 
-		// Persist any files the code may have written
-		persistFS();
 	} catch (error: unknown) {
 		self.stderr = error instanceof Error ? error.message : String(error);
 	}
 
-	self.postMessage({ id, result: self.result, stdout: self.stdout, stderr: self.stderr });
+	const exported = before ? await generatedFiles.collect(before) : { files: [], errors: [] };
+	await persistFS();
+	self.postMessage(
+		{ id, result: self.result, stdout: self.stdout, stderr: self.stderr, files: exported.files, file_errors: [...fileErrors, ...exported.errors] },
+		{ transfer: exported.files.map((file) => file.data) }
+	);
 }
 
 // Message handler
 
-self.onmessage = async (event) => {
+// ponytail: serialize this one runtime; use separate workers if parallel Python execution is needed.
+let messageQueue = Promise.resolve();
+self.onmessage = (event) => {
+	messageQueue = messageQueue.then(() => handleMessage(event)).catch((error: unknown) => {
+		self.postMessage({ id: event.data.id, stderr: error instanceof Error ? error.message : String(error) });
+	});
+};
+
+async function handleMessage(event: MessageEvent) {
 	const data = event.data;
 	const { id, type } = data;
 
 	// Backward compatibility: messages without a `type` field are execute requests
 	if (!type || type === 'execute') {
+		self.postMessage({ id, type: 'execution:start' });
 		const { code, files, ...context } = data;
 
 		// Copy context keys (packages, etc.) into worker scope
@@ -258,7 +280,7 @@ self.onmessage = async (event) => {
 		case 'fs:upload': {
 			const { files, dir } = data;
 			fsUploadFiles(files, dir);
-			persistFS();
+			await persistFS();
 			self.postMessage({ id, type: 'fs:upload', success: true });
 			break;
 		}
@@ -285,25 +307,26 @@ self.onmessage = async (event) => {
 
 		case 'fs:delete': {
 			fsDelete(data.path);
-			persistFS();
+			await persistFS();
 			self.postMessage({ id, type: 'fs:delete', success: true });
 			break;
 		}
 
 		case 'fs:mkdir': {
 			fsMkdir(data.path);
-			persistFS();
+			await persistFS();
 			self.postMessage({ id, type: 'fs:mkdir', success: true });
 			break;
 		}
 
 		case 'fs:sync': {
 			// Re-read from IndexedDB into memory to pick up externally written files
-			(self.pyodide.FS as any).syncfs(true, (err: Error | null) => {
-				if (err) {
-					console.error('Error syncing from IndexedDB:', err);
-				}
-				self.postMessage({ id, type: 'fs:sync', success: !err });
+			await new Promise<void>((resolve) => {
+				self.pyodide.FS.syncfs(true, (err: Error | null) => {
+					if (err) console.error('Error syncing from IndexedDB:', err);
+					self.postMessage({ id, type: 'fs:sync', success: !err });
+					resolve();
+				});
 			});
 			break;
 		}
@@ -311,7 +334,7 @@ self.onmessage = async (event) => {
 		default:
 			console.warn('Unknown message type:', type);
 	}
-};
+}
 
 // Helpers
 

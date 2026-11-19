@@ -8,13 +8,16 @@
 	import { config, pyodideWorker as pyodideWorkerStore, visibleControls } from '$lib/stores';
 
 	import { createPyodideWorker } from '$lib/pyodide/createPyodideWorker';
+	import { uploadGeneratedFiles } from '$lib/pyodide/uploadGeneratedFiles';
+	import { executePyodide, terminatePyodideWorker } from '$lib/pyodide/executePyodide';
 	import { executeCode } from '$lib/apis/utils';
 	import {
 		copyToClipboard,
 		initMermaid,
 		renderMermaidDiagram,
 		renderVegaVisualization,
-		unescapeHtml
+		unescapeHtml,
+		safeLinkUrl
 	} from '$lib/utils';
 
 	import 'highlight.js/styles/github-dark.min.css';
@@ -83,10 +86,10 @@
 	$: if (markdown?.document && !edit && !isDiff) void highlightDocument(code, lang);
 	let executing = false;
 
-	let stdout = null;
-	let stderr = null;
-	let result = null;
-	let files = null;
+	let stdout: string | null = null;
+	let stderr: string | null = null;
+	let result: unknown = null;
+	let files: { type?: string; data?: string; url?: string; name?: string }[] | null = null;
 
 	let copied = false;
 	let saved = false;
@@ -169,7 +172,7 @@
 			});
 
 			if (output) {
-				if (output['stdout']) {
+				if (typeof output['stdout'] === 'string') {
 					stdout = output['stdout'];
 					const stdoutLines = stdout.split('\n');
 
@@ -198,9 +201,10 @@
 					}
 				}
 
-				if (output['result']) {
-					result = output['result'];
-					const resultLines = result.split('\n');
+				let resultText = output['result'];
+				result = resultText ?? null;
+				if (typeof resultText === 'string') {
+					const resultLines = resultText.split('\n');
 
 					for (const [idx, line] of resultLines.entries()) {
 						if (line.startsWith('data:image/png;base64')) {
@@ -218,13 +222,14 @@
 								];
 							}
 
-							if (result.includes(`${line}\n`)) {
-								result = result.replace(`${line}\n`, ``);
-							} else if (result.includes(`${line}`)) {
-								result = result.replace(`${line}`, ``);
+							if (resultText.includes(`${line}\n`)) {
+								resultText = resultText.replace(`${line}\n`, ``);
+							} else if (resultText.includes(`${line}`)) {
+								resultText = resultText.replace(`${line}`, ``);
 							}
 						}
 					}
+					result = resultText;
 				}
 
 				output['stderr'] && (stderr = output['stderr']);
@@ -237,6 +242,8 @@
 	};
 
 	const executePythonAsWorker = async (code) => {
+		const token = localStorage.token;
+		const executionId = crypto.randomUUID();
 		let packages = [
 			/\bimport\s+requests\b|\bfrom\s+requests\b/.test(code) ? 'requests' : null,
 			/\bimport\s+bs4\b|\bfrom\s+bs4\b/.test(code) ? 'beautifulsoup4' : null,
@@ -270,109 +277,80 @@
 			localPyodideWorker = worker;
 		}
 
-		worker.postMessage({
-			id: id,
-			code: code,
-			packages: packages
-		});
+		const execution = await executePyodide(worker, { id: executionId, code, packages });
+		if (execution.workerTerminated) {
+			if ($pyodideWorkerStore === worker) pyodideWorkerStore.set(null);
+			if (localPyodideWorker === worker) localPyodideWorker = null;
+		}
+		const data = await uploadGeneratedFiles(execution, token, $config?.file?.max_size);
+		result = data.result;
 
-		const timeoutId = setTimeout(() => {
-			if (executing) {
-				executing = false;
-				stderr = 'Execution Time Limit Exceeded';
-				if (!isShared) {
-					worker.terminate();
-					localPyodideWorker = null;
-				}
-			}
-		}, 60000);
+		if (data['stdout']) {
+			stdout = data['stdout'];
+			const stdoutLines = stdout.split('\n');
 
-		const handler = (event) => {
-			// Ignore messages from other requests on the shared worker
-			if (event.data?.id !== id) return;
-
-			console.log('pyodideWorker.onmessage', event);
-			const { id: _id, ...data } = event.data;
-
-			console.log(_id, data);
-
-			if (data['stdout']) {
-				stdout = data['stdout'];
-				const stdoutLines = stdout.split('\n');
-
-				for (const [idx, line] of stdoutLines.entries()) {
-					if (line.startsWith('data:image/png;base64')) {
-						if (files) {
-							files.push({
+			for (const [idx, line] of stdoutLines.entries()) {
+				if (line.startsWith('data:image/png;base64')) {
+					if (files) {
+						files.push({
+							type: 'image/png',
+							data: line
+						});
+					} else {
+						files = [
+							{
 								type: 'image/png',
 								data: line
-							});
-						} else {
-							files = [
-								{
-									type: 'image/png',
-									data: line
-								}
-							];
-						}
+							}
+						];
+					}
 
-						if (stdout.includes(`${line}\n`)) {
-							stdout = stdout.replace(`${line}\n`, ``);
-						} else if (stdout.includes(`${line}`)) {
-							stdout = stdout.replace(`${line}`, ``);
-						}
+					if (stdout.includes(`${line}\n`)) {
+						stdout = stdout.replace(`${line}\n`, ``);
+					} else if (stdout.includes(`${line}`)) {
+						stdout = stdout.replace(`${line}`, ``);
 					}
 				}
 			}
+		}
 
-			if (typeof data['result'] === 'string') {
-				result = data['result'];
-				const resultLines = result.split('\n');
+		if (typeof data.result === 'string') {
+			let resultText: string = data.result;
+			const resultLines = resultText.split('\n');
 
-				for (const [idx, line] of resultLines.entries()) {
-					if (line.startsWith('data:image/png;base64')) {
-						if (files) {
-							files.push({
+			for (const [idx, line] of resultLines.entries()) {
+				if (line.startsWith('data:image/png;base64')) {
+					if (files) {
+						files.push({
+							type: 'image/png',
+							data: line
+						});
+					} else {
+						files = [
+							{
 								type: 'image/png',
 								data: line
-							});
-						} else {
-							files = [
-								{
-									type: 'image/png',
-									data: line
-								}
-							];
-						}
+							}
+						];
+					}
 
-						if (result.startsWith(`${line}\n`)) {
-							result = result.replace(`${line}\n`, ``);
-						} else if (result.startsWith(`${line}`)) {
-							result = result.replace(`${line}`, ``);
-						}
+					if (resultText.startsWith(`${line}\n`)) {
+						resultText = resultText.replace(`${line}\n`, ``);
+					} else if (resultText.startsWith(`${line}`)) {
+						resultText = resultText.replace(`${line}`, ``);
 					}
 				}
 			}
+			result = resultText;
+		}
 
-			data['stderr'] && (stderr = data['stderr']);
-			data['result'] && (result = data['result']);
+		data['stderr'] && (stderr = data['stderr']);
+		const outputFiles = [...(files ?? []), ...data.files];
+		files = outputFiles.length ? outputFiles : null;
+		executing = false;
 
-			clearTimeout(timeoutId);
-			worker.removeEventListener('message', handler);
-			executing = false;
-
-			// Signal PyodideFileNav to auto-refresh after execution
-			window.dispatchEvent(new Event('pyodide:files'));
-		};
-
-		worker.addEventListener('message', handler);
-
-		worker.onerror = (event) => {
-			console.log('pyodideWorker.onerror', event);
-			clearTimeout(timeoutId);
-			worker.removeEventListener('message', handler);
-			executing = false;
-		};
+		// Signal PyodideFileNav to auto-refresh after execution, but never revive a stopped runtime.
+		if (!execution.workerTerminated) window.dispatchEvent(new Event('pyodide:files'));
 	};
 
 	let mermaid = null;
@@ -436,6 +414,7 @@
 				stdout = output.stdout;
 				stderr = output.stderr;
 				result = output.result;
+				files = Array.isArray(output.files) && output.files.length ? output.files : null;
 			} catch (error) {
 				console.error('Error:', error);
 			}
@@ -451,7 +430,7 @@
 	onDestroy(() => {
 		highlightGeneration++;
 		if (localPyodideWorker) {
-			localPyodideWorker.terminate();
+			terminatePyodideWorker(localPyodideWorker);
 			localPyodideWorker = null;
 		}
 	});
@@ -574,7 +553,7 @@
 			<div
 				class="language-{lang} rounded-t-2xl -mt-8 {editorClassName
 					? editorClassName
-					: executing || stdout || stderr || result
+					: executing || stdout || stderr || result || files?.length
 						? ''
 						: 'rounded-b-2xl'} overflow-hidden"
 			>
@@ -611,7 +590,8 @@
 							style="border-top-left-radius: 0px; border-top-right-radius: 0px; {(executing ||
 								stdout ||
 								stderr ||
-								result) &&
+								result ||
+								files?.length) &&
 								'border-bottom-left-radius: 0px; border-bottom-right-radius: 0px;'}"><code
 								class="language-{lang} rounded-t-none whitespace-pre text-sm"
 								>{#if lang && hljs.getLanguage(lang)}{@html hljs.highlight(code, {
@@ -670,7 +650,9 @@
 									{#if files}
 										<div class="flex flex-col gap-2">
 											{#each files as file}
-												{#if file.type.startsWith('image')}
+												{#if file.url}
+													<a href={safeLinkUrl(file.url)} download={file.name?.split('/').pop() ?? ''}>{$i18n.t('Download')} {file.name}</a>
+												{:else if file.type?.startsWith('image')}
 													<img src={file.data} alt="Output" class=" w-full max-w-[36rem]" />
 												{/if}
 											{/each}

@@ -473,7 +473,8 @@ CODE_INTERPRETER_PYODIDE_PROMPT = """
 ##### Persistent File System
 
 - User-uploaded files are available at `/mnt/uploads/`. When the user asks you to work with their files, read from this directory.
-- You can also write output files to `/mnt/uploads/` so the user can access and download them from the file browser.
+- Write output files to `/mnt/uploads/`. New or changed regular files are published as authenticated downloads (at most 10 files and 20 MiB total per execution, subject to the configured upload size limit).
+- Use the returned `files[].url` download links exactly in your response. `/mnt/uploads/...` and `sandbox:` links are not web download URLs. Check `stderr` and `file_errors` before claiming a download exists.
 - The file system persists across code executions within the same session.
 - Use `import os; os.listdir('/mnt/uploads')` to discover available files."""
 

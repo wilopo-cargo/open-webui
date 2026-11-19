@@ -44,6 +44,7 @@ _TEST_ENV = {
     'CUSTOM_NAME': '',
     'USE_SLIM_DOCKER': 'true',
     'VECTOR_DB': 'chroma',
+    'STORAGE_PROVIDER': 'local',
     'CHROMA_HTTP_HOST': '',
     'WEBSOCKET_MANAGER': '',
     'REDIS_URL': '',
@@ -4400,3 +4401,159 @@ async def test_stream_error_or_disabled_tool_choice_never_executes_mcp_tool(app_
             assert any(item.get('type') == 'function_call_output' and item.get('status') == 'completed' for item in output)
     finally:
         await middleware.disconnect_mcp_clients(metadata.get('mcp_clients', {}))
+
+
+@pytest_asyncio.fixture
+async def generated_file_client(app_modules, monkeypatch, tmp_path):
+    from fastapi import FastAPI, HTTPException, Request
+    from open_webui.routers import files
+    from open_webui.storage import provider
+
+    records = {}
+
+    async def insert_file(user_id, form, db=None):
+        record = files.FileModel(user_id=user_id, created_at=0, updated_at=0, **form.model_dump())
+        records[record.id] = record
+        return record
+
+    async def get_file(file_id, db=None):
+        return records.get(file_id)
+
+    async def config_get(key, default=None):
+        return {'rag.file.max_size': 1, 'rag.file.allowed_extensions': ['pdf']}.get(key, default)
+
+    async def publish(*args, **kwargs):
+        pass
+
+    async def shared_read(file_id, permission, user, db=None):
+        return file_id in records and permission == 'read' and user.id == 'shared-reader'
+
+    def verified_user(request: Request):
+        token = request.headers.get('authorization', '').removeprefix('Bearer ')
+        if token not in ('alice', 'bob', 'shared-reader'):
+            raise HTTPException(401, 'Not authenticated')
+        return _user(token)
+
+    async def no_db():
+        return None
+
+    monkeypatch.setattr(files.Files, 'insert_new_file', insert_file)
+    monkeypatch.setattr(files.Files, 'get_file_by_id', get_file)
+    monkeypatch.setattr(files.Config, 'get', staticmethod(config_get))
+    monkeypatch.setattr(files, 'publish_event', publish)
+    monkeypatch.setattr(files, 'has_access_to_file', shared_read)
+    monkeypatch.setattr(provider, 'UPLOAD_DIR', tmp_path)
+    monkeypatch.setattr(files, 'Storage', provider.LocalStorageProvider())
+    app = FastAPI()
+    app.include_router(files.router, prefix='/api/v1/files')
+    app.dependency_overrides[files.get_verified_user] = verified_user
+    app.dependency_overrides[files.get_async_session] = no_db
+    async with _HTTPX_ASYNC_CLIENT(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        yield SimpleNamespace(client=client, records=records, directory=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ('filename', 'content'),
+    [('report.csv', b'name,total\nAlice,42\n'), ('binary.bin', b'\x00\xff\x80\n'), ('empty.txt', b'')],
+)
+@pytest.mark.asyncio
+async def test_generated_file_download_uses_owned_storage_and_existing_access_control(generated_file_client, filename, content):
+    fixture = generated_file_client
+    uploaded = await fixture.client.post(
+        '/api/v1/files/?process=false',
+        headers={'authorization': 'Bearer alice'},
+        files={'file': (filename, content, 'application/octet-stream')},
+    )
+    assert uploaded.status_code == 200
+    data = uploaded.json()
+    record = fixture.records[data['id']]
+    assert record.user_id == 'alice'
+    assert record.meta['size'] == len(content)
+    assert record.data == {}  # No RAG processing is scheduled for generated files.
+    assert Path(record.path).read_bytes() == content
+
+    url = f'/api/v1/files/{record.id}/content?attachment=true'
+    download = await fixture.client.get(url, headers={'authorization': 'Bearer alice'})
+    assert download.status_code == 200
+    assert download.content == content
+    assert download.headers['content-disposition'] == f"attachment; filename*=UTF-8''{filename}"
+    assert (await fixture.client.get(url)).status_code == 401
+    assert (await fixture.client.get(url, headers={'authorization': 'Bearer bob'})).status_code == 404
+    shared = await fixture.client.get(url, headers={'authorization': 'Bearer shared-reader'})
+    assert shared.status_code == 200 and shared.content == content
+    Path(record.path).unlink()
+    assert (await fixture.client.get(url, headers={'authorization': 'Bearer alice'})).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_generated_file_upload_keeps_size_limits_and_processed_empty_rejection(generated_file_client):
+    fixture = generated_file_client
+    too_large = await fixture.client.post(
+        '/api/v1/files/?process=false',
+        headers={'authorization': 'Bearer alice'},
+        files={'file': ('large.bin', b'x' * (1024 * 1024 + 1), 'application/octet-stream')},
+    )
+    assert too_large.status_code == 413
+    empty_processed = await fixture.client.post(
+        '/api/v1/files/?process=true',
+        headers={'authorization': 'Bearer alice'},
+        files={'file': ('empty.pdf', b'', 'application/pdf')},
+    )
+    assert empty_processed.status_code == 400
+    assert fixture.records == {}
+    assert list(fixture.directory.iterdir()) == []
+
+
+@pytest.mark.parametrize('file_errors', [[], ['Could not publish failed.csv: upload unavailable']])
+@pytest.mark.asyncio
+async def test_execute_code_download_result_preserves_real_links_and_export_errors(app_modules, monkeypatch, file_errors):
+    from open_webui.tools import builtin
+
+    async def config_get(key, default=None):
+        return 'pyodide' if key == 'code_interpreter.engine' else default
+
+    files = [{'id': 'stored-output-id', 'name': 'nested/report.csv', 'url': 'https://webui.test/api/v1/files/stored-output-id/content?attachment=true'}]
+
+    async def event_call(event):
+        assert event['type'] == 'execute:python'
+        assert event['data']['session_id'] == 'alice-session'
+        assert event['data']['files'] == []
+        return {'stdout': 'done\n', 'stderr': '\n'.join(file_errors), 'result': 0, 'files': files, 'file_errors': file_errors}
+
+    monkeypatch.setattr(builtin.Config, 'get', staticmethod(config_get))
+    result = json.loads(await builtin.execute_code(
+        "print('done')",
+        __request__=SimpleNamespace(),
+        __event_call__=event_call,
+        __metadata__={'session_id': 'alice-session'},
+    ))
+    assert result == {
+        'status': 'error' if file_errors else 'success',
+        'stdout': 'done\n',
+        'stderr': '\n'.join(file_errors),
+        'result': 0,
+        'files': files,
+        'file_errors': file_errors,
+    }
+
+
+@pytest.mark.parametrize('raw', [False, True])
+def test_generated_file_legacy_continuation_and_replay_preserve_downloads_and_errors(app_modules, raw):
+    from open_webui.utils.misc import convert_output_to_messages
+
+    execution_output = {
+        'stdout': 'done\n',
+        'stderr': 'Generated file download: upload unavailable',
+        'result': 0,
+        'files': [{'id': 'stored-output-id', 'name': 'report.csv', 'url': 'https://webui.test/api/v1/files/stored-output-id/content?attachment=true'}],
+        'file_errors': ['upload unavailable'],
+    }
+    messages = convert_output_to_messages([{
+        'type': 'open_webui:code_interpreter',
+        'code': "print('done')",
+        'status': 'completed',
+        'output': execution_output,
+    }], raw=raw)
+    content = messages[0]['content']
+    result_text = content.split('<code_interpreter_output>\n', 1)[1].split('\n</code_interpreter_output>', 1)[0]
+    assert json.loads(result_text) == execution_output

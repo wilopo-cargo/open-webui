@@ -63,10 +63,23 @@
 		// Use the source URL: decoding marked's escaped text also changes literal entities.
 		const text = isBracketed ? token.raw.slice(1, -1) : token.raw;
 		const href = isBracketed ? token.href.replace(token.text, () => text) : token.href;
+		const safeHref = safeLinkUrl(href);
+		let generatedDownload = false;
+		if (safeHref && typeof window !== 'undefined') {
+			try {
+				const url = new URL(safeHref, window.location.origin);
+				generatedDownload = url.origin === window.location.origin &&
+					/^\/api\/v1\/files\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/content$/i.test(url.pathname) &&
+					url.search === '?attachment=true';
+			} catch {
+				// Other links keep their existing navigation behavior.
+			}
+		}
 		return {
 			isAutolink,
 			href,
-			safeHref: safeLinkUrl(href),
+			safeHref,
+			generatedDownload,
 			noteId: getNoteIdFromHref(href),
 			text: isAutolink ? text : token.text
 		};
@@ -113,7 +126,8 @@
 		{:else if token.tokens && !linkToken.isAutolink}
 			<a
 				href={linkToken.safeHref}
-				target="_blank"
+				download={linkToken.generatedDownload ? '' : undefined}
+				target={linkToken.generatedDownload ? undefined : '_blank'}
 				rel="nofollow"
 				title={token.title}
 				on:click={(e) => handleLinkClick(e, linkToken.href)}
@@ -123,7 +137,8 @@
 		{:else}
 			<a
 				href={linkToken.safeHref}
-				target="_blank"
+				download={linkToken.generatedDownload ? '' : undefined}
+				target={linkToken.generatedDownload ? undefined : '_blank'}
 				rel="nofollow"
 				title={token.title}
 				on:click={(e) => handleLinkClick(e, linkToken.href)}>{linkToken.text}</a
