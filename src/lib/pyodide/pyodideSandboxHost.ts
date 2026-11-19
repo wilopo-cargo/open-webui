@@ -1,3 +1,9 @@
+import {
+	createGeneratedFileTracker,
+	GENERATED_FILE_LIMITS,
+	isSafeGeneratedFileName
+} from './generatedFiles';
+
 type MessageListener = (event: MessageEvent) => void;
 type ErrorListener = (event: Event) => void;
 type QueuedMessage = { message: unknown; transfer: Transferable[] };
@@ -8,6 +14,7 @@ const sandboxScript = String.raw`
 	let pyodideReady = null;
 	let stdout = null;
 	let stderr = null;
+	let generatedFiles = null;
 
 	function post(message, transfer) {
 		parent.postMessage(message, '*', transfer || []);
@@ -27,6 +34,7 @@ const sandboxScript = String.raw`
 			packages: ['micropip']
 		});
 		pyodide.FS.mkdirTree('/mnt/uploads');
+		generatedFiles = (${createGeneratedFileTracker.toString()})(pyodide.FS, ${JSON.stringify(GENERATED_FILE_LIMITS)}, (${isSafeGeneratedFileName.toString()}));
 		await pyodide.pyimport('micropip').install(packages || []);
 	}
 
@@ -38,17 +46,13 @@ const sandboxScript = String.raw`
 		}
 	}
 
-	function ensureDir(dir) {
+	function upload(files, dir) {
+		dir = dir || '/mnt/uploads';
 		try {
 			pyodide.FS.stat(dir);
 		} catch {
 			pyodide.FS.mkdirTree(dir);
 		}
-	}
-
-	function upload(files, dir) {
-		dir = dir || '/mnt/uploads';
-		ensureDir(dir);
 		for (const file of files || []) {
 			pyodide.FS.writeFile(dir + '/' + file.name, new Uint8Array(file.data));
 		}
@@ -135,22 +139,32 @@ const sandboxScript = String.raw`
 		stdout = null;
 		stderr = null;
 		let result = null;
-		if (files && files.length > 0) upload(files);
+		let before = null;
+		const fileErrors = [];
 		try {
+			generatedFiles.stage(files || []);
+			try {
+				before = await generatedFiles.snapshot();
+			} catch (error) {
+				fileErrors.push('Generated file export unavailable: ' + (error && error.message ? error.message : String(error)));
+			}
 			if (code.includes('matplotlib') && 'matplotlib' in pyodide.loadedPackages) await patchMatplotlib();
 			result = clean(await pyodide.runPythonAsync(code));
 		} catch (error) {
 			stderr = error && error.message ? error.message : String(error);
 		}
-		post({ id: id, result: result, stdout: stdout, stderr: stderr });
+		const exported = before ? await generatedFiles.collect(before) : { files: [], errors: [] };
+		post(
+			{ id: id, result: result, stdout: stdout, stderr: stderr, files: exported.files, file_errors: fileErrors.concat(exported.errors) },
+			exported.files.map(function (file) { return file.data; })
+		);
 	}
 
-	window.addEventListener('message', async function (event) {
-		if (event.source !== parent) return;
-		const data = event.data || {};
+	async function handleMessage(data) {
 		const id = data.id;
 		try {
 			if (!data.type || data.type === 'execute') {
+				post({ id: id, type: 'execution:start' });
 				await ensureRuntime(data.packages || []);
 				await execute(id, data.code, data.files);
 				return;
@@ -187,6 +201,13 @@ const sandboxScript = String.raw`
 		} catch (error) {
 			post({ id: id, stderr: error && error.message ? error.message : String(error) });
 		}
+	}
+
+	let messageQueue = Promise.resolve();
+	window.addEventListener('message', function (event) {
+		if (event.source !== parent) return;
+		// Serialize runtime access, including filesystem mutations.
+		messageQueue = messageQueue.then(function () { return handleMessage(event.data || {}); });
 	});
 })();
 `;

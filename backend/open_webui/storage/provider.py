@@ -48,7 +48,9 @@ class StorageProvider(ABC):
         pass
 
     @abstractmethod
-    def upload_file(self, file: BinaryIO, filename: str, tags: Dict[str, str]) -> Tuple[bytes, str]:
+    def upload_file(
+        self, file: BinaryIO, filename: str, tags: Dict[str, str], *, allow_empty: bool = False
+    ) -> Tuple[bytes, str]:
         pass
 
     @abstractmethod
@@ -62,9 +64,11 @@ class StorageProvider(ABC):
 
 class LocalStorageProvider(StorageProvider):
     @staticmethod
-    def upload_file(file: BinaryIO, filename: str, tags: Dict[str, str]) -> Tuple[bytes, str]:
+    def upload_file(
+        file: BinaryIO, filename: str, tags: Dict[str, str], *, allow_empty: bool = False
+    ) -> Tuple[bytes, str]:
         contents = file.read()
-        if not contents:
+        if not contents and not allow_empty:
             raise ValueError(ERROR_MESSAGES.EMPTY_CONTENT)
         file_path = os.path.join(UPLOAD_DIR, filename)
         with open(file_path, 'wb') as f:
@@ -143,9 +147,11 @@ class S3StorageProvider(StorageProvider):
         """Only include S3 allowed characters."""
         return re.sub(r'[^a-zA-Z0-9 äöüÄÖÜß\+\-=\._:/@]', '', s)
 
-    def upload_file(self, file: BinaryIO, filename: str, tags: Dict[str, str]) -> Tuple[bytes, str]:
+    def upload_file(
+        self, file: BinaryIO, filename: str, tags: Dict[str, str], *, allow_empty: bool = False
+    ) -> Tuple[bytes, str]:
         """Handles uploading of the file to S3 storage."""
-        contents, file_path = LocalStorageProvider.upload_file(file, filename, tags)
+        contents, file_path = LocalStorageProvider.upload_file(file, filename, tags, allow_empty=allow_empty)
         s3_key = os.path.join(self.key_prefix, filename)
         try:
             self.s3_client.upload_file(file_path, self.bucket_name, s3_key)
@@ -227,9 +233,11 @@ class GCSStorageProvider(StorageProvider):
             self.gcs_client = storage.Client()
         self.bucket = self.gcs_client.bucket(GCS_BUCKET_NAME)
 
-    def upload_file(self, file: BinaryIO, filename: str, tags: Dict[str, str]) -> Tuple[bytes, str]:
+    def upload_file(
+        self, file: BinaryIO, filename: str, tags: Dict[str, str], *, allow_empty: bool = False
+    ) -> Tuple[bytes, str]:
         """Handles uploading of the file to GCS storage."""
-        contents, file_path = LocalStorageProvider.upload_file(file, filename, tags)
+        contents, file_path = LocalStorageProvider.upload_file(file, filename, tags, allow_empty=allow_empty)
         try:
             blob = self.bucket.blob(filename)
             blob.upload_from_filename(file_path)
@@ -291,9 +299,11 @@ class AzureStorageProvider(StorageProvider):
             self.blob_service_client = BlobServiceClient(account_url=self.endpoint, credential=DefaultAzureCredential())
         self.container_client = self.blob_service_client.get_container_client(self.container_name)
 
-    def upload_file(self, file: BinaryIO, filename: str, tags: Dict[str, str]) -> Tuple[bytes, str]:
+    def upload_file(
+        self, file: BinaryIO, filename: str, tags: Dict[str, str], *, allow_empty: bool = False
+    ) -> Tuple[bytes, str]:
         """Handles uploading of the file to Azure Blob Storage."""
-        contents, file_path = LocalStorageProvider.upload_file(file, filename, tags)
+        contents, file_path = LocalStorageProvider.upload_file(file, filename, tags, allow_empty=allow_empty)
         try:
             blob_client = self.container_client.get_blob_client(filename)
             blob_client.upload_blob(contents, overwrite=True)

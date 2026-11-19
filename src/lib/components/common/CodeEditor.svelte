@@ -145,7 +145,8 @@ print("${endTag}")
 
 			function handleMessage(event) {
 				const { id: eventId, stdout, stderr } = event.data;
-				if (eventId !== id) return; // Only handle our message
+				// Runtime progress is not Black's formatted output.
+				if (eventId !== id || event.data.type === 'execution:start') return;
 				clearTimeout(timeout);
 				worker.removeEventListener('message', handleMessage);
 				worker.removeEventListener('error', handleError);

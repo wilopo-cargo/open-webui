@@ -389,7 +389,9 @@ async def upload_file_handler(
             'OpenWebUI-File-Id': id,
         }
         try:
-            contents, file_path = await asyncio.to_thread(Storage.upload_file, file.file, filename, tags)
+            contents, file_path = await asyncio.to_thread(
+                Storage.upload_file, file.file, filename, tags, allow_empty=not process
+            )
         except OSError as e:
             if e.errno != errno.ENAMETOOLONG:
                 log.exception(e)
@@ -401,7 +403,9 @@ async def upload_file_handler(
             file.file.seek(0)
             filename = f'{id}.{file_extension}' if file_extension else id
             try:
-                contents, file_path = await asyncio.to_thread(Storage.upload_file, file.file, filename, tags)
+                contents, file_path = await asyncio.to_thread(
+                    Storage.upload_file, file.file, filename, tags, allow_empty=not process
+                )
             except OSError as e:
                 log.exception(e)
                 raise HTTPException(

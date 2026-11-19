@@ -20,6 +20,7 @@
 	import FullHeightIframe from './FullHeightIframe.svelte';
 	import MCPApp from '$lib/components/chat/Messages/MCPApp.svelte';
 	import { settings } from '$lib/stores';
+	import { safeLinkUrl } from '$lib/utils';
 
 	export let id: string = '';
 	export let attributes: {
@@ -170,6 +171,9 @@
 
 	$: parsedArgs = parseArguments(args);
 	$: parsedResult = parseJSONString(result);
+	$: generatedFiles = attributes?.name === 'execute_code' && Array.isArray(parsedResult?.files)
+		? parsedResult.files
+		: [];
 
 	const toggleOpen = () => {
 		open = !open;
@@ -395,8 +399,8 @@
 
 	<!-- Files display (images etc.) when done -->
 	{#if isDone}
-		{#if typeof files === 'object'}
-			{#each files ?? [] as file, idx}
+		{#if Array.isArray(files) || generatedFiles.length}
+			{#each [...(Array.isArray(files) ? files : []), ...generatedFiles] as file, idx}
 				{#if typeof file === 'string'}
 					{#if file.startsWith('data:image/')}
 						<Image id={`${componentId}-tool-call-result-${idx}`} src={file} alt="Image" />
@@ -404,6 +408,8 @@
 				{:else if typeof file === 'object'}
 					{#if (file.type === 'image' || (file?.content_type ?? '').startsWith('image/')) && file.url}
 						<Image id={`${componentId}-tool-call-result-${idx}`} src={file.url} alt="Image" />
+					{:else if file.url && file.name}
+						<a href={safeLinkUrl(file.url)} download={file.name.split('/').pop()} class="block text-sm underline">{$i18n.t('Download')} {file.name}</a>
 					{/if}
 				{/if}
 			{/each}

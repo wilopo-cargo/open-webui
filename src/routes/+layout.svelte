@@ -9,6 +9,8 @@
 	import { io } from 'socket.io-client';
 	import { spring } from 'svelte/motion';
 	import { createPyodideWorker } from '$lib/pyodide/createPyodideWorker';
+	import { uploadGeneratedFiles } from '$lib/pyodide/uploadGeneratedFiles';
+	import { executePyodide } from '$lib/pyodide/executePyodide';
 	import { Toaster, toast } from 'svelte-sonner';
 
 	let loadingProgress = spring(0, {
@@ -47,7 +49,7 @@
 		desktopEvent
 	} from '$lib/stores';
 	import { refreshChatList } from '$lib/stores/chatList';
-	import { getFileBlobById, getFileContentById } from '$lib/apis/files';
+	import { getFileBlobById } from '$lib/apis/files';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { beforeNavigate } from '$app/navigation';
@@ -313,12 +315,14 @@
 		return worker;
 	};
 
+	/**
+	 * @param {string} id
+	 * @param {string} code
+	 * @param {((output: import('$lib/pyodide/uploadGeneratedFiles').PyodideOutput) => void) | undefined} cb
+	 * @param {{ id?: string; filename?: string; name?: string }[]} files
+	 */
 	const executePythonAsWorker = async (id, code, cb, files = []) => {
-		let result = null;
-		let stdout = null;
-		let stderr = null;
-
-		let executing = true;
+		const token = localStorage.token;
 		let packages = [
 			/\bimport\s+requests\b|\bfrom\s+requests\b/.test(code) ? 'requests' : null,
 			/\bimport\s+bs4\b|\bfrom\s+bs4\b/.test(code) ? 'beautifulsoup4' : null,
@@ -349,112 +353,22 @@
 					const fileId = file?.id;
 					const fileName = file?.filename || file?.name || 'file';
 					if (fileId) {
-						const content = await getFileContentById(fileId);
-						if (content) {
-							filePayloads.push({ name: fileName, data: content });
-						}
+						const content = await getFileBlobById(token, fileId);
+						filePayloads.push({ name: fileName, data: await content.arrayBuffer() });
 					}
 				} catch (e) {
-					console.error('Failed to fetch file for Pyodide:', e);
+					cb?.({ stdout: null, stderr: `Could not stage input file: ${e}`, result: null, files: [] });
+					return;
 				}
 			}
 		}
 
-		worker.postMessage({
-			type: 'execute',
-			id: id,
-			code: code,
-			packages: packages,
-			files: filePayloads.length > 0 ? filePayloads : undefined
-		});
-
-		// Timeout for this specific execution (not the worker itself)
-		let timeoutId = setTimeout(() => {
-			if (executing) {
-				executing = false;
-				stderr = 'Execution Time Limit Exceeded';
-
-				// Terminate and recreate the worker on timeout
-				worker.terminate();
-				pyodideWorker.set(null);
-
-				if (cb) {
-					cb(
-						JSON.parse(
-							JSON.stringify(
-								{
-									stdout: stdout,
-									stderr: stderr,
-									result: result
-								},
-								(_key, value) => (typeof value === 'bigint' ? value.toString() : value)
-							)
-						)
-					);
-				}
-			}
-		}, 60000);
-
-		// Use addEventListener so multiple concurrent executions don't clobber each other
-		const onMessage = (event) => {
-			const { id: eventId, ...data } = event.data;
-			// Only handle responses for this execution ID
-			if (eventId !== id) return;
-			// Ignore FS responses (they use a type field)
-			if (data.type && data.type.startsWith('fs:')) return;
-
-			console.log('pyodideWorker.onmessage', event);
-			clearTimeout(timeoutId);
-			worker.removeEventListener('message', onMessage);
-			worker.removeEventListener('error', onError);
-
-			data['stdout'] && (stdout = data['stdout']);
-			data['stderr'] && (stderr = data['stderr']);
-			data['result'] && (result = data['result']);
-
-			if (cb) {
-				cb(
-					JSON.parse(
-						JSON.stringify(
-							{
-								stdout: stdout,
-								stderr: stderr,
-								result: result
-							},
-							(_key, value) => (typeof value === 'bigint' ? value.toString() : value)
-						)
-					)
-				);
-			}
-
-			executing = false;
-		};
-
-		const onError = (event) => {
-			console.log('pyodideWorker.onerror', event);
-			clearTimeout(timeoutId);
-			worker.removeEventListener('message', onMessage);
-			worker.removeEventListener('error', onError);
-
-			if (cb) {
-				cb(
-					JSON.parse(
-						JSON.stringify(
-							{
-								stdout: stdout,
-								stderr: stderr,
-								result: result
-							},
-							(_key, value) => (typeof value === 'bigint' ? value.toString() : value)
-						)
-					)
-				);
-			}
-			executing = false;
-		};
-
-		worker.addEventListener('message', onMessage);
-		worker.addEventListener('error', onError);
+		const execution = await executePyodide(worker, { id, code, packages, files: filePayloads });
+		if (execution.workerTerminated && $pyodideWorker === worker) pyodideWorker.set(null);
+		// Only stored file IDs/URLs cross back to either native or legacy tool consumers.
+		const output = await uploadGeneratedFiles(execution, token, $config?.file?.max_size);
+		cb?.(JSON.parse(JSON.stringify(output, (_key, value) => typeof value === 'bigint' ? value.toString() : value)));
+		if (!execution.workerTerminated) window.dispatchEvent(new Event('pyodide:files'));
 	};
 
 	const resolveToolServer = (serverUrl) => {

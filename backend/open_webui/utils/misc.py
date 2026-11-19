@@ -650,9 +650,8 @@ def convert_output_to_messages(
 
             if code_output:
                 if isinstance(code_output, dict):
-                    stdout = code_output.get('stdout', '')
-                    result = code_output.get('result', '')
-                    output_text = stdout or result
+                    # Preserve downloads and failures for the model's continuation and replay.
+                    output_text = JSONCodec.dumps(code_output, ensure_ascii=False)
                 else:
                     output_text = str(code_output)
                 if output_text:
