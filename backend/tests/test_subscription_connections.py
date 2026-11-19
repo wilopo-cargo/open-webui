@@ -1,7 +1,8 @@
-"""Disposable-DB lifecycle/security check and real loopback provider HTTP smoke.
+"""Disposable-DB lifecycle, automation-default ownership, and loopback provider/tool check.
 
 Run from the repository root: python backend/tests/test_subscription_connections.py
 No credentials, .env files, app lifespan, real consent, or external provider calls.
+Only a synthetic DB-backed tool is enabled; tool servers and package installation are disabled.
 For an operator's separate real-account smoke: start a LOCAL WebUI with a disposable
 DATA_DIR and encryption key, connect using Settings > Connections, paste the FULL
 callback URL, select its model (or a preset), then exercise a saved chat with an
@@ -43,6 +44,7 @@ async def _check():
     from open_webui.models.groups import Group, GroupMember
     from open_webui.models.models import Model, Models
     from open_webui.models.oauth_sessions import OAuthSession, OAuthSessions
+    from open_webui.models.tools import Tool
     from open_webui.models.users import User, UserModel
     from open_webui.routers import subscriptions as router
     from open_webui.routers.auths import delete_oauth_session_by_provider
@@ -51,17 +53,20 @@ async def _check():
     from open_webui.utils import subscriptions as core
     from open_webui.utils.audit import AuditLevel, AuditLoggingMiddleware
     from open_webui.utils.auth import get_verified_user
+    from open_webui.utils.automations import _resolve_model_defaults
     from open_webui.utils.chat import generate_chat_completion
     from open_webui.utils.models import check_model_access
     from open_webui.utils.oauth import OAuthManager, get_system_oauth_token
     from open_webui.utils.payload import apply_model_controls, apply_params_to_form_data
     from open_webui.utils.session_pool import close_session
+    from open_webui.utils.tools import get_tools
     from open_webui.utils.subscriptions import claude, codex
     from sqlalchemy import select
     from sqlalchemy.ext.asyncio import AsyncSession
 
     tables = [User.__table__, Group.__table__, GroupMember.__table__, Model.__table__,
-              AccessGrant.__table__, OAuthSession.__table__, Config.__table__, Chat.__table__, ChatMessage.__table__]
+              AccessGrant.__table__, OAuthSession.__table__, Config.__table__, Chat.__table__, ChatMessage.__table__,
+              Tool.__table__]
     async with async_engine.begin() as db:
         await db.run_sync(lambda connection: User.metadata.create_all(connection, tables=tables))
 
@@ -371,11 +376,35 @@ async def _check():
             assert (await core.resolve_subscription_model(users['bob'], shared_raw))['subscription']['connection_id'] == shared_id
 
             # A saved preset keeps WebUI-only tools/knowledge/controls, without global-model leakage.
+            automation_meta = {
+                'toolIds': ['attached-tool'], 'defaultFilterIds': ['attached-filter'], 'terminalId': 'attached-terminal',
+                'knowledge': [{'id': 'attached-knowledge'}],
+                'defaultFeatureIds': ['web_search', 'image_generation', 'code_interpreter'],
+                'capabilities': {'web_search': True, 'image_generation': False, 'code_interpreter': True},
+            }
+            tool_spec = {'name': 'lookup', 'description': 'Read a number',
+                         'parameters': {'type': 'object', 'properties': {'value': {'type': 'integer'}}, 'required': ['value']}}
+            tool_source = (
+                'class Tools:\n'
+                '    def __init__(self):\n'
+                '        self.calls = 0\n'
+                '    async def lookup(self, value: int) -> str:\n'
+                '        assert value == 7\n'
+                '        self.calls += 1\n'
+                "        return 'seven'\n"
+            )
             async with get_async_db_context() as db:
                 db.add(Model(id='preset-local', user_id='alice', base_model_id=raw, name='Knowledge preset', is_active=True,
                              params={'system': 'Saved system context', 'model_controls': {}},
-                             meta={'toolIds': ['attached-tool'], 'knowledge': [{'id': 'attached-knowledge'}]}, created_at=0, updated_at=0))
+                             meta=automation_meta, created_at=0, updated_at=0))
                 await AccessGrants.replace_access_grants(db, 'model', 'preset-local', [{'principal_type': 'user', 'principal_id': 'bob', 'permission': 'read'}])
+                db.add(Model(id='preset-shared', user_id='alice', base_model_id=shared_raw, name='Shared preset', is_active=True,
+                             params={}, meta=automation_meta, created_at=0, updated_at=0))
+                await AccessGrants.replace_access_grants(db, 'model', 'preset-shared', [{'principal_type': 'user', 'principal_id': 'bob', 'permission': 'read'}])
+                db.add(Model(id='ordinary-defaults', user_id='alice', base_model_id='ordinary-base', name='Ordinary preset', is_active=True,
+                             params={}, meta=automation_meta, created_at=0, updated_at=0))
+                db.add(Tool(id='attached-tool', user_id='alice', name='Attached lookup', content=tool_source,
+                            specs=[tool_spec], meta={}, is_active=True, created_at=0, updated_at=0))
                 await db.commit()
             alice_models = await core.get_model_overlay(request_for('alice'), users['alice'])
             bob_models = await core.get_model_overlay(request_for('bob'), users['bob'])
@@ -385,6 +414,65 @@ async def _check():
             assert app.state.MODELS == {} and app.state.OPENAI_MODELS == {}
             await check_model_access(users['alice'], alice_models['preset-local'])
             await denied(check_model_access(users['bob'], alice_models['preset-local']), 404)
+
+            # Automations resolve real owner-only overlays, not the shared registry.
+            await Config.upsert({'web.search.enable': True, 'image_generation.enable': True})
+            inherited = {'tool_ids': ['attached-tool'], 'filter_ids': ['attached-filter'], 'terminal_id': 'attached-terminal'}
+            expected = {**inherited, 'features': {'web_search': True}}
+            alice_request, bob_request = request_for('alice'), request_for('bob')
+            assert await _resolve_model_defaults(alice_request, users['alice'], 'preset-local') == expected
+            assert await _resolve_model_defaults(alice_request, users['alice'], 'preset-local', models=alice_models) == expected
+            # Bob has a model grant, but cannot inherit a personal connection's tools.
+            assert await _resolve_model_defaults(bob_request, users['bob'], 'preset-local') == {}
+            assert await _resolve_model_defaults(bob_request, users['bob'], 'preset-shared') == expected
+            assert await get_tools(bob_request, expected['tool_ids'], users['bob'], {'__user__': users['bob'].model_dump()}) == {}
+            # Reusing a request must not retain revoked model or connection grants.
+            async with get_async_db_context() as db:
+                await AccessGrants.replace_access_grants(db, 'model', 'preset-shared', [])
+                await db.commit()
+            assert await _resolve_model_defaults(bob_request, users['bob'], 'preset-shared') == {}
+            async with get_async_db_context() as db:
+                await AccessGrants.replace_access_grants(db, 'model', 'preset-shared', [{'principal_type': 'user', 'principal_id': 'bob', 'permission': 'read'}])
+                await db.commit()
+            assert await _resolve_model_defaults(bob_request, users['bob'], 'preset-shared') == expected
+            assert (await api('PATCH', '/' + shared_id, 'admin', {'access_grants': []})).status_code == 200
+            assert await _resolve_model_defaults(bob_request, users['bob'], 'preset-shared') == {}
+            assert (await api('PATCH', '/' + shared_id, 'admin', {'access_grants': [{'principal_type': 'user', 'principal_id': 'bob', 'permission': 'read'}]})).status_code == 200
+            assert await _resolve_model_defaults(bob_request, users['bob'], 'preset-shared') == expected
+            assert (await api('PATCH', '/' + personal_id, data={'enabled': False})).status_code == 200
+            assert await _resolve_model_defaults(alice_request, users['alice'], 'preset-local') == {}
+            assert (await api('PATCH', '/' + personal_id, data={'enabled': True})).status_code == 200
+
+            ordinary = await Models.get_model_by_id('ordinary-defaults')
+            registry = {'ordinary-defaults': {'id': ordinary.id, 'owned_by': 'openai', 'info': ordinary.model_dump()}}
+            app.state.MODELS = registry
+            try:
+                assert await _resolve_model_defaults(alice_request, users['alice'], ordinary.id) == expected
+                assert await _resolve_model_defaults(alice_request, users['alice'], 'missing-model') == {}
+                assert app.state.MODELS is registry and list(registry) == [ordinary.id]
+            finally:
+                app.state.MODELS = {}
+
+            # Feature defaults still need admin enablement, capability, and opt-in.
+            # code_interpreter is opted in and capable above, but never headless-safe.
+            await Config.upsert({'web.search.enable': False})
+            assert await _resolve_model_defaults(alice_request, users['alice'], 'preset-local') == inherited
+            await Config.upsert({'web.search.enable': True})
+            async with get_async_db_context() as db:
+                preset = await db.get(Model, 'preset-local')
+                preset.meta = {**automation_meta, 'capabilities': {'web_search': False, 'image_generation': True, 'code_interpreter': True}}
+                await db.commit()
+            assert await _resolve_model_defaults(alice_request, users['alice'], 'preset-local') == {**inherited, 'features': {'image_generation': True}}
+            async with get_async_db_context() as db:
+                preset = await db.get(Model, 'preset-local')
+                preset.meta = {**automation_meta, 'defaultFeatureIds': []}
+                await db.commit()
+            assert await _resolve_model_defaults(alice_request, users['alice'], 'preset-local') == inherited
+            async with get_async_db_context() as db:
+                preset = await db.get(Model, 'preset-local')
+                preset.meta = automation_meta
+                await db.commit()
+            assert app.state.MODELS == {} and app.state.OPENAI_MODELS == {}
 
             # Manual compaction uses the same saved preset without registering its private base globally.
             await Config.upsert({'chat.context_compaction.enable': True, 'chat.context_compaction.model': ''})
@@ -487,10 +575,16 @@ async def _check():
                     assert persisted['refresh_token'] == refresh + '-rotated'
                     assert persisted['expires_at'] > time.time()
 
-            # Real adapter + HTTP transport: retry2 happens before output and cannot re-run the local tool.
-            for provider, model_id in [('codex', raw), ('claude', f'subscription:{claude_id}:local-claude')]:
+            # Resolved preset tools reach the real loader, provider, and guarded callable.
+            owner_request = request_for('alice')
+            defaults = await _resolve_model_defaults(owner_request, users['alice'], 'preset-local')
+            bound_tools = await get_tools(owner_request, defaults.get('tool_ids', []), users['alice'],
+                                          {'__user__': users['alice'].model_dump()})
+            tools = [{'type': 'function', 'function': tool['spec']} for tool in bound_tools.values()]
+            assert [tool['function']['name'] for tool in tools] == ['lookup']
+            # Real adapter + HTTP transport: retry2 cannot re-run the inherited tool.
+            for provider, model_id in [('codex', 'preset-local'), ('claude', f'subscription:{claude_id}:local-claude')]:
                 messages = [{'role': 'system', 'content': 'Knowledge context'}, {'role': 'user', 'content': 'Look up seven'}]
-                tools = [{'type': 'function', 'function': {'name': 'lookup', 'description': 'Read a number', 'parameters': {'type': 'object', 'properties': {'value': {'type': 'integer'}}}}}]
                 fail_inference_once.add(provider)
                 before = counts[(provider, 'inference')]
                 response = await client.post('/test/completions', headers={'x-test-user': 'alice'}, json={'model': model_id, 'messages': messages, 'tools': tools, 'stream': False})
@@ -498,19 +592,14 @@ async def _check():
                 call = response.json()['choices'][0]['message']['tool_calls'][0]
                 assert call['id'] == 'call-local' and json.loads(call['function']['arguments']) == {'value': 7}
                 assert counts[(provider, 'inference')] == before + 2
-                executions = Counter()
-
-                def lookup(value):
-                    executions['lookup'] += 1
-                    assert value == 7
-                    return 'seven'
-
-                tool_result = lookup(**json.loads(call['function']['arguments']))
+                executions_before = app.state.TOOLS['attached-tool'].calls
+                tool_result = await bound_tools[call['function']['name']]['callable'](**json.loads(call['function']['arguments']))
+                assert tool_result == 'seven'
                 messages.extend([response.json()['choices'][0]['message'], {'role': 'tool', 'tool_call_id': call['id'], 'content': tool_result}])
                 followup = await client.post('/test/completions', headers={'x-test-user': 'alice'}, json={'model': model_id, 'messages': messages, 'tools': tools, 'stream': False})
                 assert followup.status_code == 200, followup.text
                 assert followup.json()['choices'][0]['message']['content'] == 'local answer'
-                assert executions['lookup'] == 1 and counts[(provider, 'inference')] == before + 3
+                assert app.state.TOOLS['attached-tool'].calls == executions_before + 1 and counts[(provider, 'inference')] == before + 3
                 streamed = await client.post('/test/completions', headers={'x-test-user': 'alice'}, json={'model': model_id, 'messages': [{'role': 'user', 'content': 'hello'}], 'stream': True})
                 assert streamed.status_code == 200 and 'local answer' in streamed.text and '[DONE]' in streamed.text
                 assert 'SECRET-' not in streamed.text
@@ -824,7 +913,8 @@ if __name__ == '__main__':
             'DATABASE_PORT': '', 'DATABASE_NAME': '', 'DATABASE_ENABLE_IAM_TOKEN_AUTH': 'false',
             'WEBUI_AUTH': 'true', 'WEBUI_SECRET_KEY': os.urandom(32).hex(), 'OAUTH_SESSION_TOKEN_ENCRYPTION_KEY': os.urandom(32).hex(),
             'WEBUI_JWT_SECRET_KEY': '', 'LICENSE_BLOB_PATH': '', 'ENV': 'test', 'OFFLINE_MODE': 'true',
-            'USE_SLIM_DOCKER': 'true', 'ENABLE_FUNCTIONS': 'false', 'ENABLE_TOOLS': 'false',
+            'USE_SLIM_DOCKER': 'true', 'ENABLE_FUNCTIONS': 'false', 'ENABLE_PLUGINS': 'true', 'ENABLE_TOOLS': 'true',
+            'ENABLE_TOOL_SERVERS': 'false', 'ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS': 'false',
             'REDIS_URL': '', 'WEBSOCKET_REDIS_URL': '', 'WEBSOCKET_MANAGER': '',
         })
         asyncio.run(_check())

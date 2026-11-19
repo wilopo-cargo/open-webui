@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Scheduled chat/channel automations and channel replies inherit attached tools and model defaults from the requesting owner's scoped model catalog, including subscription-backed presets. Private catalogs remain request-local, and tool permissions, provider authorization and feature gates are unchanged.
 - Full-config imports validate Composio connections before saving any settings; invalid policies return actionable errors without exposing credentials or changing the previous configuration.
 - Empty Composio tool allowlists now accept the provider's uppercase toolkit catalog metadata and match it against configured lowercase toolkit slugs, preventing valid session/catalog responses from incorrectly reporting `Composio is unavailable`. Exact app-tool names, configured toolkit boundaries, and helper exclusions remain enforced.
 - ERP MCP connections fail closed for missing per-user OAuth tokens, non-static OAuth, unsafe URLs, and custom Authorization overrides. CSV handoff rejects foreign, historical, temporary, non-CSV, oversized, and out-of-upload-directory references, and refuses redirects or invalid upload responses.

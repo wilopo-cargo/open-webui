@@ -45,6 +45,7 @@ from open_webui.utils.recurrence import (
     rrule_interval_seconds,
     validate_rrule,
 )
+from open_webui.utils.subscriptions import get_model_overlay
 from open_webui.utils.task import prompt_template
 from open_webui.utils.agents.discovery import get_models as get_agent_models
 from open_webui.utils.terminals import initialize_terminal_directory, resolve_terminal_connection
@@ -161,8 +162,9 @@ def _build_request(
     return request
 
 
-async def _resolve_model_defaults(app, model_id: str) -> dict:
-    models = getattr(app.state, 'MODELS', {})
+async def _resolve_model_defaults(request, user, model_id: str, *, models=None) -> dict:
+    if models is None:
+        models = await get_model_overlay(request, user)
     model = models.get(model_id, {})
     meta = model.get('info', {}).get('meta', {})
 
@@ -239,8 +241,9 @@ async def _execute_channel_automation(
     ):
         raise ValueError('Owner no longer permitted to use channels')
 
-    model = getattr(app.state, 'MODELS', {}).get(model_id, {})
     request = _build_request(app, token=token)
+    models = await get_model_overlay(request, user)
+    model = models.get(model_id, {})
 
     from open_webui.routers.channels import new_message_handler
 
@@ -279,7 +282,7 @@ async def _execute_channel_automation(
         )
 
     form_data = {
-        **await _resolve_model_defaults(app, model_id),
+        **await _resolve_model_defaults(request, user, model_id, models=models),
         'model': model_id,
         'messages': [
             {
@@ -454,7 +457,7 @@ async def execute_automation(app, automation: AutomationModel) -> None:
 
         # Build the same payload the frontend sends to /api/chat/completions
         form_data = {
-            **await _resolve_model_defaults(app, model_id),
+            **await _resolve_model_defaults(request, user, model_id),
             'model': model_id,
             'messages': [{'role': 'user', 'content': prompt}],
             'stream': True,
