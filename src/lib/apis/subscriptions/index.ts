@@ -19,6 +19,12 @@ export type SubscriptionConnection = {
 	can_manage: boolean;
 	access_grants: SubscriptionGrant[];
 };
+export type SubscriptionUsage = {
+	status: 'available' | 'unreported';
+	fetched_at: number;
+	windows: { id: string; label: string; used_percent: number; resets_at: number | null }[];
+};
+
 
 export type SubscriptionAuthorization = {
 	state: string;
@@ -103,6 +109,9 @@ export const updateSubscriptionConnection = (
 
 export const refreshSubscriptionModels = (token: string, id: string) =>
 	request<SubscriptionConnection>(token, `/${encodeURIComponent(id)}/models`, 'POST');
+export const getSubscriptionUsage = (token: string, id: string) =>
+	request<SubscriptionUsage>(token, `/${encodeURIComponent(id)}/usage`);
+
 
 export const deleteSubscriptionConnection = (token: string, id: string) =>
 	request<{ status: boolean }>(token, `/${encodeURIComponent(id)}`, 'DELETE');

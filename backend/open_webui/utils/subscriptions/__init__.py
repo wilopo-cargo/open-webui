@@ -356,6 +356,18 @@ async def update_connection(user, connection_id, changes):
         return await _summary(db, row, token, user)
 
 
+async def get_usage(user, connection_id):
+    # Account-wide quotas are management data, not part of a shared read grant.
+    provider, token = await _connection_token(connection_id, user, manage=True, require_enabled=False)
+    try:
+        windows = await get_provider(provider).get_usage(token)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(502, 'Provider usage is temporarily unavailable.') from None
+    return {'status': 'available' if windows else 'unreported', 'windows': windows, 'fetched_at': int(time.time())}
+
+
 async def delete_connection(user, connection_id):
     async with _locked_connection(connection_id, user, manage=True, require_enabled=False) as (db, row, token):
         await db.execute(delete(AccessGrant).filter_by(resource_type=RESOURCE_TYPE, resource_id=row.id))

@@ -58,6 +58,7 @@ OAUTH = {
 }
 MESSAGES_URL = 'https://api.anthropic.com/v1/messages?beta=true'
 MODELS_URL = 'https://api.anthropic.com/v1/models'
+USAGE_URL = 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1'
 ANTHROPIC_VERSION = '2023-06-01'
 ANTHROPIC_BETA = (
     'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,'
@@ -131,6 +132,13 @@ async def _read_json(response, limit=MAX_JSON_BYTES, stream=None):
             raise HTTPException(status_code=502, detail='Claude response exceeded the size limit.')
         body.extend(chunk)
     return _decode_json(body, limit)
+
+
+async def get_usage(token):
+    from open_webui.utils.subscriptions.usage import claude_windows, fetch_usage
+
+    headers = {**_headers(token), 'Anthropic-Beta': 'oauth-2025-04-20'}
+    return claude_windows(await fetch_usage(USAGE_URL, headers))
 
 
 def authorization_url(state: str, challenge: str) -> str:

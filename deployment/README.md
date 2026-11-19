@@ -151,6 +151,15 @@ Subscription connections use direct OAuth and provider protocol adapters based o
 
 Use the card to rename, enable/disable, refresh the catalog, or disconnect. Reauthorization requires a new authorization flow; disabling hides the models without deleting credentials. Disconnect removes the connection and its access grants. Expired access tokens refresh on the server; revoked refresh credentials require reconnection.
 
+### Provider account usage
+
+Connection managers can see provider-reported usage on subscription cards: Codex session/weekly windows and Claude five-hour, seven-day and reported model-specific weekly windows. Percentages describe the provider account, not just WebUI chats, and are not estimated from local token counts.
+
+Usage loads separately after the connection list and can be updated with **Refresh usage**. The fetched timestamp shows when the data was read; there is no periodic polling. Reset times are shown only when reported by the provider, in the browser's local timezone. A reported zero is displayed as `0% used`; missing windows show **No usage data reported**, and failed requests show **Usage unavailable** without stale progress bars. Failure to read usage does not disable an otherwise usable connection.
+
+Personal owners and shared-connection managers can read usage, including for disabled connections. A shared inference read grant does not expose the owner's account-wide quota or reset schedule. Tokens and raw provider/account/billing data stay server-side, using the existing encrypted credential and refresh path. These internal provider endpoints, also used by [9router](https://github.com/decolua/9router/tree/master/open-sse/services/usage), may change or be unavailable for some accounts; no account access or plan entitlement is implied.
+
+
 Existing browser-direct API connections keep their separate **+** button, URL/key dialog and connection controls. Their availability still depends on the administrator's **Direct Connections** setting; subscription connections do not replace or enable them.
 
 ### Personal connection priority
