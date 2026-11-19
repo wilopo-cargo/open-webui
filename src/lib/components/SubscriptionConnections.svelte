@@ -13,13 +13,22 @@
 		completeSubscriptionConnection,
 		deleteSubscriptionConnection,
 		getSubscriptionConnections,
+		getSubscriptionUsage,
 		refreshSubscriptionModels,
 		updateSubscriptionConnection,
 		SubscriptionApiError,
 		type SubscriptionAuthorization,
 		type SubscriptionConnection,
-		type SubscriptionGrant
+		type SubscriptionGrant,
+		type SubscriptionUsage
 	} from '$lib/apis/subscriptions';
+
+	type UsageState = { loading: boolean; usage?: SubscriptionUsage; error?: string };
+	const formatDate = (timestamp: number) =>
+		new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(timestamp * 1000));
+	const formatPercent = (percent: number) =>
+		new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(percent);
+
 
 	const i18n: any = getContext('i18n');
 	export let admin = false;
@@ -29,6 +38,7 @@
 	let busy = '';
 	let error = '';
 	let notice = '';
+	let usageByConnection: Record<string, UsageState> = {};
 	let provider: 'codex' | 'claude' = 'codex';
 	let name = '';
 	let callback = '';
@@ -48,8 +58,26 @@
 				? value.trim()
 				: fallback;
 
+	const loadUsage = async (connection: SubscriptionConnection, refresh = false) => {
+		const current = usageByConnection[connection.id];
+		if (!connection.can_manage || current?.loading || (!refresh && current)) return;
+		usageByConnection = { ...usageByConnection, [connection.id]: { loading: true } };
+		try {
+			const usage = await getSubscriptionUsage(localStorage.token, connection.id);
+			usageByConnection = { ...usageByConnection, [connection.id]: { loading: false, usage } };
+		} catch (e) {
+			usageByConnection = {
+				...usageByConnection,
+				[connection.id]: { loading: false, error: errorText(e, 'Usage is unavailable.') }
+			};
+		}
+	};
+
 	const refreshList = async () => {
 		connections = await getSubscriptionConnections(localStorage.token);
+		for (const connection of connections) {
+			if (connection.can_manage && (!admin || connection.scope === 'shared')) void loadUsage(connection);
+		}
 	};
 
 	const refreshModels = async () => {
@@ -314,6 +342,51 @@
 							</div>
 						{/if}
 					</div>
+					{#if connection.can_manage}
+						<div class="mt-3 border-t border-gray-100 pt-2 dark:border-white/[0.08]">
+							<div class="flex flex-wrap items-center justify-between gap-2">
+								<span class="text-[0.6875rem] font-medium text-gray-700 dark:text-gray-200">{$i18n.t('Provider account usage')}</span>
+								<button
+									type="button"
+									class="text-[0.6875rem] text-gray-600 underline disabled:opacity-50 dark:text-gray-300"
+									aria-label={$i18n.t('Refresh usage for {{name}}', { name: connection.name })}
+									disabled={usageByConnection[connection.id]?.loading}
+									on:click={() => loadUsage(connection, true)}
+								>
+									{usageByConnection[connection.id]?.loading ? $i18n.t('Loading…') : $i18n.t('Refresh usage')}
+								</button>
+							</div>
+							{#if usageByConnection[connection.id]?.loading}
+								<p class="mt-1 text-[0.6875rem] text-gray-500 dark:text-gray-400" role="status">{$i18n.t('Loading usage…')}</p>
+							{:else if usageByConnection[connection.id]?.error}
+								<p class="mt-1 text-[0.6875rem] text-red-600 dark:text-red-400" role="alert">{$i18n.t('Usage unavailable')}: {usageByConnection[connection.id].error}</p>
+							{:else if usageByConnection[connection.id]?.usage?.status === 'unreported'}
+								<p class="mt-1 text-[0.6875rem] text-gray-500 dark:text-gray-400">{$i18n.t('No usage data reported')} · {$i18n.t('Fetched')}: {formatDate(usageByConnection[connection.id].usage.fetched_at)}</p>
+							{:else if usageByConnection[connection.id]?.usage?.status === 'available'}
+								<div class="mt-2 space-y-2">
+									{#each usageByConnection[connection.id].usage.windows as usageWindow (usageWindow.id)}
+										<div class="min-w-0">
+											<div class="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 text-[0.6875rem]">
+												<span class="min-w-0 text-gray-600 dark:text-gray-300">{usageWindow.label}</span>
+												<span class="shrink-0 text-gray-700 dark:text-gray-200">{formatPercent(usageWindow.used_percent)}% {$i18n.t('used')}</span>
+											</div>
+											<progress
+												class="mt-1 block h-2 w-full overflow-hidden rounded-full accent-blue-600"
+												max="100"
+												value={Math.min(100, Math.max(0, usageWindow.used_percent))}
+												aria-label={$i18n.t('Usage for {{name}}: {{window}}', { name: connection.name, window: usageWindow.label })}
+											/>
+											{#if usageWindow.resets_at !== null}
+												<p class="mt-1 break-words text-[0.625rem] text-gray-500 dark:text-gray-400">{$i18n.t('Resets')}: {formatDate(usageWindow.resets_at)}</p>
+											{/if}
+										</div>
+									{/each}
+									<p class="text-[0.625rem] text-gray-500 dark:text-gray-400">{$i18n.t('Fetched')}: {formatDate(usageByConnection[connection.id].usage.fetched_at)}</p>
+								</div>
+							{/if}
+						</div>
+					{/if}
+
 				</li>
 			{/each}
 		</ul>

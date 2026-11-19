@@ -54,6 +54,7 @@ PROVIDER_ID = 'codex'
 CLIENT_VERSION = '0.167.1'
 RESPONSES_URL = 'https://chatgpt.com/backend-api/codex/responses'
 MODELS_URL = f'https://chatgpt.com/backend-api/codex/models?client_version={CLIENT_VERSION}'
+USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
 OAUTH = {
     'authorize_url': 'https://auth.openai.com/oauth/authorize',
     'token_url': 'https://auth.openai.com/oauth/token',
@@ -223,6 +224,12 @@ async def list_models(token: dict) -> list[dict]:
         raise HTTPException(502, 'Could not discover Codex models securely.') from None
     finally:
         await cleanup_response(response, session)
+
+
+async def get_usage(token: dict) -> list[dict]:
+    from open_webui.utils.subscriptions.usage import codex_windows, fetch_usage
+
+    return codex_windows(await fetch_usage(USAGE_URL, _headers(token)))
 
 
 def _reasoning_details(item: dict, index: int = 0) -> list[dict]:

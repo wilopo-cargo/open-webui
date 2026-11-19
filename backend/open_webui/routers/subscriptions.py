@@ -80,6 +80,11 @@ async def refresh_models(connection_id: str, user=Depends(get_verified_user)):
     return await subscriptions.refresh_models(user, connection_id)
 
 
+@router.get('/{connection_id}/usage')
+async def get_usage(connection_id: str, user=Depends(get_verified_user)):
+    return await subscriptions.get_usage(user, connection_id)
+
+
 @router.delete('/{connection_id}')
 async def delete_connection(connection_id: str, user=Depends(get_verified_user)):
     return await subscriptions.delete_connection(user, connection_id)
