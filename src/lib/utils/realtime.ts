@@ -880,6 +880,7 @@ export class RealtimeCall {
 	}
 
 	private result(turn: VoiceTurn, status: string, answer: string, speak = true) {
+		turn.finished = true;
 		// JSON can use six bytes per character; stay below the subscription bridge's frame limit.
 		const limit = this.subscription ? 80000 : 100000;
 		const text =
