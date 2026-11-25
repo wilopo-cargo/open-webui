@@ -38,6 +38,7 @@ async def _check():
     from open_webui import events
     from open_webui.internal.db import async_engine, get_async_db_context
     from open_webui.models.access_grants import AccessGrant, AccessGrants
+    from open_webui.models.auths import Auth
     from open_webui.models.chat_messages import ChatMessage, ChatMessages
     from open_webui.models.chats import Chat
     from open_webui.models.config import Config
@@ -47,12 +48,13 @@ async def _check():
     from open_webui.models.tools import Tool
     from open_webui.models.users import User, UserModel
     from open_webui.routers import subscriptions as router
+    from open_webui.routers.audio import realtime as realtime_router
     from open_webui.routers.auths import delete_oauth_session_by_provider
     from open_webui.routers.chats import CompactChatForm, compact_chat_by_id
     from open_webui.routers.users import get_user_oauth_sessions_by_id
     from open_webui.utils import subscriptions as core
     from open_webui.utils.audit import AuditLevel, AuditLoggingMiddleware
-    from open_webui.utils.auth import get_verified_user
+    from open_webui.utils.auth import create_token, get_verified_user
     from open_webui.utils.automations import _resolve_model_defaults
     from open_webui.utils.chat import generate_chat_completion
     from open_webui.utils.models import check_model_access
@@ -66,7 +68,7 @@ async def _check():
 
     tables = [User.__table__, Group.__table__, GroupMember.__table__, Model.__table__,
               AccessGrant.__table__, OAuthSession.__table__, Config.__table__, Chat.__table__, ChatMessage.__table__,
-              Tool.__table__]
+              Tool.__table__, Auth.__table__]
     async with async_engine.begin() as db:
         await db.run_sync(lambda connection: User.metadata.create_all(connection, tables=tables))
 
@@ -76,6 +78,8 @@ async def _check():
     async with get_async_db_context() as db:
         db.add_all([User(id=user.id, email=user.email, name=user.name, role=user.role,
                          last_active_at=0, updated_at=0, created_at=0) for user in users.values()])
+        db.add_all([Auth(id=user.id, email=user.email, password='unused', active=True,
+                         session_stamp='local-stamp') for user in users.values()])
         db.add(Group(id='team', user_id='admin', name='Team', description='', created_at=0, updated_at=0))
         db.add(GroupMember(id='member-bob', group_id='team', user_id='bob'))
         await db.commit()
@@ -189,10 +193,26 @@ async def _check():
             {'type': 'message_stop'},
         ])
 
+    realtime_sessions = 0
+
+    async def realtime_endpoint(request):
+        nonlocal realtime_sessions
+        realtime_sessions += 1
+        upstream = web.WebSocketResponse()
+        await upstream.prepare(request)
+        await upstream.send_json({'type': 'session.created', 'session': {'id': 'loopback-session'}})
+        update = await upstream.receive_json()
+        assert update['type'] == 'session.update'
+        await upstream.send_json({'type': 'session.updated'})
+        async for _ in upstream:
+            pass
+        return upstream
+
     provider_app = web.Application()
     provider_app.router.add_post('/{provider}/token', token_endpoint)
     provider_app.router.add_get('/{provider}/models', models_endpoint)
     provider_app.router.add_post('/{provider}/chat', inference_endpoint)
+    provider_app.router.add_get('/v1/realtime', realtime_endpoint)
 
     app = FastAPI()
     app.state.MODELS = {}
@@ -208,6 +228,7 @@ async def _check():
 
     app.dependency_overrides[get_verified_user] = authenticated
     app.include_router(router.router, prefix='/api/v1/subscriptions')
+    app.include_router(realtime_router.router, prefix='/audio')
 
     captured_audit = []
     audited_app = AuditLoggingMiddleware(app, audit_level=AuditLevel.REQUEST_RESPONSE)
@@ -503,6 +524,84 @@ async def _check():
             finally:
                 app.state.MODELS = {}
                 events.EVENT_SINKS = sinks
+
+            # Exercise the real WebSocket route and token validation against the
+            # disposable DB and a loopback provider. Access failures must precede
+            # the upstream WebSocket handshake.
+            await Config.upsert({
+                'audio.realtime.enabled': True,
+                'audio.realtime.provider': 'openai',
+                'audio.realtime.auth_type': 'api_key',
+                'audio.realtime.openai.api_base_url': local_url('/v1'),
+                'audio.realtime.openai.api_key': 'loopback-only',
+                'audio.realtime.model': 'local-realtime',
+                'audio.realtime.voice': 'alloy',
+                'audio.realtime.transcription_model': 'local-transcription',
+                'user.permissions': {'chat': {'call': True}},
+            })
+            tokens = {
+                name: create_token({'id': name, 'session_stamp': 'local-stamp'})
+                for name in ('alice', 'bob')
+            }
+            received_events = []
+
+            async def websocket_call(name, model_id):
+                state = {'receive': 0}
+
+                async def receive():
+                    state['receive'] += 1
+                    if state['receive'] == 1:
+                        return {'type': 'websocket.connect'}
+                    if state['receive'] == 2:
+                        return {'type': 'websocket.receive', 'text': json.dumps({
+                            'type': 'auth', 'token': tokens[name], 'model_id': model_id,
+                        })}
+                    return {'type': 'websocket.disconnect', 'code': 1000}
+
+                async def send(message):
+                    received_events.append(message)
+
+                await app({
+                    'type': 'websocket', 'asgi': {'version': '3.0', 'spec_version': '2.3'},
+                    'http_version': '1.1', 'scheme': 'ws', 'server': ('webui.test', 80),
+                    'client': ('127.0.0.1', 1), 'root_path': '', 'path': '/audio/realtime',
+                    'raw_path': b'/audio/realtime', 'query_string': b'', 'headers': [],
+                    'subprotocols': [], 'state': {}, 'app': app,
+                }, receive, send)
+
+            original_sessions = realtime_sessions
+            start = len(received_events)
+            await websocket_call('alice', raw)
+            assert realtime_sessions == original_sessions + 1
+            assert any(event.get('type') == 'websocket.send' and
+                       json.loads(event['text'])['type'] == 'bridge.ready' for event in received_events[start:])
+            original_sessions = realtime_sessions
+            await websocket_call('alice', 'preset-local')
+            assert realtime_sessions == original_sessions + 1
+
+            for name, model_id in [('bob', raw), ('bob', 'preset-local')]:
+                original_sessions = realtime_sessions
+                start = len(received_events)
+                await websocket_call(name, model_id)
+                assert realtime_sessions == original_sessions
+                assert any(event.get('type') == 'websocket.send' and
+                           'Chat model access denied' in event.get('text', '') for event in received_events[start:])
+
+            # The shared preset works while both grants exist; revoking the
+            # subscription grant blocks it before the provider is contacted.
+            original_sessions = realtime_sessions
+            await websocket_call('bob', 'preset-shared')
+            assert realtime_sessions == original_sessions + 1
+            assert (await api('PATCH', '/' + shared_id, 'admin', {'access_grants': []})).status_code == 200
+            original_sessions = realtime_sessions
+            start = len(received_events)
+            await websocket_call('bob', 'preset-shared')
+            assert realtime_sessions == original_sessions
+            assert any(event.get('type') == 'websocket.send' and
+                       'Chat model access denied' in event.get('text', '') for event in received_events[start:])
+            assert (await api('PATCH', '/' + shared_id, 'admin', {'access_grants': [
+                {'principal_type': 'user', 'principal_id': 'bob', 'permission': 'read'},
+            ]})).status_code == 200
 
             # Expired access tokens survive cleanup and refresh exactly once with rotation across concurrent calls.
             refresh = await expire(personal_id)
@@ -897,6 +996,7 @@ async def _check():
                 assert (await selected())['subscription']['connection_id'] == first  # A later independent request may choose anew.
 
             await check_priorities()
+
     await close_session()
     await async_engine.dispose()
     print('subscription lifecycle, ownership, priorities, rotation, and real loopback provider smoke passed')

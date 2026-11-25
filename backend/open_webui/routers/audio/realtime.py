@@ -7,7 +7,7 @@ import logging
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import aiohttp
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, DEFAULT_REALTIME_CALL_PROMPT_TEMPLATE
 from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL, BYPASS_MODEL_ACCESS_CONTROL, ENABLE_FORWARD_USER_INFO_HEADERS
@@ -20,6 +20,7 @@ from open_webui.utils.headers import get_microsoft_entra_id_access_token, includ
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.models import check_model_access, get_all_models
 from open_webui.utils.session_pool import get_session
+from open_webui.utils.subscriptions import assert_model_access as assert_subscription_model_access
 from open_webui.utils.voice_avatar import avatar_animation_tools
 
 router = APIRouter()
@@ -404,6 +405,7 @@ async def realtime_call(ws: WebSocket):
         if not isinstance(model_id, str):
             raise ValueError('Select a chat model')
         agent_model = model_id.startswith('agent:')
+        subscription_model = None
         if agent_model:
             from open_webui.utils.agents.discovery import get_models as get_agent_models
 
@@ -422,14 +424,21 @@ async def realtime_call(ws: WebSocket):
             if model is None:
                 raise ValueError('Agent model is unavailable in the selected terminal')
         else:
-            if not ws.app.state.MODELS:
-                await get_all_models(ws, user=user)
-            model = ws.app.state.MODELS.get(model_id)
-            if not model or model.get('direct'):
-                raise ValueError('Bridge requires a server-configured chat model')
+            try:
+                subscription_model = await assert_subscription_model_access(user, model_id)
+            except HTTPException:
+                raise ValueError('Chat model access denied') from None
+            model = subscription_model
+            if model is None:
+                if not ws.app.state.MODELS:
+                    await get_all_models(ws, user=user)
+                model = ws.app.state.MODELS.get(model_id)
+                if not model or model.get('direct'):
+                    raise ValueError('Bridge requires a server-configured chat model')
         model_info = await Models.get_model_by_id(model_id)
         if (
             not agent_model
+            and subscription_model is None
             and not BYPASS_MODEL_ACCESS_CONTROL
             and (user.role != 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL)
         ):
