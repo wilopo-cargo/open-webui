@@ -3296,6 +3296,8 @@
 	"settings.admin.images.imageGeneration.label": "",
 	"settings.admin.images.imageGenerationEngine.description": "",
 	"settings.admin.images.imageGenerationEngine.label": "",
+	"settings.admin.images.imageGenerationSubscription.description": "",
+	"settings.admin.images.imageGenerationSubscription.label": "",
 	"settings.admin.images.imageGenerationModel.label": "",
 	"settings.admin.images.imagePromptGeneration.description": "",
 	"settings.admin.images.imagePromptGeneration.label": "",
