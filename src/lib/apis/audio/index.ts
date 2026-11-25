@@ -29,7 +29,7 @@ export const getAudioConfig = async (token: string) => {
 
 export type RealtimeConfig = {
 	ENABLED: boolean;
-	PROVIDER: 'openai' | 'azure';
+	PROVIDER: 'openai' | 'openai_subscription' | 'azure';
 	AUTH_TYPE: 'api_key' | 'microsoft_entra_id';
 	OPENAI_API_BASE_URL: string;
 	OPENAI_API_KEY: string;

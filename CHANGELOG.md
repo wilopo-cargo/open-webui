@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenAI (Subscription)** in Admin Settings → Audio → Voice calls uses the selected Codex model's subscription for the live call, without an API key. The existing OpenAI-compatible API key and Azure options remain available. This mode uses the Codex Live endpoint and depends on OpenAI account eligibility and endpoint availability.
 - Provider-reported usage indicators for Codex and Claude subscription connections, with quota percentages, reported reset times and independent refresh controls. Account-wide usage is visible only to connection managers; unavailable or unreported data is never shown as zero usage.
 - Personal subscription connection priorities for saved subscription-backed presets. Lower numbers prefer an enabled, owner-only connection with the same provider and exact model ID; otherwise the preset keeps its configured connection. Preset settings and access checks remain intact, explicitly selected connection models stay pinned, and failed requests never switch accounts.
 - Administrator-owned Composio connections with configured toolkit policies and fresh sessions bound to each verified Open WebUI user. Employees authorize their own work accounts through in-chat Connect Links; native MCP and ERP authentication remain separate.
@@ -23,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Realtime Voice accepts authorized Codex and Claude subscription models and presets. Configure the separate voice provider in Admin Settings → Audio; voice uses that provider's API credentials, while delegated questions use the selected chat connection.
+- The OpenAI-compatible and Azure Realtime providers accept authorized Codex and Claude subscription models and presets for delegated chat.
 - Scheduled chat/channel automations and channel replies inherit attached tools and model defaults from the requesting owner's scoped model catalog, including subscription-backed presets. Private catalogs remain request-local, and tool permissions, provider authorization and feature gates are unchanged.
 - Full-config imports validate Composio connections before saving any settings; invalid policies return actionable errors without exposing credentials or changing the previous configuration.
 - Empty Composio tool allowlists now accept the provider's uppercase toolkit catalog metadata and match it against configured lowercase toolkit slugs, preventing valid session/catalog responses from incorrectly reporting `Composio is unavailable`. Exact app-tool names, configured toolkit boundaries, and helper exclusions remain enforced.

@@ -3645,6 +3645,8 @@
 	"settings.audio.realtime.inputParams": "Input Parameters",
 	"settings.audio.realtime.inputParamsHelp": "Additional parameters for realtime audio input in JSON format.",
 	"settings.audio.realtime.openai": "OpenAI / compatible",
+	"settings.audio.realtime.subscription": "OpenAI (Subscription)",
+	"settings.audio.realtime.subscriptionHelp": "Select a Codex subscription model in chat to start a call. The call uses that model’s Codex connection; no API key is needed.",
 	"settings.chat.toolPermissionsAuto.description": "Run low-risk tools automatically. Ask before risky or unclear actions.",
 	"settings.personal.about.checkForUpdates.label": "Check for updates",
 	"settings.personal.about.sections.community.title": "Community",

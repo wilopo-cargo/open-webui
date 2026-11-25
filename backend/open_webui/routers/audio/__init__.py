@@ -296,7 +296,7 @@ class STTConfigForm(BaseModel):
 
 class RealtimeConfigForm(BaseModel):
     ENABLED: bool = False
-    PROVIDER: Literal['openai', 'azure'] = 'openai'
+    PROVIDER: Literal['openai', 'openai_subscription', 'azure'] = 'openai'
     AUTH_TYPE: Literal['api_key', 'microsoft_entra_id'] = 'api_key'
     OPENAI_API_BASE_URL: str = 'https://api.openai.com/v1'
     OPENAI_API_KEY: str = ''

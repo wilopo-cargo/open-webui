@@ -402,7 +402,12 @@ type Config = {
 		login_footer?: string;
 	};
 	audio?: {
-		realtime?: { enabled: boolean; model: string; voice: string };
+		realtime?: {
+			enabled: boolean;
+			provider?: 'openai' | 'openai_subscription' | 'azure';
+			model: string;
+			voice: string;
+		};
 		stt: { engine: string };
 		tts: { engine: string; voice: string; split_on: string };
 	};

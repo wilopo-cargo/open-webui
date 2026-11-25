@@ -14,6 +14,7 @@ from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL, BYPASS_MODEL_ACCESS_CONTR
 from open_webui.models.chats import Chats
 from open_webui.models.config import Config
 from open_webui.models.models import Models, ModelVoice
+from open_webui.routers.audio import realtime_subscription
 from open_webui.utils.access_control import has_permission
 from open_webui.utils.auth import get_verified_user_by_token
 from open_webui.utils.headers import get_microsoft_entra_id_access_token, include_user_info_headers
@@ -28,6 +29,7 @@ log = logging.getLogger(__name__)
 
 # Messages are bounded before JSON parsing. Audio appends contain at most one second.
 MAX_EVENT_BYTES = 512 * 1024
+_AUTH_RECHECK_SECONDS = 60
 CALL_STATUSES = {
     'working': 'I am working on your request.',
     'approval': 'Please review the approval or question in chat. I will wait for you there.',
@@ -364,6 +366,7 @@ async def realtime_call(ws: WebSocket):
     upstream = None
     tasks = []
     user = None
+    subscription_transport = False
     try:
         async with asyncio.timeout(10):
             raw = await ws.receive_text()
@@ -395,17 +398,77 @@ async def realtime_call(ws: WebSocket):
         if user.role != 'admin' and not await has_permission(user.id, 'chat.call', config.get('user.permissions', {})):
             raise ValueError('Call permission denied')
         chat_id = auth.get('chat_id')
+        if chat_id is not None and not isinstance(chat_id, str):
+            raise ValueError('Invalid chat')
         if chat_id:
-            if not isinstance(chat_id, str):
-                raise ValueError('Invalid chat')
             chat = await Chats.get_chat_by_id(chat_id)
             if not chat or chat.user_id != user.id:
                 raise ValueError('Chat not found')
         model_id = auth.get('model_id')
         if not isinstance(model_id, str):
             raise ValueError('Select a chat model')
+        subscription_mode = config.get('audio.realtime.provider') == 'openai_subscription'
         agent_model = model_id.startswith('agent:')
         subscription_model = None
+        if not agent_model:
+            try:
+                subscription_model = await assert_subscription_model_access(user, model_id, prefer_personal=subscription_mode)
+            except HTTPException:
+                raise ValueError('Chat model access denied') from None
+
+        async def check_access():
+            error = realtime_subscription.CallError if subscription_mode else ValueError
+            current = await get_verified_user_by_token(token, redis)
+            if not current or not await Config.get('audio.realtime.enabled'):
+                raise error('Call authorization expired')
+            if current.role != 'admin' and not await has_permission(
+                current.id, 'chat.call', await Config.get('user.permissions') or {}
+            ):
+                raise error('Call permission revoked')
+            if subscription_mode:
+                if await Config.get('audio.realtime.provider') != 'openai_subscription':
+                    raise error('Realtime provider changed')
+                if chat_id and not await Chats.get_chat_by_id_and_user_id(chat_id, current.id):
+                    raise error('Chat not found')
+                try:
+                    selected = await assert_subscription_model_access(current, model_id)
+                    # Recheck the selected preset and its configured base, then the credential
+                    # actually in use if the initial personal preference selected a different one.
+                    if (
+                        selected is None
+                        or selected['subscription']['provider'] != 'codex'
+                        or selected['subscription']['model'] != subscription_model['subscription']['model']
+                        or (
+                            selected['id'] != subscription_model['id']
+                            and await assert_subscription_model_access(current, subscription_model['id']) is None
+                        )
+                    ):
+                        raise error('Chat model access revoked')
+                except HTTPException:
+                    raise error('Chat model access revoked') from None
+
+        async def check_auth():
+            # Also limits a call to the provider's one-hour session lifetime.
+            for _ in range(60):
+                await asyncio.sleep(_AUTH_RECHECK_SECONDS)
+                await check_access()
+            error = realtime_subscription.CallError if subscription_mode else ValueError
+            raise error('Call session expired. Start a new call.')
+
+        if subscription_mode:
+            if subscription_model is None or subscription_model['subscription']['provider'] != 'codex':
+                raise ValueError('Select a Codex subscription chat model')
+            subscription_transport = True
+            await realtime_subscription.bridge(
+                ws,
+                user,
+                subscription_model,
+                config.get('audio.realtime.prompt_template'),
+                check_access=check_access,
+                watch_access=check_auth,
+            )
+            return
+
         if agent_model:
             from open_webui.utils.agents.discovery import get_models as get_agent_models
 
@@ -424,10 +487,6 @@ async def realtime_call(ws: WebSocket):
             if model is None:
                 raise ValueError('Agent model is unavailable in the selected terminal')
         else:
-            try:
-                subscription_model = await assert_subscription_model_access(user, model_id)
-            except HTTPException:
-                raise ValueError('Chat model access denied') from None
             model = subscription_model
             if model is None:
                 if not ws.app.state.MODELS:
@@ -564,19 +623,6 @@ async def realtime_call(ws: WebSocket):
                         await ws.send_json(event)
             raise ValueError('Voice provider connection closed')
 
-        async def check_auth():
-            # Also limits a call to the provider's one-hour session lifetime.
-            for _ in range(60):
-                await asyncio.sleep(60)
-                current = await get_verified_user_by_token(token, redis)
-                if not current or not await Config.get('audio.realtime.enabled'):
-                    raise ValueError('Call authorization expired')
-                if current.role != 'admin' and not await has_permission(
-                    current.id, 'chat.call', await Config.get('user.permissions') or {}
-                ):
-                    raise ValueError('Call permission revoked')
-            raise ValueError('Call session expired. Start a new call.')
-
         tasks = [asyncio.create_task(fn()) for fn in (client_events, provider_events, check_auth)]
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
@@ -589,7 +635,7 @@ async def realtime_call(ws: WebSocket):
         # Only our own validation errors are safe to show. Never stringify provider exceptions.
         detail = (
             str(exc)
-            if type(exc) is ValueError
+            if type(exc) is realtime_subscription.CallError or (not subscription_transport and type(exc) is ValueError)
             # A send can still fail on the provider connection that just closed.
             else 'Voice provider connection closed'
             if isinstance(exc, aiohttp.ClientConnectionResetError)
