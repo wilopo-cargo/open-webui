@@ -245,12 +245,11 @@ def _validate_erp_mcp_connection(connection: dict, server_id: str) -> None:
         raise ValueError('ERP MCP server configuration has an unsafe MCP URL.') from None
 
 
-class MCPAuthRequiredError(ValueError):
+class MCPAuthRequiredError(HTTPException):
     """The saved MCP connection requires a user OAuth grant."""
 
-    def __init__(self, message: str, status_code: int = 401):
-        super().__init__(message)
-        self.status_code = status_code
+    def __init__(self, detail: str):
+        super().__init__(status_code=401, detail=detail)
 
 
 async def _require_erp_mcp_oauth_token(request, user, server_id: str) -> None:
@@ -297,7 +296,7 @@ async def connect_mcp_server(
     headers = {} if auth else await get_headers()
 
     if mcp_server_connection.get('auth_type') in ('oauth_2.1', 'oauth_2.1_static') and not headers.get('Authorization'):
-        raise MCPAuthRequiredError('MCP authorization is required.')
+        raise MCPAuthRequiredError('Auth required')
 
     client = MCPClient(
         event_caller=extra_params.get('__event_call__') if metadata.get('session_id') else None,

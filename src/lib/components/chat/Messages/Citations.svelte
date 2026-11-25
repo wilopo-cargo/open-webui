@@ -152,6 +152,9 @@
 				const existingSource = acc.find((item) => item.id === id);
 
 				if (existingSource) {
+					if (sourceUrl && !isValidHttpUrl(existingSource.source?.url ?? '')) {
+						existingSource.source = { ...existingSource.source, url: sourceUrl };
+					}
 					existingSource.document.push(document);
 					existingSource.metadata.push(metadata);
 					if (distance !== undefined) existingSource.distances.push(distance);

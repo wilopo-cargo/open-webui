@@ -983,7 +983,7 @@
 									{readOnly}
 								/>
 							{/if}
-							{#if message.oauthRecovery && !readOnly && (message.oauthRecovery.status === 'auth_needed' || message.oauthRecovery.status === 'connected')}
+							{#if message.oauthRecovery && !readOnly && !$temporaryChatEnabled && (message.oauthRecovery.status === 'auth_needed' || message.oauthRecovery.status === 'connected')}
 								<div class="mt-2 flex flex-wrap items-center gap-2 text-sm">
 									{#if message.oauthRecovery.status === 'auth_needed'}
 										<button

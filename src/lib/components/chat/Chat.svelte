@@ -131,7 +131,11 @@
 	import { uploadFile } from '$lib/apis/files';
 	import { createOpenAITextStream } from '$lib/apis/streaming';
 	import { getFunctions } from '$lib/apis/functions';
-	import { getOAuthClientAuthorizationUrl } from '$lib/apis/configs';
+	import {
+		getOAuthClientAuthorizationUrl,
+		initiateOAuthRedirect,
+		takePendingOAuthToolId
+	} from '$lib/apis/configs';
 
 	import Banner from '../common/Banner.svelte';
 	import MessageInput from '$lib/components/chat/MessageInput.svelte';
@@ -369,6 +373,18 @@
 	let pendingOAuthTools: { id: string; name: string; serverId: string; authType: string | null }[] =
 		[];
 
+	const restoreOAuthToolSelection = (chatId: string | null) => {
+		if (embedded) return;
+		const toolId = takePendingOAuthToolId($page.url, chatId);
+		if (
+			toolId &&
+			!selectedToolIds.includes(toolId) &&
+			$tools?.some((tool) => tool.id === toolId && tool.authenticated !== false)
+		) {
+			selectedToolIds = [...selectedToolIds, toolId];
+		}
+	};
+
 	const restoreOAuthRecovery = () => {
 		if (!isShared && !$temporaryChatEnabled) {
 			for (const message of Object.values(history.messages)) {
@@ -483,7 +499,10 @@
 				return;
 			}
 			selectedToolIds = [...new Set([...(recovery.toolIds ?? []), toolId])];
-			await sendMessage(history, recovery.parentId, { modelId: recovery.modelId });
+			await sendMessage(history, recovery.parentId, {
+				modelId: recovery.modelId,
+				modelIdx: message.modelIdx
+			});
 		} catch (error) {
 			if ($chatId === activeChatId && history.messages[messageId] === message) {
 				message.oauthRecovery = recovery;
@@ -3065,14 +3084,7 @@
 				.filter((id) => id && ($tools ?? []).find((t) => t.id === id));
 		}
 
-		// Restore tool selection after OAuth redirect
-		const pendingToolId = sessionStorage.getItem('pendingOAuthToolId');
-		if (pendingToolId) {
-			sessionStorage.removeItem('pendingOAuthToolId');
-			if (!selectedToolIds.includes(pendingToolId)) {
-				selectedToolIds = [...selectedToolIds, pendingToolId];
-			}
-		}
+		restoreOAuthToolSelection(null);
 
 		loading = false;
 		await tick();
@@ -3324,6 +3336,7 @@
 					if (signal.aborted) return;
 					await setDefaults(restored);
 					if (signal.aborted) return;
+					if ($chatId === id) restoreOAuthToolSelection(id);
 					restoreOAuthRecovery();
 					loading = false;
 					await tick();
@@ -5297,24 +5310,22 @@
 		},
 		draft = getChatInputDraft()
 	) => {
+		const id = $chatId;
+		const signal = chatLoadController.signal;
 		await tick();
+		if (signal.aborted || $chatId !== id) return;
 		saveSessionSelectedModels();
 		await saveDraft(draft, getDraftChatId(), false);
-		sessionStorage.setItem('pendingOAuthToolId', tool.id);
-		sessionStorage.setItem('oauthRedirectInProgressToolId', tool.id);
-		const authorizeUrl = new URL(
-			getOAuthClientAuthorizationUrl(tool.serverId, tool.authType ?? 'mcp'),
-			window.location.origin
-		);
-		if (
-			$chatId &&
+		if (signal.aborted || $chatId !== id) return;
+
+		const returnChatId =
+			id &&
 			!$temporaryChatEnabled &&
-			!isTemporaryChatId($chatId) &&
-			/^[A-Za-z0-9_-]+$/.test($chatId)
-		) {
-			authorizeUrl.searchParams.set('return_to', `/c/${$chatId}`);
-		}
-		window.location.assign(authorizeUrl.toString());
+			!isTemporaryChatId(id) &&
+			/^[A-Za-z0-9_-]+$/.test(id)
+				? id
+				: null;
+		initiateOAuthRedirect(tool, returnChatId);
 	};
 
 	const clearDraft = async (chatId: string | null = null) => {
