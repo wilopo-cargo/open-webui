@@ -303,7 +303,7 @@ from open_webui.utils.tool_approval import (
     build_tool_approval_resume_payload,
     resolve_tool_call_output,
 )
-from open_webui.utils.tools import set_terminal_servers, set_tool_servers
+from open_webui.utils.tools import _get_accessible_mcp_connection, set_terminal_servers, set_tool_servers
 
 if SAFE_MODE:
     print('SAFE MODE ENABLED')
@@ -2981,10 +2981,15 @@ async def oauth_client_authorize(
     request: Request,
     response: Response,
     user=Depends(get_verified_user),
+    return_to: str | None = None,
 ):
     # ensure_valid_client_registration
     if not ENABLE_TOOL_SERVERS:
         raise HTTPException(status_code=403, detail='Tool servers are disabled')
+    if client_id.startswith('mcp:'):
+        connection = await _get_accessible_mcp_connection(client_id.removeprefix('mcp:'), user)
+        if not connection or connection.get('auth_type') not in ('oauth_2.1', 'oauth_2.1_static'):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     client = await oauth_client_manager.get_client(client_id)
     client_info = await oauth_client_manager.get_client_info(client_id)
@@ -3018,7 +3023,12 @@ async def oauth_client_authorize(
                 detail='OAuth client registration is still invalid after re-registration',
             )
 
-    return await oauth_client_manager.handle_authorize(request, client_id=client_id, user_id=user.id)
+    authorization = await oauth_client_manager.handle_authorize(
+        request, client_id=client_id, user_id=user.id, return_to=return_to
+    )
+    if 'application/json' in request.headers.get('accept', '').lower():
+        return JSONResponse({'authorization_url': authorization.headers.get('location')})
+    return authorization
 
 
 @app.get('/oauth/clients/{client_id}/callback')

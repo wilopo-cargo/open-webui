@@ -1399,6 +1399,29 @@
 		};
 	});
 
+	onMount(() => {
+		const viewport = window.visualViewport;
+		if (!viewport) return;
+
+		const root = document.documentElement;
+		const update = () => {
+			// Safari may shrink only the visual viewport when the keyboard opens.
+			if (viewport.scale === 1) {
+				root.style.setProperty('--chat-viewport-bottom', `${viewport.height + viewport.offsetTop}px`);
+			} else {
+				root.style.removeProperty('--chat-viewport-bottom');
+			}
+		};
+		update();
+		viewport.addEventListener('resize', update);
+		viewport.addEventListener('scroll', update);
+		return () => {
+			viewport.removeEventListener('resize', update);
+			viewport.removeEventListener('scroll', update);
+			root.style.removeProperty('--chat-viewport-bottom');
+		};
+	});
+
 	$: if (typeof document !== 'undefined') {
 		document.documentElement.classList.toggle(
 			'high-contrast',

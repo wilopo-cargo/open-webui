@@ -58,6 +58,8 @@
 
 	export let onSelect = (e) => {};
 	export let onInsertToNote: ((content: string) => void) | null = null;
+	export let onOAuthAuthorize: (serverId: string, messageId: string) => void;
+	export let onOAuthRetry: (messageId: string) => void;
 
 	export let messagesCount: number | null = 8;
 	let messagesLoading = false;
@@ -568,6 +570,8 @@
 									{editCodeBlock}
 									{topPadding}
 									{onInsertToNote}
+									{onOAuthAuthorize}
+									{onOAuthRetry}
 									{shareMode}
 								/>
 							{/each}

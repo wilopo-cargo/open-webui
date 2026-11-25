@@ -73,6 +73,12 @@ class OAuthTokenAuth(httpx2.Auth):
                 yield request
 
 
+class MCPConnectionHTTPError(RuntimeError):
+    def __init__(self, status_code: int):
+        super().__init__(f'MCP connection returned HTTP {status_code}')
+        self.status_code = status_code
+
+
 class MCPClient:
     def __init__(self, event_caller=None, server_name=''):
         self.client: Optional[Client] = None
@@ -146,8 +152,16 @@ class MCPClient:
         httpx_client_factory=None,
     ) -> None:
         client_factory = httpx_client_factory if httpx_client_factory is not None else create_httpx_client
+        initialization_status = None
+
+        async def record_initialization_status(response):
+            nonlocal initialization_status
+            if not connected.done() and response.request.method == 'POST':
+                initialization_status = response.status_code
+
         try:
             async with client_factory(headers=headers, auth=auth) as http_client:
+                http_client.event_hooks['response'].append(record_initialization_status)
                 # mode='auto' (the default) probes server/discover for the stateless
                 # 2026-07-28 protocol and falls back to the initialize handshake on
                 # legacy servers. The read timeout bounds that handshake and every
@@ -165,6 +179,8 @@ class MCPClient:
         except Exception as e:
             if connected.done():
                 log.exception("Lost connection to MCP server '%s'", self.server_name)
+            elif initialization_status in (401, 403):
+                connected.set_exception(MCPConnectionHTTPError(initialization_status))
             else:
                 connected.set_exception(e)
         finally:

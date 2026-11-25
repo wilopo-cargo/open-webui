@@ -874,6 +874,12 @@ body {
 	color: #eee;
 }
 
+@media (pointer: coarse) {
+	#chat-container {
+		max-height: min(100dvh, var(--chat-viewport-bottom, 100dvh));
+	}
+}
+
 /* Position the handle relative to each LI */
 .pm-li--with-handle {
 	position: relative;

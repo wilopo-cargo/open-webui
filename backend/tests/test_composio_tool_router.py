@@ -84,6 +84,7 @@ def app_modules():
     from open_webui.routers import configs, tools
     from open_webui.utils import composio, composio_files, erp_mcp, middleware
     from open_webui.utils import tools as tool_utils
+    from open_webui.models.config import Config
     from open_webui.models.models import Model
     from open_webui.models.oauth_sessions import OAuthSession
 
@@ -98,6 +99,7 @@ def app_modules():
     try:
         # Migrations are disabled: the normal chat overlay reads these tables,
         # but this Composio fixture intentionally has no subscription accounts or presets.
+        Config.__table__.create(db.engine, checkfirst=True)
         OAuthSession.__table__.create(db.engine, checkfirst=True)
         Model.__table__.create(db.engine, checkfirst=True)
         yield SimpleNamespace(
@@ -3437,6 +3439,11 @@ async def test_mcp_httpx2_transport_negotiates_legacy_tools_and_blocks_cross_ori
 
         def do_POST(self):
             message = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            if self.path in ('/401', '/403'):
+                self.send_response(int(self.path[1:]))
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
             if self.path == '/redirect':
                 self.send_response(307)
                 self.send_header('Location', f'http://localhost:{self.server.server_port}/collect')
@@ -3519,6 +3526,10 @@ async def test_mcp_httpx2_transport_negotiates_legacy_tools_and_blocks_cross_ori
         with pytest.raises(Exception):
             await client.connect(f'{url}/redirect', headers=headers, auth=auth, httpx_client_factory=factory)
         assert redirected == []
+        for status in (401, 403):
+            with pytest.raises(mcp_client.MCPConnectionHTTPError) as failure:
+                await client.connect(f'{url}/{status}', headers=headers, auth=auth, httpx_client_factory=factory)
+            assert failure.value.status_code == status
     finally:
         await client.disconnect()
         server.shutdown()

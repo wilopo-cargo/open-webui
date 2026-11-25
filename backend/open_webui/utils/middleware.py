@@ -2827,6 +2827,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     client_key = tool_id if is_composio else server_id
                     await ensure_unique_tool_names([client_key], mcp_clients)
                     erp_connection = None
+                    native_connection = None
                     try:
                         if is_composio:
                             result = await connect_composio_server(request, server_id, user)
@@ -2844,6 +2845,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                                     extra_params,
                                 )
                     except Exception as e:
+                        recovery_status = None
                         if is_composio:
                             error_content = str(e)
                             if error_content not in _COMPOSIO_SAFE_ERRORS:
@@ -2852,6 +2854,26 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         else:
                             log.debug(e)
                             error_content = f"Failed to connect to MCP server '{server_id}'"
+                            auth_type = (native_connection or {}).get('auth_type')
+                            status_code = getattr(e, 'status_code', None) or getattr(
+                                getattr(e, 'response', None), 'status_code', None
+                            )
+                            if status_code == 403:
+                                recovery_status = 'denied'
+                                error_content = 'Access to this MCP connection was denied.'
+                            elif status_code == 401 and auth_type in ('oauth_2.1', 'oauth_2.1_static'):
+                                recovery_status = 'auth_needed'
+                            if event_emitter and recovery_status:
+                                await event_emitter(
+                                    {
+                                        'type': 'chat:tool:connection',
+                                        'data': {
+                                            'status': recovery_status,
+                                            'server_id': server_id,
+                                            'auth_type': 'mcp',
+                                        },
+                                    }
+                                )
                         if event_emitter:
                             await event_emitter(
                                 {
@@ -2861,6 +2883,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                                         'description': error_content,
                                         'error': True,
                                         'done': True,
+                                        **(
+                                            {'mcp_recovery': recovery_status, 'server_id': server_id}
+                                            if recovery_status
+                                            else {}
+                                        ),
                                     },
                                 }
                             )

@@ -28,6 +28,7 @@
 		models,
 		settings,
 		temporaryChatEnabled,
+		tools,
 		TTSWorker,
 		user,
 		visibleControls
@@ -103,6 +104,14 @@
 		};
 		done: boolean;
 		error?: boolean | { content: string };
+		oauthRecovery?: {
+			status: 'auth_needed' | 'denied' | 'connected' | 'failed';
+			serverId: string;
+			authType: 'mcp';
+			parentId?: string;
+			modelId?: string;
+			toolIds?: string[];
+		};
 		sources?: string[];
 		code_executions?: {
 			uuid: string;
@@ -183,6 +192,8 @@
 	export let forkHandler: Function | null = null;
 
 	export let addMessages: Function;
+	export let onOAuthAuthorize: (serverId: string, messageId: string) => void = () => {};
+	export let onOAuthRetry: (messageId: string) => void = () => {};
 	export let onToolCallResolved: Function = () => {};
 
 	export let isLastMessage = true;
@@ -972,9 +983,32 @@
 									{readOnly}
 								/>
 							{/if}
+							{#if message.oauthRecovery && !readOnly && (message.oauthRecovery.status === 'auth_needed' || message.oauthRecovery.status === 'connected')}
+								<div class="mt-2 flex flex-wrap items-center gap-2 text-sm">
+									{#if message.oauthRecovery.status === 'auth_needed'}
+										<button
+											class="rounded-full border border-gray-200 px-3 py-1.5 text-gray-700 transition hover:bg-gray-100 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800"
+											type="button"
+											on:click={() => onOAuthAuthorize(message.oauthRecovery.serverId, message.id)}
+										>
+											{$i18n.t('Connect')}
+											{$tools.find((tool) => tool.id === `server:mcp:${message.oauthRecovery.serverId}`)
+												?.name ?? message.oauthRecovery.serverId}
+										</button>
+									{:else if message.oauthRecovery.status === 'connected'}
+										<button
+											class="rounded-full border border-gray-200 px-3 py-1.5 text-gray-700 transition hover:bg-gray-100 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800"
+											type="button"
+											on:click={() => onOAuthRetry(message.id)}
+										>
+											{$i18n.t('Retry')}
+										</button>
+									{/if}
+								</div>
+							{/if}
 
-							{#if message.code_executions}
-								<CodeExecutions codeExecutions={message.code_executions} />
+							{#if message.code_executions || message.output}
+								<CodeExecutions codeExecutions={message.code_executions} output={message.output} />
 							{/if}
 						</div>
 					</div>
