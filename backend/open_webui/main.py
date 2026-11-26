@@ -2457,6 +2457,7 @@ async def get_app_config(request: Request):
         'code_execution.engine',
         'code_interpreter.engine',
         'audio.realtime.enabled',
+        'audio.realtime.provider',
         'audio.realtime.model',
         'audio.realtime.voice',
         'audio.tts.engine',
@@ -2594,6 +2595,7 @@ async def get_app_config(request: Request):
                 'audio': {
                     'realtime': {
                         'enabled': config.get('audio.realtime.enabled'),
+                        'provider': config.get('audio.realtime.provider'),
                         'model': config.get('audio.realtime.model'),
                         'voice': config.get('audio.realtime.voice'),
                     },

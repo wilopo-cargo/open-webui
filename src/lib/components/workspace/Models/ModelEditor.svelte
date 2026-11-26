@@ -1790,7 +1790,8 @@
 												'Configure the realtime voice, voice avatar, and text-to-speech voice for this model.'
 											)}
 											summary={[
-												$config?.audio?.realtime?.enabled
+												$config?.audio?.realtime?.enabled &&
+												$config.audio.realtime.provider !== 'openai_subscription'
 													? voice.voice || $i18n.t('Admin default')
 													: null,
 												voiceAvatar
@@ -1803,7 +1804,7 @@
 												.filter(Boolean)
 												.join(' · ') || $i18n.t('Default')}
 										>
-											{#if $config?.audio?.realtime?.enabled}
+											{#if $config?.audio?.realtime?.enabled && $config.audio.realtime.provider !== 'openai_subscription'}
 												<div
 													class="grid min-h-8 grid-cols-[7rem_minmax(0,1fr)] items-center gap-2 px-1 text-xs sm:grid-cols-[8rem_minmax(0,1fr)]"
 												>

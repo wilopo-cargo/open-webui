@@ -2493,13 +2493,18 @@
 					selectedModelIds.length === 1
 						? $models.find((model) => model.id === selectedModelIds[0])
 						: null;
+				const realtime = $config?.audio?.realtime;
 				return {
 					chatId: isTemporaryChatId($chatId) ? undefined : $chatId || undefined,
 					modelId: model && !('direct' in model && model.direct) ? model.id : '',
 					terminalId: $selectedTerminalId || undefined,
-					voiceModel: $config?.audio?.realtime?.model,
-					voice: model?.info?.meta?.voice?.voice || $config?.audio?.realtime?.voice,
-					messages: createMessagesList(history, history.currentId).map((message) => {
+					provider: realtime?.provider,
+					voiceModel: realtime?.model,
+					voice:
+						realtime?.provider === 'openai_subscription'
+							? realtime.voice
+							: model?.info?.meta?.voice?.voice || realtime?.voice,
+					messages: () => createMessagesList(history, history.currentId).map((message) => {
 						const voice = message.meta?.voice;
 						const spoken = voice && message.model === voice.model && !message.output?.length;
 						const state = getBridgeTurnState(message);
@@ -2518,7 +2523,17 @@
 							if (speech)
 								content += `\n[Historical voice transcript, not current task status]\n${speech}`;
 						}
-						return { role: message.role, content };
+						return {
+							id: message.id,
+							role: message.role,
+							content,
+							completed: message.role !== 'assistant' || state === 'completed',
+							voiceCallId:
+								voice?.call_id ??
+								(message.role === 'assistant'
+									? history.messages[message.parentId]?.meta?.voice?.call_id
+									: undefined)
+						};
 					})
 				};
 			},
@@ -4068,24 +4083,24 @@
 			selectedModels = _selectedModels;
 		}
 
-		if (String(userPrompt).trim() === '/compact') {
+		// Voice transcripts are prompts, not commands for the composer.
+		const command = _raw ? '' : String(userPrompt).trim();
+		if (command === '/compact') {
 			clearCommandInput();
 			await handleManualCompact();
 			return { status: 'rejected' };
 		}
-		if (String(userPrompt).trim() === '/status') {
+		if (command === '/status') {
 			clearCommandInput();
 			handleStatusCommand();
 			return { status: 'rejected' };
 		}
-		if (String(userPrompt).trim() === '/comments') {
+		if (command === '/comments') {
 			clearCommandInput();
 			messageInput?.openComments();
 			return { status: 'rejected' };
 		}
-		const sideCommand = String(userPrompt)
-			.trim()
-			.match(/^\/(?:side|btw)(?:\s+([\s\S]*))?$/i);
+		const sideCommand = command.match(/^\/(?:side|btw)(?:\s+([\s\S]*))?$/i);
 		if (sideCommand && !sideChatAllowed) {
 			toast.error($i18n.t('You do not have permission to use side chat.'));
 			return { status: 'rejected' };
@@ -4100,14 +4115,12 @@
 			showTabs.set('side');
 			return { status: 'rejected' };
 		}
-		if (String(userPrompt).trim() === '/fork') {
+		if (command === '/fork') {
 			clearCommandInput();
 			await handleForkChat();
 			return { status: 'rejected' };
 		}
-		const modelCommandMatch = String(userPrompt)
-			.trim()
-			.match(/^\/model(?:\s+([\s\S]+))?$/);
+		const modelCommandMatch = command.match(/^\/model(?:\s+([\s\S]+))?$/);
 		if (modelCommandMatch) {
 			handleModelCommand(modelCommandMatch[1]?.trim() ?? '');
 			return { status: 'rejected' };

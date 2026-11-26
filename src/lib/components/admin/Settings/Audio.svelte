@@ -152,12 +152,13 @@
 	};
 
 	const updateConfigHandler = async () => {
+		const subscription = realtime.PROVIDER === 'openai_subscription';
 		let openaiParams = {};
 		let realtimeInputParams: Record<string, unknown> | null = null;
 		try {
 			openaiParams = TTS_OPENAI_PARAMS ? JSON.parse(TTS_OPENAI_PARAMS) : {};
 			TTS_OPENAI_PARAMS = JSON.stringify(openaiParams, null, 2);
-			if (REALTIME_INPUT_PARAMS.trim()) {
+			if (!subscription && REALTIME_INPUT_PARAMS.trim()) {
 				realtimeInputParams = JSON.parse(REALTIME_INPUT_PARAMS);
 				if (
 					!realtimeInputParams ||
@@ -167,9 +168,10 @@
 					throw new Error('Input parameters must be a JSON object');
 				}
 			}
-			REALTIME_INPUT_PARAMS = realtimeInputParams
-				? JSON.stringify(realtimeInputParams, null, 2)
-				: '';
+			if (!subscription)
+				REALTIME_INPUT_PARAMS = realtimeInputParams
+					? JSON.stringify(realtimeInputParams, null, 2)
+					: '';
 		} catch {
 			toast.error($i18n.t('Invalid JSON format for Parameters'));
 			return;
@@ -177,8 +179,9 @@
 
 		const res = await updateAudioConfig(localStorage.token, {
 			realtime: {
-				...realtime,
-				INPUT_PARAMS: realtimeInputParams,
+				...(subscription ? {} : { ...realtime, INPUT_PARAMS: realtimeInputParams }),
+				ENABLED: realtime.ENABLED,
+				PROVIDER: realtime.PROVIDER,
 				REALTIME_CALL_PROMPT_TEMPLATE: (realtime.REALTIME_CALL_PROMPT_TEMPLATE ?? '').trim() || null
 			},
 			tts: {
@@ -234,7 +237,6 @@
 		const res = await getAudioConfig(localStorage.token);
 
 		if (res) {
-			console.log(res);
 			TTS_OPENAI_API_BASE_URL = res.tts.OPENAI_API_BASE_URL;
 			TTS_OPENAI_API_KEY = res.tts.OPENAI_API_KEY;
 			TTS_OPENAI_PARAMS = JSON.stringify(res?.tts?.OPENAI_PARAMS ?? '', null, 2);
@@ -316,99 +318,106 @@
 					<SettingsSelect
 						bind:value={realtime.PROVIDER}
 						ariaLabel={$i18n.t('Provider')}
-						on:change={() => (realtime.AUTH_TYPE = 'api_key')}
+						on:change={() => {
+							if (realtime.PROVIDER === 'openai') realtime.AUTH_TYPE = 'api_key';
+						}}
 					>
 						<option value="openai">{$i18n.t('settings.audio.realtime.openai')}</option>
+						<option value="openai_subscription">{$i18n.t('settings.audio.realtime.subscription')}</option>
 						<option value="azure">{$i18n.t('Azure OpenAI')}</option>
 					</SettingsSelect>
 				</AdminSettingRow>
-				{#if realtime.PROVIDER === 'azure'}
-					<AdminSettingRow
-						label={$i18n.t('Authentication')}
-						description={realtime.AUTH_TYPE === 'microsoft_entra_id'
-							? $i18n.t('settings.audio.realtime.entraHelp')
-							: ''}
-					>
-						<SettingsSelect bind:value={realtime.AUTH_TYPE} ariaLabel={$i18n.t('Authentication')}>
-							<option value="api_key">{$i18n.t('API Key')}</option>
-							<option value="microsoft_entra_id">{$i18n.t('settings.audio.realtime.entra')}</option>
-						</SettingsSelect>
-					</AdminSettingRow>
-				{/if}
-				<div class="grid grid-cols-1 gap-2" class:sm:grid-cols-2={realtime.AUTH_TYPE === 'api_key'}>
-					<AdminSettingField
-						label={$i18n.t(
-							realtime.PROVIDER === 'azure' ? 'settings.audio.realtime.azureUrl' : 'API Base URL'
-						)}
-						description={realtime.PROVIDER === 'azure'
-							? $i18n.t('settings.audio.realtime.azureUrlHelp')
-							: ''}
-						forId="realtime-api-base-url"
-					>
-						<input
-							id="realtime-api-base-url"
-							class={inputClass}
-							bind:value={realtime.OPENAI_API_BASE_URL}
-						/>
-					</AdminSettingField>
-					{#if realtime.AUTH_TYPE === 'api_key'}
-						<AdminSettingField label={$i18n.t('API Key')}>
-							<SensitiveInput
-								variant="settings"
-								placeholder={$i18n.t('API Key')}
-								bind:value={realtime.OPENAI_API_KEY}
+				{#if realtime.PROVIDER === 'openai_subscription'}
+					<p class="text-fg-tertiary text-xs">{$i18n.t('settings.audio.realtime.subscriptionHelp')}</p>
+				{:else}
+					{#if realtime.PROVIDER === 'azure'}
+						<AdminSettingRow
+							label={$i18n.t('Authentication')}
+							description={realtime.AUTH_TYPE === 'microsoft_entra_id'
+								? $i18n.t('settings.audio.realtime.entraHelp')
+								: ''}
+						>
+							<SettingsSelect bind:value={realtime.AUTH_TYPE} ariaLabel={$i18n.t('Authentication')}>
+								<option value="api_key">{$i18n.t('API Key')}</option>
+								<option value="microsoft_entra_id">{$i18n.t('settings.audio.realtime.entra')}</option>
+							</SettingsSelect>
+						</AdminSettingRow>
+					{/if}
+					<div class="grid grid-cols-1 gap-2" class:sm:grid-cols-2={realtime.AUTH_TYPE === 'api_key'}>
+						<AdminSettingField
+							label={$i18n.t(
+								realtime.PROVIDER === 'azure' ? 'settings.audio.realtime.azureUrl' : 'API Base URL'
+							)}
+							description={realtime.PROVIDER === 'azure'
+								? $i18n.t('settings.audio.realtime.azureUrlHelp')
+								: ''}
+							forId="realtime-api-base-url"
+						>
+							<input
+								id="realtime-api-base-url"
+								class={inputClass}
+								bind:value={realtime.OPENAI_API_BASE_URL}
 							/>
 						</AdminSettingField>
-					{/if}
-				</div>
-				<div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+						{#if realtime.AUTH_TYPE === 'api_key'}
+							<AdminSettingField label={$i18n.t('API Key')}>
+								<SensitiveInput
+									variant="settings"
+									placeholder={$i18n.t('API Key')}
+									bind:value={realtime.OPENAI_API_KEY}
+								/>
+							</AdminSettingField>
+						{/if}
+					</div>
+					<div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+						<AdminSettingField
+							label={$i18n.t(
+								realtime.PROVIDER === 'azure' ? 'settings.audio.realtime.deployment' : 'Voice Model'
+							)}
+							description={realtime.PROVIDER === 'azure'
+								? $i18n.t('settings.audio.realtime.deploymentHelp')
+								: ''}
+							forId="realtime-model"
+						>
+							<input
+								id="realtime-model"
+								class={inputClass}
+								bind:value={realtime.MODEL}
+								placeholder="gpt-realtime-2.1-mini"
+							/>
+						</AdminSettingField>
+						<AdminSettingField label={$i18n.t('Voice')} forId="realtime-call-voice">
+							<input
+								id="realtime-call-voice"
+								class={inputClass}
+								bind:value={realtime.VOICE}
+								placeholder="marin"
+							/>
+						</AdminSettingField>
+					</div>
 					<AdminSettingField
-						label={$i18n.t(
-							realtime.PROVIDER === 'azure' ? 'settings.audio.realtime.deployment' : 'Voice Model'
-						)}
-						description={realtime.PROVIDER === 'azure'
-							? $i18n.t('settings.audio.realtime.deploymentHelp')
-							: ''}
-						forId="realtime-model"
+						label={$i18n.t('Input Transcription Model')}
+						forId="realtime-transcription-model"
 					>
 						<input
-							id="realtime-model"
+							id="realtime-transcription-model"
 							class={inputClass}
-							bind:value={realtime.MODEL}
-							placeholder="gpt-realtime-2.1-mini"
+							bind:value={realtime.TRANSCRIPTION_MODEL}
 						/>
 					</AdminSettingField>
-					<AdminSettingField label={$i18n.t('Voice')} forId="realtime-call-voice">
-						<input
-							id="realtime-call-voice"
-							class={inputClass}
-							bind:value={realtime.VOICE}
-							placeholder="marin"
+					<AdminSettingField
+						label={$i18n.t('settings.audio.realtime.inputParams')}
+						description={$i18n.t('settings.audio.realtime.inputParamsHelp')}
+						forId="realtime-input-params"
+					>
+						<Textarea
+							id="realtime-input-params"
+							className={textareaClass}
+							bind:value={REALTIME_INPUT_PARAMS}
+							placeholder={$i18n.t('Enter additional parameters in JSON format')}
 						/>
 					</AdminSettingField>
-				</div>
-				<AdminSettingField
-					label={$i18n.t('Input Transcription Model')}
-					forId="realtime-transcription-model"
-				>
-					<input
-						id="realtime-transcription-model"
-						class={inputClass}
-						bind:value={realtime.TRANSCRIPTION_MODEL}
-					/>
-				</AdminSettingField>
-				<AdminSettingField
-					label={$i18n.t('settings.audio.realtime.inputParams')}
-					description={$i18n.t('settings.audio.realtime.inputParamsHelp')}
-					forId="realtime-input-params"
-				>
-					<Textarea
-						id="realtime-input-params"
-						className={textareaClass}
-						bind:value={REALTIME_INPUT_PARAMS}
-						placeholder={$i18n.t('Enter additional parameters in JSON format')}
-					/>
-				</AdminSettingField>
+				{/if}
 				<AdminSettingField label={$i18n.t('Prompt Template')} forId="realtime-prompt-template">
 					<Textarea
 						id="realtime-prompt-template"

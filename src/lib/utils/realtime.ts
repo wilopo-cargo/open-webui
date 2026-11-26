@@ -1,5 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { AUDIO_API_BASE_URL } from '$lib/constants';
+import { SubscriptionMedia } from './realtime-subscription-media';
 
 export type BridgeSubmission = {
 	status: 'submitted' | 'deferred' | 'rejected';
@@ -9,14 +10,62 @@ export type BridgeSubmission = {
 	taskIds?: string[];
 };
 
+type ContextMessage = {
+	id: string;
+	role: string;
+	content: string;
+	completed: boolean;
+	voiceCallId?: string;
+};
 type CallContext = {
 	chatId?: string;
 	modelId: string;
 	terminalId?: string;
+	provider?: string;
 	voiceModel?: string;
 	voice?: string;
-	messages: { role: string; content: string }[];
+	messages: () => ContextMessage[];
 };
+type SubscriptionTranscript = {
+	draft: string;
+	lastFinal?: string;
+	inputId?: string;
+	interrupted?: boolean;
+};
+type SubscriptionState = {
+	media: SubscriptionMedia;
+	hasAnswer: boolean;
+	serverReady: boolean;
+	events: Set<string>;
+	contextIds: Set<string>;
+	user: SubscriptionTranscript;
+	assistant: SubscriptionTranscript;
+	waiting?: { callId: string; timer: ReturnType<typeof setTimeout> };
+};
+type SubscriptionEvent = {
+	type: string;
+	event_id?: unknown;
+	item?: { id?: unknown; type?: unknown; target?: unknown; text?: unknown; content?: unknown };
+	turn?: { id?: unknown; role?: unknown; transcript?: unknown };
+};
+type VoiceSpeech = {
+	id: string;
+	metadata?: { input_item_id?: string; call_id?: string; status?: string };
+	statusCallId?: string;
+	delegated?: boolean;
+	speech: Map<string, string>;
+	messageId?: string;
+};
+
+const callConfiguration = (context: CallContext) =>
+	JSON.stringify([
+		context.provider,
+		context.modelId,
+		context.terminalId,
+		context.voiceModel,
+		context.voice
+	]);
+
 type VoiceTurn = {
 	callId: string;
 	inputId: string;
@@ -30,7 +79,10 @@ type VoiceTurn = {
 type Options = {
 	context: () => CallContext;
 	addMessage: (role: string, text: string, voice: any, parentId?: string) => Promise<string>;
-	submit: (text: string, options: any) => Promise<BridgeSubmission>;
+	submit: (
+		text: string,
+		options: { _raw: boolean; bridge: { userMessageId: string; modelId: string } }
+	) => Promise<BridgeSubmission>;
 	stop: (messageId: string) => Promise<void>;
 	message: (messageId: string) => any;
 	visibleText: (message: any) => string;
@@ -86,6 +138,7 @@ export class RealtimeCall {
 	animationInterruption = 0;
 	private animationCalls = new Set<string>();
 	private ws?: WebSocket;
+	private subscription?: SubscriptionState;
 	private context?: AudioContext;
 	private stream?: MediaStream;
 	private source?: MediaStreamAudioSourceNode;
@@ -128,20 +181,38 @@ export class RealtimeCall {
 		try {
 			const context = this.options.context();
 			this.token = token;
-			this.configuration = JSON.stringify([
-				context.modelId,
-				context.terminalId,
-				context.voiceModel,
-				context.voice
-			]);
+			this.configuration = callConfiguration(context);
 			if (!context.modelId) throw new Error('Select one chat model or agent.');
-			this.context = new AudioContext({ sampleRate: 24000 });
-			if (this.context.sampleRate !== 24000 || !this.context.audioWorklet) {
-				throw new Error(
-					'This browser cannot use 24 kHz AudioWorklet audio. Use Standard call mode.'
-				);
+			if (context.provider === 'openai_subscription') {
+				this.subscription = {
+					media: new SubscriptionMedia({
+						ready: () => {
+							if (session === this.session) this.ready();
+						},
+						levels: (input, output, playing) => {
+							if (session === this.session) this.subscriptionLevels(input, output, playing);
+						},
+						error: (message) => {
+							if (session === this.session) this.fail(message);
+						}
+					}),
+					hasAnswer: false,
+					serverReady: false,
+					events: new Set(),
+					contextIds: new Set(),
+					user: { draft: '' },
+					assistant: { draft: '' }
+				};
+			} else {
+				this.context = new AudioContext({ sampleRate: 24000 });
+				if (this.context.sampleRate !== 24000 || !this.context.audioWorklet) {
+					throw new Error(
+						'This browser cannot use 24 kHz AudioWorklet audio. Use Standard call mode.'
+					);
+				}
+				await this.context.resume();
+				if (session !== this.session) return;
 			}
-			await this.context.resume();
 			const stream = await navigator.mediaDevices.getUserMedia({
 				audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
 			});
@@ -150,22 +221,34 @@ export class RealtimeCall {
 				return;
 			}
 			this.stream = stream;
-			await this.context.audioWorklet.addModule(new URL('./realtime-audio.js', import.meta.url));
-			if (session !== this.session) return;
-			this.audio = new AudioWorkletNode(this.context, 'realtime-audio', {
-				outputChannelCount: [1]
-			});
-			this.source = this.context.createMediaStreamSource(stream);
-			this.source.connect(this.audio);
-			this.audio.connect(this.context.destination);
-			this.audio.port.onmessage = ({ data }) => this.audioEvent(data);
+			const media = this.subscription?.media;
+			let sdp: string | undefined;
+			if (media) {
+				sdp = await media.offer(stream);
+				if (session !== this.session) return;
+				if (!sdp) throw new Error('Could not create a voice media offer.');
+			} else {
+				const audioContext = this.context!;
+				await audioContext.audioWorklet.addModule(
+					new URL('./realtime-audio.js', import.meta.url)
+				);
+				if (session !== this.session) return;
+				this.audio = new AudioWorkletNode(audioContext, 'realtime-audio', {
+					outputChannelCount: [1]
+				});
+				this.source = audioContext.createMediaStreamSource(stream);
+				this.source.connect(this.audio);
+				this.audio.connect(audioContext.destination);
+				this.audio.port.onmessage = ({ data }) => this.audioEvent(data);
+			}
 			const url = new URL(`${AUDIO_API_BASE_URL}/realtime`, location.href);
 			url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
 			const ws = new WebSocket(url);
 			this.ws = ws;
 			const started = Date.now();
 			this.lastPong = started;
-			ws.onopen = () =>
+			ws.onopen = () => {
+				if (session !== this.session) return;
 				this.send({
 					type: 'auth',
 					token,
@@ -173,6 +256,8 @@ export class RealtimeCall {
 					model_id: context.modelId,
 					terminal_id: context.terminalId
 				});
+				if (sdp) this.send({ type: 'subscription.offer', sdp });
+			};
 			ws.onmessage = ({ data }) => {
 				if (session !== this.session) return;
 				try {
@@ -181,7 +266,9 @@ export class RealtimeCall {
 					this.fail('Invalid voice event. The call has ended.');
 				}
 			};
-			ws.onerror = () => this.fail('Voice connection failed.');
+			ws.onerror = () => {
+				if (session === this.session) this.fail('Voice connection failed.');
+			};
 			ws.onclose = () => {
 				if (session === this.session) this.fail('Voice connection closed.');
 			};
@@ -197,6 +284,40 @@ export class RealtimeCall {
 			if (session === this.session)
 				this.fail(error instanceof Error ? error.message : 'Could not start microphone.');
 		}
+	}
+
+	private ready() {
+		const subscription = this.subscription;
+		if (
+			this.connected ||
+			(subscription && (!subscription.serverReady || !subscription.media.connected))
+		)
+			return;
+		this.connected = true;
+		this.connecting = false;
+		this.lastPong = Date.now();
+		this.syncContext();
+		if (subscription) {
+			this.stream?.getAudioTracks().forEach((track) => (track.enabled = !this.muted));
+			subscription.media.startMeters();
+		} else this.audio?.port.postMessage({ type: 'capture', enabled: !this.muted });
+		this.options.change();
+	}
+
+	private subscriptionLevels(input: number, output: number, playing: boolean) {
+		const userSpeaking = !this.muted && input > 0.015;
+		if (
+			this.speaking === playing &&
+			this.userSpeaking === userSpeaking &&
+			Math.abs(this.inputLevel - input) <= 0.002 &&
+			Math.abs(this.outputLevel - output) <= 0.002
+		)
+			return;
+		this.speaking = this.playbackActive = playing;
+		this.userSpeaking = userSpeaking;
+		this.inputLevel = input;
+		this.outputLevel = output;
+		this.options.change();
 	}
 
 	private send(event: any) {
@@ -304,6 +425,7 @@ export class RealtimeCall {
 		if (
 			!this.connected ||
 			this.receivingSpeech ||
+			(this.subscription && (this.userSpeaking || this.subscription.waiting)) ||
 			this.savingHistory ||
 			this.working ||
 			this.speaking ||
@@ -313,10 +435,7 @@ export class RealtimeCall {
 		)
 			return;
 		const context = this.options.context();
-		if (
-			this.configuration !==
-			JSON.stringify([context.modelId, context.terminalId, context.voiceModel, context.voice])
-		) {
+		if (this.configuration !== callConfiguration(context)) {
 			const token = this.token;
 			this.end();
 			void this.connect(token);
@@ -325,11 +444,24 @@ export class RealtimeCall {
 
 	private syncContext() {
 		if (!this.connected) return;
-		// Replace the bounded snapshot, so streaming answers and task status cannot go stale.
+		const subscription = this.subscription;
+		// Codex only accepts appends. PCM replaces its bounded snapshot as the chat changes.
 		let budget = 64000;
 		const messages = this.options
 			.context()
-			.messages.slice(-100)
+			.messages()
+			.slice(-100)
+			.filter((message) => {
+				if (!subscription) return true;
+				if (
+					!message.completed ||
+					message.voiceCallId === this.callId ||
+					subscription.contextIds.has(message.id)
+				)
+					return false;
+				subscription.contextIds.add(message.id);
+				return true;
+			})
 			.reverse()
 			.flatMap((message) => {
 				if (!['user', 'assistant'].includes(message.role) || budget <= 0) return [];
@@ -338,6 +470,17 @@ export class RealtimeCall {
 				return content ? [{ role: message.role, content }] : [];
 			})
 			.reverse();
+		if (subscription) {
+			if (messages.length)
+				this.send({
+					type: 'subscription.context',
+					text: messages
+						.map(({ role, content }) => `${role}: ${content}`)
+						.join('\n')
+						.replace(/[\uD800-\uDFFF]/gu, '\uFFFD')
+				});
+			return;
+		}
 		const snapshot = JSON.stringify(messages);
 		if (snapshot === this.chatContext) return;
 		this.chatContext = snapshot;
@@ -355,15 +498,30 @@ export class RealtimeCall {
 			this.lastPong = Date.now();
 			return;
 		}
+		const subscription = this.subscription;
+		if (type === 'subscription.answer' && subscription) {
+			if (subscription.hasAnswer) return;
+			if (typeof event.sdp !== 'string' || !event.sdp.trim())
+				throw new Error('Missing voice media answer');
+			subscription.hasAnswer = true;
+			void subscription.media.accept(event.sdp).catch(() => {
+				if (this.subscription === subscription) this.fail('Could not apply the voice media answer.');
+			});
+			return;
+		}
 		if (type === 'bridge.ready') {
-			if (event.sample_rate !== 24000) throw new Error('Wrong sample rate');
+			if (!subscription && event.sample_rate !== 24000) throw new Error('Wrong sample rate');
 			this.model = event.model;
 			this.voice = event.voice;
-			this.connected = true;
-			this.connecting = false;
-			this.syncContext();
-			this.audio?.port.postMessage({ type: 'capture', enabled: !this.muted });
-		} else if (type === 'input_audio_buffer.speech_started') {
+			if (subscription) subscription.serverReady = true;
+			this.ready();
+			return;
+		}
+		if (subscription) {
+			this.subscriptionEvent(subscription, event);
+			return;
+		}
+		if (type === 'input_audio_buffer.speech_started') {
 			if (this.muted) return;
 			this.receivingSpeech = event.item_id;
 			this.userSpeaking = !this.muted;
@@ -393,26 +551,7 @@ export class RealtimeCall {
 				this.flush();
 				return;
 			}
-			const session = this.session;
-			const modelId = this.options.context().modelId;
-			this.savingHistory++;
-			const userId = this.recording.then(() => {
-				if (session !== this.session) return '';
-				return this.options.addMessage('user', text, {
-					call_id: this.callId,
-					input_item_id: event.item_id,
-					model: this.model
-				});
-			});
-			this.recording = userId.then(() => undefined);
-			this.inputs.set(event.item_id, { text, userId, modelId });
-			userId
-				.finally(() => this.savingHistory--)
-				.then(() => {
-					if (session === this.session)
-						this.enqueue({ type: 'bridge.respond', item_id: event.item_id });
-				})
-				.catch(() => this.fail('Could not save the spoken message.'));
+			this.recordInput(event.item_id, text, true);
 		} else if (type === 'response.created') {
 			this.responseRequested = false;
 			this.activeResponse = event.response.id;
@@ -499,69 +638,7 @@ export class RealtimeCall {
 			const args = JSON.parse(event.item.arguments);
 			if (typeof args.request !== 'string' || !args.request.trim())
 				throw new Error('Invalid function arguments');
-			const inputId = response.metadata?.input_item_id;
-			const input = this.inputs.get(inputId);
-			if (!input) throw new Error('Function has no transcribed input');
-			response.delegated = true;
-			if ([...this.calls.values()].some((call) => call.inputId === inputId)) {
-				this.send({
-					type: 'bridge.result',
-					call_id: event.item.call_id,
-					status: 'cancelled',
-					answer: 'This input has already been delegated.'
-				});
-				return;
-			}
-			const turn: VoiceTurn = {
-				callId: event.item.call_id,
-				inputId,
-				userId: '',
-				modelId: input.modelId,
-				finished: false,
-				approval: false
-			};
-			this.calls.set(turn.callId, turn);
-			// A replacement delegation suppresses any old result still waiting to be spoken.
-			this.commands = this.commands.filter((command) => !command.call_id);
-			const session = this.session;
-			this.delegation = this.delegation
-				.then(async () => {
-					if (session !== this.session) return;
-					if (this.pending && !this.pending.finished && this.pending.assistantId) {
-						const previous = this.pending;
-						previous.finished = true;
-						await this.options.stop(previous.assistantId!);
-						this.result(previous, 'cancelled', 'Superseded by a new request.', false);
-						await this.options.saveVoice(previous.assistantId!, { superseded: true });
-					}
-					turn.userId = await input.userId;
-					// The next model request must include the previous spoken reply in DB history.
-					await this.metadata;
-					if (session !== this.session) return;
-					this.pending = turn;
-					this.working = true;
-					this.options.change();
-					const result = await this.options.submit(input.text, {
-						_raw: true,
-						bridge: { userMessageId: turn.userId, modelId: turn.modelId }
-					});
-					if (session !== this.session) return;
-					if (result?.status !== 'submitted' || !result.assistantMessageId) {
-						this.result(
-							turn,
-							result?.status === 'deferred' ? 'deferred' : 'failed',
-							'Complete the required steps in chat and try again.'
-						);
-						return;
-					}
-					turn.assistantId = result.assistantMessageId;
-					turn.taskIds = result.taskIds;
-					this.saveSpeech(response);
-					this.update();
-				})
-				.catch(() =>
-					this.fail('Could not submit or stop the selected chat model. Review the request in chat.')
-				);
+			this.delegate(event.item.call_id, response.metadata?.input_item_id, response);
 		} else if (type === 'response.done') {
 			if (this.activeResponse === event.response.id) this.activeResponse = '';
 			this.responseRequested = false;
@@ -591,6 +668,195 @@ export class RealtimeCall {
 		this.options.change();
 	}
 
+	private subscriptionEvent(subscription: SubscriptionState, event: SubscriptionEvent) {
+		if (!this.connected) return;
+		const { user, assistant } = subscription;
+		const { type, item, turn } = event;
+		const rawId = (type === 'turn.done' ? turn?.id : item?.id) ?? event.event_id;
+		const id = typeof rawId === 'string' && rawId ? rawId : undefined;
+		if (id) {
+			const key = `${type}:${type === 'turn.done' ? turn?.role : ''}:${id}`;
+			if (subscription.events.has(key)) return;
+			subscription.events.add(key);
+		}
+
+		if (type === 'input_transcript.added' || type === 'output_transcript.added') {
+			const text = item?.text;
+			if (typeof text !== 'string' || !text) return;
+			const transcript = type === 'input_transcript.added' ? user : assistant;
+			if (!transcript.draft) transcript.inputId = transcript === user ? undefined : user.inputId;
+			if (text.startsWith(transcript.draft)) transcript.draft = text;
+			else if (!transcript.draft.endsWith(text)) transcript.draft += text;
+			return;
+		}
+
+		if (type === 'turn.done') {
+			const role = turn?.role;
+			if (!turn || (role !== 'user' && role !== 'assistant') || typeof turn.transcript !== 'string')
+				return;
+			const transcript = role === 'user' ? user : assistant;
+			const text = turn.transcript.trim() || (role === 'assistant' ? transcript.draft.trim() : '');
+			if (!id && !transcript.draft && transcript.lastFinal === text) return;
+			transcript.draft = '';
+			transcript.lastFinal = text;
+			if (role === 'assistant') {
+				if (text) this.saveSubscriptionSpeech(subscription, text, id);
+				assistant.inputId = undefined;
+				assistant.interrupted = false;
+				return;
+			}
+
+			const { waiting } = subscription;
+			subscription.waiting = undefined;
+			clearTimeout(waiting?.timer);
+			user.inputId = text ? (id ?? uuidv4()) : undefined;
+			if (user.inputId) {
+				this.recordInput(user.inputId, text);
+				if (waiting) this.delegate(waiting.callId, user.inputId);
+			} else if (waiting) this.noSubscriptionInput(waiting.callId);
+			return;
+		}
+
+		if (
+			type !== 'delegation.created' ||
+			item?.type !== 'delegation' ||
+			item.target !== 'client' ||
+			typeof item.id !== 'string' ||
+			!item.id ||
+			!Array.isArray(item.content)
+		)
+			return;
+		// The provider may request delegation before transcription finishes. Never use its request text.
+		if (user.inputId) this.delegate(item.id, user.inputId);
+		else if (subscription.waiting) this.noSubscriptionInput(item.id);
+		else {
+			const callId = item.id;
+			subscription.waiting = {
+				callId,
+				timer: setTimeout(() => {
+					if (this.subscription !== subscription) return;
+					subscription.waiting = undefined;
+					this.noSubscriptionInput(callId);
+				}, 5000)
+			};
+		}
+	}
+
+	private noSubscriptionInput(callId: string) {
+		this.send({
+			type: 'subscription.result',
+			call_id: callId,
+			text: 'No complete spoken request was received. Ask the user to repeat it.'
+		});
+	}
+
+	private saveSubscriptionSpeech(subscription: SubscriptionState, text: string, id?: string) {
+		const itemId = id || uuidv4();
+		if (subscription.assistant.interrupted) this.interrupted.add(itemId);
+		this.saveSpeech({
+			id: itemId,
+			metadata: { input_item_id: subscription.assistant.inputId ?? subscription.user.inputId },
+			speech: new Map([[itemId, text]])
+		});
+	}
+
+	private recordInput(inputId: string, text: string, respond = false) {
+		const session = this.session;
+		const modelId = this.options.context().modelId;
+		this.savingHistory++;
+		const userId = this.recording.then(() => {
+			if (session !== this.session) return '';
+			return this.options.addMessage('user', text, {
+				call_id: this.callId,
+				input_item_id: inputId,
+				model: this.model
+			});
+		});
+		this.inputs.set(inputId, { text, userId, modelId });
+		this.recording = userId.then(
+			() => {
+				if (session !== this.session) return;
+				this.savingHistory--;
+				if (respond) this.enqueue({ type: 'bridge.respond', item_id: inputId });
+			},
+			() => {
+				if (session === this.session) this.fail('Could not save the spoken message.');
+			}
+		);
+	}
+
+	private delegate(callId: string, inputId: string, response?: VoiceSpeech) {
+		if (this.calls.has(callId)) return;
+		const input = this.inputs.get(inputId);
+		if (!input) throw new Error('Function has no transcribed input');
+		if (response) response.delegated = true;
+		if ([...this.calls.values()].some((call) => call.inputId === inputId)) {
+			const text = 'This input has already been delegated.';
+			this.send(
+				this.subscription
+					? { type: 'subscription.result', call_id: callId, text }
+					: { type: 'bridge.result', call_id: callId, status: 'cancelled', answer: text }
+			);
+			return;
+		}
+		const turn: VoiceTurn = {
+			callId,
+			inputId,
+			userId: '',
+			modelId: input.modelId,
+			finished: false,
+			approval: false
+		};
+		this.calls.set(callId, turn);
+		// A replacement delegation suppresses any old result still waiting to be spoken.
+		this.commands = this.commands.filter((command) => !command.call_id);
+		const session = this.session;
+		this.delegation = this.delegation
+			.then(async () => {
+				if (session !== this.session) return;
+				const previous = this.pending;
+				if (previous?.assistantId && !previous.finished) {
+					previous.finished = true;
+					await this.options.stop(previous.assistantId);
+					if (session !== this.session) return;
+					this.result(previous, 'cancelled', 'Superseded by a new request.', false);
+					await this.options.saveVoice(previous.assistantId, { superseded: true });
+				}
+				turn.userId = await input.userId;
+				// The next model request must include the previous spoken reply in DB history.
+				await this.metadata;
+				if (session !== this.session) return;
+				if (!turn.userId || !this.options.message(turn.userId)) {
+					this.result(turn, 'failed', 'The spoken message is no longer available in this chat.');
+					return;
+				}
+				this.pending = turn;
+				this.working = true;
+				this.options.change();
+				const result = await this.options.submit(input.text, {
+					_raw: true,
+					bridge: { userMessageId: turn.userId, modelId: turn.modelId }
+				});
+				if (session !== this.session) return;
+				if (result.status !== 'submitted' || !result.assistantMessageId) {
+					this.result(
+						turn,
+						result.status === 'deferred' ? 'deferred' : 'failed',
+						'Complete the required steps in chat and try again.'
+					);
+					return;
+				}
+				turn.assistantId = result.assistantMessageId;
+				turn.taskIds = result.taskIds;
+				if (response) this.saveSpeech(response);
+				this.update();
+			})
+			.catch(() => {
+				if (session === this.session)
+					this.fail('Could not submit or stop the selected chat model. Review the request in chat.');
+			});
+	}
+
 	update() {
 		this.syncContext();
 		const turn = this.pending;
@@ -598,7 +864,7 @@ export class RealtimeCall {
 		const message = this.options.message(turn.assistantId);
 		const state = getBridgeTurnState(message);
 		this.approval = state === 'approval';
-		if (state === 'approval' && !turn.approval)
+		if (!this.subscription && state === 'approval' && !turn.approval)
 			this.enqueue({ type: 'bridge.status', status: 'approval' });
 		turn.approval = this.approval;
 		if (['completed', 'failed', 'cancelled'].includes(state)) {
@@ -615,17 +881,23 @@ export class RealtimeCall {
 
 	private result(turn: VoiceTurn, status: string, answer: string, speak = true) {
 		turn.finished = true;
-		this.send({
-			type: 'bridge.result',
-			call_id: turn.callId,
-			status,
-			answer:
-				answer.length <= 100000
-					? answer
-					: 'The complete answer is ready in chat. It is too long to read in this call.'
-		});
-		this.commands = this.commands.filter((command) => command.type !== 'bridge.status');
-		if (speak) this.enqueue({ type: 'bridge.respond', call_id: turn.callId });
+		// JSON can use six bytes per character; stay below the subscription bridge's frame limit.
+		const limit = this.subscription ? 80000 : 100000;
+		const text =
+			answer.length <= limit
+				? answer
+				: 'The complete answer is ready in chat. It is too long to read in this call.';
+		if (this.subscription) {
+			this.send({
+				type: 'subscription.result',
+				call_id: turn.callId,
+				text: text.replace(/[\uD800-\uDFFF]/gu, '\uFFFD') || 'The request completed. See it in chat.'
+			});
+		} else {
+			this.send({ type: 'bridge.result', call_id: turn.callId, status, answer: text });
+			this.commands = this.commands.filter((command) => command.type !== 'bridge.status');
+			if (speak) this.enqueue({ type: 'bridge.respond', call_id: turn.callId });
+		}
 		if (this.pending === turn) {
 			this.working = false;
 			this.approval = false;
@@ -633,16 +905,16 @@ export class RealtimeCall {
 		this.options.change();
 	}
 
-	private saveSpeech(response: any) {
+	private saveSpeech(response: VoiceSpeech) {
 		if (!response.speech.size) return;
 		const inputId = response.metadata?.input_item_id;
 		const turn = response.metadata?.status
-			? this.calls.get(response.statusCallId)
+			? this.calls.get(response.statusCallId ?? '')
 			: response.metadata?.call_id
 				? this.calls.get(response.metadata.call_id)
 				: [...this.calls.values()].find((call) => call.inputId === inputId);
 		if (response.delegated && !turn?.assistantId) return;
-		const input = this.inputs.get(inputId ?? turn?.inputId);
+		const input = this.inputs.get(inputId ?? turn?.inputId ?? '');
 		const speech = [...response.speech.entries()].map(([item_id, transcript]) => ({
 			item_id,
 			transcript,
@@ -659,29 +931,49 @@ export class RealtimeCall {
 			speech
 		};
 		const savedChatId = this.options.context().chatId;
+		const session = this.session;
 		this.savingHistory++;
 		this.metadata = this.metadata
 			.then(async () => {
-				if (savedChatId !== this.options.context().chatId) return;
+				const parentId = input ? await input.userId : undefined;
+				if (input && (!parentId || !this.options.message(parentId))) return;
+				if (
+					savedChatId !== this.options.context().chatId &&
+					(savedChatId || session !== this.session || !parentId)
+				)
+					return;
+				if (!input && !savedChatId && session !== this.session) return;
 				if (turn?.assistantId) await this.options.saveVoice(turn.assistantId, metadata);
 				else if (!response.messageId) {
 					response.messageId = await this.options.addMessage(
 						'assistant',
 						speech.map((item) => item.transcript).join('\n'),
 						metadata,
-						input ? await input.userId : undefined
+						parentId
 					);
 				} else await this.options.saveVoice(response.messageId, metadata);
 			})
-			.catch(() => this.options.error('Could not save the voice transcript.'))
+			.catch(() => {
+				if (session === this.session) this.options.error('Could not save the voice transcript.');
+			})
 			.finally(() => {
+				if (session !== this.session) return;
 				this.savingHistory--;
-				this.flush();
+				if (this.subscription) this.syncContext();
+				else this.flush();
 			});
 	}
 
 	stopSpeaking() {
 		this.animationInterruption++;
+		if (this.subscription) {
+			this.subscription.media.interrupt();
+			if (this.subscription.assistant.draft) this.subscription.assistant.interrupted = true;
+			this.speaking = this.playbackActive = false;
+			this.outputLevel = 0;
+			this.options.change();
+			return;
+		}
 		if (this.responseRequested) this.cancelRequested = true;
 		const responses = new Set(
 			[...this.speakingResponses].filter((id) => !this.interrupted.has(id))
@@ -711,17 +1003,19 @@ export class RealtimeCall {
 	async stopBackend() {
 		const turn = this.pending;
 		if (!turn?.assistantId || turn.finished) return;
+		const session = this.session;
 		turn.finished = true;
 		try {
 			await this.options.stop(turn.assistantId);
-			if (this.connected)
+			if (session === this.session && this.connected)
 				this.result(
 					turn,
 					'cancelled',
 					'The backend request was cancelled. Completed actions have not been undone.'
 				);
 		} catch {
-			this.fail('Backend cancellation was not confirmed. Review the request in chat.');
+			if (session === this.session)
+				this.fail('Backend cancellation was not confirmed. Review the request in chat.');
 		}
 	}
 
@@ -734,10 +1028,10 @@ export class RealtimeCall {
 			this.audio?.port.postMessage({ type: 'pause', paused: false });
 		}
 		this.stream?.getAudioTracks().forEach((track) => {
-			track.enabled = !this.muted;
+			track.enabled = !this.muted && (!this.subscription || this.connected);
 		});
 		this.audio?.port.postMessage({ type: 'capture', enabled: this.connected && !this.muted });
-		if (this.muted) {
+		if (this.muted && !this.subscription) {
 			this.send({ type: 'input_audio_buffer.clear' });
 			this.flush();
 		}
@@ -751,7 +1045,17 @@ export class RealtimeCall {
 	}
 
 	end() {
-		if (this.connected) {
+		const subscription = this.subscription;
+		if (subscription) {
+			clearTimeout(subscription.waiting?.timer);
+			const partial = subscription.assistant.draft.trim();
+			if (this.connected && partial) {
+				subscription.assistant.interrupted = true;
+				this.saveSubscriptionSpeech(subscription, partial);
+			}
+			subscription.media.close();
+			this.subscription = undefined;
+		} else if (this.connected) {
 			this.stopSpeaking();
 			for (const response of this.responses.values()) {
 				if (!response.done) this.saveSpeech(response);
@@ -760,6 +1064,7 @@ export class RealtimeCall {
 		++this.session;
 		clearInterval(this.timer);
 		if (this.ws) {
+			this.ws.onopen = null;
 			this.ws.onclose = null;
 			this.ws.onerror = null;
 			this.ws.onmessage = null;
@@ -768,6 +1073,8 @@ export class RealtimeCall {
 		this.ws = undefined;
 		this.stream?.getTracks().forEach((track) => track.stop());
 		this.source?.disconnect();
+		this.stream = undefined;
+		this.source = undefined;
 		if (this.audio) {
 			this.audio.port.onmessage = null;
 			this.audio.disconnect();
@@ -786,6 +1093,8 @@ export class RealtimeCall {
 		this.activeResponse = '';
 		this.pending = undefined;
 		this.chatContext = '';
+		this.savingHistory = 0;
+		this.delegation = this.recording = this.metadata = Promise.resolve();
 		this.sentSamples = 0;
 		this.commands = [];
 		this.speakingResponses.clear();

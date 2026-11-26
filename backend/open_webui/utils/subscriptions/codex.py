@@ -49,6 +49,7 @@ from open_webui.utils.session_pool import (
     request_model,
     stream_wrapper,
 )
+from open_webui.utils.subscriptions import _connection_token
 
 PROVIDER_ID = 'codex'
 CLIENT_VERSION = '0.167.1'
@@ -164,21 +165,36 @@ def _account_id(token: dict) -> str | None:
     return None
 
 
-def _headers(token: dict, session_id: str | None = None, *, lite: bool = False) -> dict:
+def _auth_headers(token: dict) -> dict[str, str]:
     access_token = token.get('access_token')
     if not isinstance(access_token, str) or not access_token or any(c in access_token for c in '\r\n'):
         raise HTTPException(401, 'Reconnect this Codex subscription.')
+    headers = {'Authorization': f'Bearer {access_token}'}
+    if account := _account_id(token):
+        headers['ChatGPT-Account-ID'] = account
+    return headers
+
+
+async def get_realtime_headers(user, model: dict) -> dict[str, str]:
+    """Get fresh credentials for the fixed Codex Realtime origins, without client identity headers."""
+    subscription = model['subscription']
+    if subscription['provider'] != PROVIDER_ID:
+        raise HTTPException(404, 'Codex subscription model not found')
+    provider, token = await _connection_token(subscription['connection_id'], user, raw_id=subscription['model'])
+    if provider != PROVIDER_ID:
+        raise HTTPException(404, 'Codex subscription model not found')
+    return {**_auth_headers(token), 'OpenAI-Alpha': 'quicksilver=v2'}
+
+
+def _headers(token: dict, session_id: str | None = None, *, lite: bool = False) -> dict:
     headers = {
-        'Authorization': f'Bearer {access_token}',
+        **_auth_headers(token),
         'Accept': 'text/event-stream' if session_id else 'application/json',
         'Content-Type': 'application/json',
         'originator': 'codex_cli_rs',
         'User-Agent': f'codex_cli_rs/{CLIENT_VERSION}',
         'version': CLIENT_VERSION,
     }
-    account = _account_id(token)
-    if account:
-        headers['ChatGPT-Account-ID'] = account
     if session_id:
         headers['session_id'] = session_id
     if lite:
