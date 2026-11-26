@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenAI (Subscription)** in Admin Settings → Images generates images with each user's personal Codex connection, without an API key. It uses the enabled connection with the highest priority and never falls back to a shared connection or the API-key provider. Existing generation and editing providers remain available.
 - Provider-reported usage indicators for Codex and Claude subscription connections, with quota percentages, reported reset times and independent refresh controls. Account-wide usage is visible only to connection managers; unavailable or unreported data is never shown as zero usage.
 - Personal subscription connection priorities for saved subscription-backed presets. Lower numbers prefer an enabled, owner-only connection with the same provider and exact model ID; otherwise the preset keeps its configured connection. Preset settings and access checks remain intact, explicitly selected connection models stay pinned, and failed requests never switch accounts.
 - Administrator-owned Composio connections with configured toolkit policies and fresh sessions bound to each verified Open WebUI user. Employees authorize their own work accounts through in-chat Connect Links; native MCP and ERP authentication remain separate.

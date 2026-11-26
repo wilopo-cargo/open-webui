@@ -152,7 +152,7 @@
 		if (res) {
 			backendConfig.set(await getBackendConfig());
 
-			if (res.ENABLE_IMAGE_GENERATION) {
+			if (res.ENABLE_IMAGE_GENERATION && res.IMAGE_GENERATION_ENGINE !== 'openai_subscription') {
 				getModels();
 			}
 
@@ -253,7 +253,7 @@
 				return;
 			}
 
-			if (config.ENABLE_IMAGE_GENERATION) {
+			if (config.ENABLE_IMAGE_GENERATION && config.IMAGE_GENERATION_ENGINE !== 'openai_subscription') {
 				getModels();
 			}
 
@@ -340,7 +340,11 @@
 					<AdminSettingSection title={$i18n.t('settings.admin.images.sections.createImage.title')}>
 						<AdminSettingRow
 							label={$i18n.t('settings.admin.images.imageGenerationEngine.label')}
-							description={$i18n.t('settings.admin.images.imageGenerationEngine.description')}
+							description={$i18n.t(
+								config.IMAGE_GENERATION_ENGINE === 'openai_subscription'
+									? 'settings.admin.images.imageGenerationSubscription.description'
+									: 'settings.admin.images.imageGenerationEngine.description'
+							)}
 							let:labelId
 						>
 							<SettingsSelect
@@ -352,14 +356,18 @@
 								<option value="comfyui">{$i18n.t('ComfyUI')}</option>
 								<option value="automatic1111">{$i18n.t('Automatic1111')}</option>
 								<option value="gemini">{$i18n.t('Gemini')}</option>
+								<option value="openai_subscription">
+									{$i18n.t('settings.admin.images.imageGenerationSubscription.label')}
+								</option>
 							</SettingsSelect>
 						</AdminSettingRow>
 
-						<div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
-							<AdminSettingField
-								label={$i18n.t('settings.admin.images.imageGenerationModel.label')}
-								forId="image-generation-model"
-							>
+						{#if config?.IMAGE_GENERATION_ENGINE !== 'openai_subscription'}
+							<div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+								<AdminSettingField
+									label={$i18n.t('settings.admin.images.imageGenerationModel.label')}
+									forId="image-generation-model"
+								>
 								<input
 									id="image-generation-model"
 									list="model-list"
@@ -402,7 +410,8 @@
 									/>
 								</AdminSettingField>
 							{/if}
-						</div>
+							</div>
+						{/if}
 
 						<AdminSettingRow
 							label={$i18n.t('settings.admin.images.imagePromptGeneration.label')}

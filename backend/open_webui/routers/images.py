@@ -44,6 +44,7 @@ from open_webui.utils.images.comfyui import (
 )
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.session_pool import get_session
+from open_webui.utils.subscriptions import codex, get_personal_codex_token
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,6 +57,8 @@ IMAGE_CACHE_DIR = CACHE_DIR / 'image' / 'generations'
 IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 router = APIRouter()
+
+OPENAI_SUBSCRIPTION_ENGINE = 'openai_subscription'
 
 IMAGE_FILE_EXTENSIONS = {
     'image/jpeg': '.jpg',
@@ -217,6 +220,8 @@ async def set_image_model(request: Request, model: str):
 
 async def get_image_model(request):
     image_config = await get_image_config()
+    if image_config.IMAGE_GENERATION_ENGINE == OPENAI_SUBSCRIPTION_ENGINE:
+        return codex.IMAGE_MODEL
     if image_config.IMAGE_GENERATION_ENGINE == 'openai':
         return image_config.IMAGE_GENERATION_MODEL if image_config.IMAGE_GENERATION_MODEL else 'gpt-image-2'
     elif image_config.IMAGE_GENERATION_ENGINE == 'gemini':
@@ -291,34 +296,46 @@ async def get_config(request: Request, user=Depends(get_admin_user)):
 
 @router.post('/config/update')
 async def update_config(request: Request, form_data: ImagesConfig, user=Depends(get_admin_user)):
-    if form_data.IMAGE_SIZE == 'auto' and not re.match(
-        IMAGE_AUTO_SIZE_MODELS_REGEX_PATTERN, form_data.IMAGE_GENERATION_MODEL
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=ERROR_MESSAGES.INCORRECT_FORMAT(
-                f'  (auto is only allowed with models matching {IMAGE_AUTO_SIZE_MODELS_REGEX_PATTERN}).'
-            ),
-        )
-
-    pattern = r'^\d+x\d+$'
-    if not (form_data.IMAGE_SIZE == 'auto' or form_data.IMAGE_SIZE == '' or re.match(pattern, form_data.IMAGE_SIZE)):
-        raise HTTPException(
-            status_code=400,
-            detail=ERROR_MESSAGES.INCORRECT_FORMAT('  (e.g., 512x512).'),
-        )
-
-    if form_data.IMAGE_STEPS < 0:
-        raise HTTPException(
-            status_code=400,
-            detail=ERROR_MESSAGES.INCORRECT_FORMAT('  (e.g., 50).'),
-        )
-
+    subscription = form_data.IMAGE_GENERATION_ENGINE == OPENAI_SUBSCRIPTION_ENGINE
     updates = config_updates(form_data.model_dump(), IMAGE_CONFIG_KEYS)
-    updates['image_generation.comfyui.base_url'] = form_data.COMFYUI_BASE_URL.strip('/')
+    if subscription:
+        # The subscription provider has no configurable model or credentials.
+        # Leave all inactive generation settings intact when switching engines.
+        updates = {
+            key: value
+            for key, value in updates.items()
+            if not key.startswith('image_generation.')
+            or key in {'image_generation.engine', 'image_generation.enable', 'image_generation.prompt.enable'}
+        }
+    else:
+        if form_data.IMAGE_SIZE == 'auto' and not re.match(
+            IMAGE_AUTO_SIZE_MODELS_REGEX_PATTERN, form_data.IMAGE_GENERATION_MODEL
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.INCORRECT_FORMAT(
+                    f'  (auto is only allowed with models matching {IMAGE_AUTO_SIZE_MODELS_REGEX_PATTERN}).'
+                ),
+            )
+
+        pattern = r'^\d+x\d+$'
+        if not (form_data.IMAGE_SIZE == 'auto' or form_data.IMAGE_SIZE == '' or re.match(pattern, form_data.IMAGE_SIZE)):
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.INCORRECT_FORMAT('  (e.g., 512x512).'),
+            )
+
+        if form_data.IMAGE_STEPS < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.INCORRECT_FORMAT('  (e.g., 50).'),
+            )
+
+        updates['image_generation.comfyui.base_url'] = form_data.COMFYUI_BASE_URL.strip('/')
     updates['images.edit.comfyui.base_url'] = form_data.IMAGES_EDIT_COMFYUI_BASE_URL.strip('/')
     await Config.upsert(updates)
-    await set_image_model(request, form_data.IMAGE_GENERATION_MODEL)
+    if not subscription:
+        await set_image_model(request, form_data.IMAGE_GENERATION_MODEL)
     values = await get_config_values(IMAGE_CONFIG_KEYS)
     await publish_event(
         request,
@@ -378,6 +395,8 @@ async def verify_connection(form_data: ConnectionVerificationForm, user=Depends(
 @router.get('/models')
 async def get_models(request: Request, user=Depends(get_verified_user)):
     image_config = await get_image_config()
+    if image_config.IMAGE_GENERATION_ENGINE == OPENAI_SUBSCRIPTION_ENGINE:
+        return [{'id': codex.IMAGE_MODEL, 'name': 'GPT-IMAGE 2'}]
     try:
         if image_config.IMAGE_GENERATION_ENGINE == 'openai':
             return [
@@ -581,21 +600,6 @@ async def upload_image(request, image_data, content_type, metadata, user, db=Non
 
 @router.post('/generations')
 async def generate_images(request: Request, form_data: CreateImageForm, user=Depends(get_verified_user)):
-    image_config = await get_image_config()
-    if not image_config.ENABLE_IMAGE_GENERATION:
-        raise HTTPException(
-            status_code=403,
-            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-        )
-
-    if user.role != 'admin' and not await has_permission(
-        user.id, 'features.image_generation', image_config.USER_PERMISSIONS
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-        )
-
     result = await image_generations(request, form_data, user=user)
     await publish_event(
         request,
@@ -620,6 +624,30 @@ async def image_generations(
     user=None,
 ):
     image_config = await get_image_config()
+    if (
+        user is None
+        or not image_config.ENABLE_IMAGE_GENERATION
+        or (
+            user.role != 'admin'
+            and not await has_permission(user.id, 'features.image_generation', image_config.USER_PERMISSIONS)
+        )
+    ):
+        raise HTTPException(status_code=403, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+    if image_config.IMAGE_GENERATION_ENGINE == OPENAI_SUBSCRIPTION_ENGINE:
+        if form_data.n != 1:
+            raise HTTPException(status_code=400, detail='Codex generates one image per request.')
+        token = await get_personal_codex_token(user)
+        image = await codex.generate_image(form_data.prompt, token)
+        _, image_file = await upload_image(
+            request,
+            image,
+            'image/png',
+            {'model': codex.IMAGE_MODEL, 'prompt': form_data.prompt, 'n': 1, **(metadata or {})},
+            user,
+        )
+        return [image_file]
+
     # if IMAGE_SIZE = 'auto', default WidthxHeight to the 512x512 default
     # This is only relevant when the user has set IMAGE_SIZE to 'auto' with an
     # image model other than gpt-image-1, which is warned about on settings save

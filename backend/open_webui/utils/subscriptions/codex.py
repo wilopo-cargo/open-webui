@@ -25,6 +25,8 @@ SOFTWARE.
 import asyncio
 import base64
 import binascii
+import io
+import struct
 import time
 from copy import deepcopy
 from urllib.parse import urlencode, urlsplit
@@ -33,6 +35,7 @@ from uuid import uuid4
 import aiohttp
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
+from PIL import Image
 from starlette.background import BackgroundTask
 
 from open_webui.utils.json_codec import JSONCodec
@@ -56,6 +59,8 @@ CLIENT_VERSION = '0.167.1'
 RESPONSES_URL = 'https://chatgpt.com/backend-api/codex/responses'
 MODELS_URL = f'https://chatgpt.com/backend-api/codex/models?client_version={CLIENT_VERSION}'
 USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
+IMAGE_MODEL = 'gpt-image-2'
+_IMAGE_GENERATIONS_URL = 'https://chatgpt.com/backend-api/codex/images/generations'
 OAUTH = {
     'authorize_url': 'https://auth.openai.com/oauth/authorize',
     'token_url': 'https://auth.openai.com/oauth/token',
@@ -74,6 +79,7 @@ _ALLOWED_FIELDS = {
 _REASONING_FORMAT = 'openai-responses-v1'
 _IMAGE_TYPES = {'image/png', 'image/jpeg', 'image/webp', 'image/gif'}
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024
+_MAX_IMAGE_B64_BYTES = ((_MAX_IMAGE_BYTES + 2) // 3) * 4
 _OAUTH_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 
@@ -246,6 +252,74 @@ async def get_usage(token: dict) -> list[dict]:
     from open_webui.utils.subscriptions.usage import codex_windows, fetch_usage
 
     return codex_windows(await fetch_usage(USAGE_URL, _headers(token)))
+
+
+def _decode_generated_image(body: bytearray) -> bytes:
+    try:
+        rows = JSONCodec.loads(body)['data']
+        if not isinstance(rows, list) or len(rows) != 1:
+            raise ValueError
+        encoded = rows[0]['b64_json']
+        if not isinstance(encoded, str) or not 0 < len(encoded) <= _MAX_IMAGE_B64_BYTES:
+            raise ValueError
+        data = base64.b64decode(encoded, validate=True)
+        if not 0 < len(data) <= _MAX_IMAGE_BYTES:
+            raise ValueError
+        with Image.open(io.BytesIO(data), formats=('PNG',)) as image:
+            if image.width * image.height > 25_000_000:
+                raise ValueError
+            image.verify()
+        return data
+    except (KeyError, TypeError, ValueError, OSError, SyntaxError, RecursionError, struct.error, Image.DecompressionBombError):
+        raise HTTPException(502, 'Codex returned an invalid image.') from None
+
+
+async def generate_image(prompt: str, token: dict) -> bytes:
+    headers = _headers(token)
+    if 'ChatGPT-Account-ID' not in headers:
+        raise HTTPException(401, 'Reconnect this Codex subscription in Settings → Connections.')
+    headers['Accept-Encoding'] = 'identity'
+    payload = {'model': IMAGE_MODEL, 'prompt': prompt, 'n': 1, 'quality': 'low', 'size': '1024x1024'}
+
+    try:
+        async with await get_provider_session() as session:
+            async with session.post(
+                _IMAGE_GENERATIONS_URL,
+                json=payload,
+                headers=headers,
+                ssl=True,
+                allow_redirects=False,
+                auto_decompress=False,
+            ) as response:
+                if response.status == 401:
+                    raise HTTPException(401, 'Reconnect this Codex subscription in Settings → Connections.')
+                if response.status == 403:
+                    raise HTTPException(403, 'This Codex subscription cannot generate images.')
+                if response.status == 429:
+                    raise HTTPException(429, 'Codex image generation is rate limited. Try again later.')
+                if response.status in (400, 422):
+                    raise HTTPException(400, 'Codex rejected the image generation request.')
+                if response.status != 200:
+                    raise HTTPException(502, 'Codex image generation failed.')
+                if response.content_type != 'application/json' or any(
+                    encoding.lower() not in ('', 'identity') for encoding in response.headers.getall('Content-Encoding', ())
+                ):
+                    raise HTTPException(502, 'Codex returned an invalid image response.')
+
+                limit = _MAX_IMAGE_B64_BYTES + 64 * 1024  # Allow room for the JSON envelope.
+                if response.content_length is not None and response.content_length > limit:
+                    raise HTTPException(502, 'Codex image response is too large.')
+                body = bytearray()
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    if len(body) + len(chunk) > limit:
+                        raise HTTPException(502, 'Codex image response is too large.')
+                    body.extend(chunk)
+    except TimeoutError:
+        raise HTTPException(504, 'Codex image generation timed out.') from None
+    except (aiohttp.ClientError, ValueError):
+        raise HTTPException(502, 'Could not reach Codex image generation securely.') from None
+
+    return await asyncio.to_thread(_decode_generated_image, body)
 
 
 def _reasoning_details(item: dict, index: int = 0) -> list[dict]:

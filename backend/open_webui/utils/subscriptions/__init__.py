@@ -206,14 +206,19 @@ async def _valid_token(db, row, token):
     return token
 
 
-async def _connection_token(connection_id, user, *, manage=False, require_enabled=True, raw_id=None):
+async def _connection_token(connection_id, user, *, manage=False, require_enabled=True, raw_id=None, personal_provider=None):
     async def refresh_and_commit():
         async with _locked_connection(connection_id, user, manage=manage, require_enabled=require_enabled) as (db, row, token):
+            provider = row.provider.split(':', 1)[1]
+            if personal_provider is not None and (
+                provider != personal_provider or row.user_id != user.id or _metadata(token).get('scope') != 'personal'
+            ):
+                raise HTTPException(404, 'Subscription connection not found')
             if raw_id is not None:
                 _catalog_model(token, raw_id)
             token = await _valid_token(db, row, token)
             await db.commit()
-            return row.provider.split(':', 1)[1], token
+            return provider, token
 
     # OAuth refresh can spend the old token before cancellation arrives. Keep
     # the lock, exchange, and durable commit together, then propagate chat Stop.
@@ -234,6 +239,33 @@ async def _connection_token(connection_id, user, *, manage=False, require_enable
     if cancelled:
         raise asyncio.CancelledError
     return result
+
+
+async def get_personal_codex_token(user):
+    """Select the caller's own enabled Codex connection without consulting chat catalogs or grants."""
+    missing = 'Connect and enable a personal Codex subscription in Settings → Connections to generate images.'
+    selected = None
+    async with get_async_db_context() as db:
+        rows = await db.scalars(select(OAuthSession).filter_by(user_id=user.id, provider='subscription:codex'))
+        for row in rows:
+            connection = _metadata(OAuthSessions._decrypt_token(row.token))
+            if connection.get('scope') != 'personal' or not connection.get('enabled', True) or connection.get('reauth_required'):
+                continue
+            candidate = (connection.get('priority', 100), row.created_at, row.id)
+            if selected is None or candidate < selected:
+                selected = candidate
+
+    if selected is None:
+        raise HTTPException(409, missing)
+    # Recheck ownership, scope, provider and enabled state under the refresh lock.
+    # A concurrent change must not cause a dispatch on another account.
+    try:
+        _, token = await _connection_token(selected[2], user, personal_provider='codex')
+    except HTTPException as exc:
+        if exc.status_code in (404, 409):
+            raise HTTPException(409, missing) from None
+        raise
+    return token
 
 
 async def authorize(user, provider, name, scope, grants):

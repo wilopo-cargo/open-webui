@@ -3296,6 +3296,8 @@
 	"settings.admin.images.imageGeneration.label": "Image Generation",
 	"settings.admin.images.imageGenerationEngine.description": "Choose the provider used for image generation.",
 	"settings.admin.images.imageGenerationEngine.label": "Image Generation Engine",
+	"settings.admin.images.imageGenerationSubscription.description": "Connect Codex in Settings → Connections to use each user's personal ChatGPT subscription for image generation. No API key is used.",
+	"settings.admin.images.imageGenerationSubscription.label": "OpenAI (Subscription)",
 	"settings.admin.images.imageGenerationModel.label": "Model",
 	"settings.admin.images.imagePromptGeneration.description": "Generate an image prompt before sending the request.",
 	"settings.admin.images.imagePromptGeneration.label": "Image Prompt Generation",
