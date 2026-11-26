@@ -346,6 +346,12 @@ def _build_oauth_callback_error_message(e: Exception) -> str:
     return message[:197] + '...' if len(message) > 200 else message
 
 
+def _validated_chat_return_to(value: str | None) -> str | None:
+    if not value or not re.fullmatch(r'/c/[A-Za-z0-9_-]+', value):
+        return None
+    return value
+
+
 def is_in_blocked_groups(group_name: str, groups: list) -> bool:
     """
     Check if a group name matches any blocked pattern.
@@ -1244,7 +1250,9 @@ class OAuthClientManager:
             log.error(f'Exception during token refresh for client_id {client_id}: {e}')
             return None
 
-    async def handle_authorize(self, request, client_id: str, user_id: str) -> RedirectResponse:
+    async def handle_authorize(
+        self, request, client_id: str, user_id: str, return_to: str | None = None
+    ) -> RedirectResponse:
         client = await self.get_client(client_id)
         if client is None:
             raise HTTPException(404)
@@ -1269,6 +1277,8 @@ class OAuthClientManager:
             # Keep the URL out of the session cookie; long scope lists push it past the browser size limit
             authorization_url = auth_data.pop('url')
             auth_data['user_id'] = user_id
+            if validated_return_to := _validated_chat_return_to(return_to):
+                auth_data['return_to'] = validated_return_to
             await client.save_authorize_data(request, redirect_uri=redirect_uri_str, **auth_data)
             return RedirectResponse(authorization_url, status_code=302)
         except RuntimeError as e:
@@ -1294,10 +1304,13 @@ class OAuthClientManager:
         error_message = None
         state = request.query_params.get('state')
         user_id = None
+        return_to = None
+        oauth_status = 'failed'
         try:
             client_info = await self.get_client_info(client_id)
             state_data = await client.framework.get_state_data(request.session, state) if state else None
             user_id = state_data.get('user_id') if state_data else None
+            return_to = _validated_chat_return_to(state_data.get('return_to')) if state_data else None
             if not user_id:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -1359,6 +1372,7 @@ class OAuthClientManager:
                 log.warning(error_message)
         except Exception as e:
             error_message = _build_oauth_callback_error_message(e)
+            oauth_status = 'denied' if isinstance(e, OAuth2Error) and e.error == 'access_denied' else 'failed'
             log.warning(
                 'OAuth callback error for user_id=%s client_id=%s: %s',
                 user_id,
@@ -1370,14 +1384,22 @@ class OAuthClientManager:
             if state and client is not None:
                 await client.framework.clear_state_data(request.session, state)
 
+
         webui_url = await Config.get('webui.url')
         redirect_url = (str(webui_url or request.base_url)).rstrip('/')
+        if return_to:
+            redirect_url = f'{redirect_url}{return_to}'
 
         if error_message:
             log.debug(error_message)
-            redirect_url = f'{redirect_url}/?error={urllib.parse.quote_plus(error_message)}'
+            if return_to:
+                redirect_url = f'{redirect_url}?oauth_status={oauth_status}'
+            else:
+                redirect_url = f'{redirect_url}/?error={urllib.parse.quote_plus(error_message)}'
             return RedirectResponse(url=redirect_url, headers=response.headers)
 
+        if return_to:
+            redirect_url = f'{redirect_url}?oauth_status=connected'
         response = RedirectResponse(url=redirect_url, headers=response.headers)
         return response
 

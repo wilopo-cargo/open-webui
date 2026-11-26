@@ -50,6 +50,8 @@
 	export let editCodeBlock = true;
 	export let topPadding = false;
 	export let onInsertToNote: ((content: string) => void) | null = null;
+	export let onOAuthAuthorize: (serverId: string, messageId: string) => void;
+	export let onOAuthRetry: (messageId: string) => void;
 
 	// Keep the latest turn's real height when assigning a chat ID remounts the message list.
 	$: isCurrentTurn =
@@ -127,6 +129,8 @@
 				{editCodeBlock}
 				{topPadding}
 				{onInsertToNote}
+				{onOAuthAuthorize}
+				{onOAuthRetry}
 				{shareMode}
 			/>
 		{:else}
@@ -159,6 +163,8 @@
 					{editCodeBlock}
 					{topPadding}
 					{onInsertToNote}
+					{onOAuthAuthorize}
+					{onOAuthRetry}
 					{shareMode}
 				/>
 			{/key}

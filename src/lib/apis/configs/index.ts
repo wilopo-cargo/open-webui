@@ -582,15 +582,45 @@ export const getOAuthClientAuthorizationUrl = (clientId: string, type: null | st
 	return `${WEBUI_BASE_URL}/oauth/clients/${oauthClientId}/authorize`;
 };
 
-export const initiateOAuthRedirect = (tool: {
-	id: string;
-	serverId: string;
-	authType?: string | null;
-}) => {
+export const initiateOAuthRedirect = (
+	tool: { id: string; serverId: string; authType?: string | null },
+	chatId: string | null = null
+) => {
+	const authUrl = new URL(
+		getOAuthClientAuthorizationUrl(tool.serverId, tool.authType ?? 'mcp'),
+		window.location.origin
+	);
+	if (chatId) {
+		authUrl.searchParams.set('return_to', `/c/${chatId}`);
+		sessionStorage.setItem('pendingOAuthToolChatId', chatId);
+	} else {
+		sessionStorage.removeItem('pendingOAuthToolChatId');
+	}
 	sessionStorage.setItem('pendingOAuthToolId', tool.id);
 	sessionStorage.setItem('oauthRedirectInProgressToolId', tool.id);
-	const authUrl = getOAuthClientAuthorizationUrl(tool.serverId, tool.authType ?? 'mcp');
-	window.open(authUrl, '_self', 'noopener');
+	window.location.assign(authUrl.toString());
+};
+
+export const takePendingOAuthToolId = (url: URL, chatId: string | null) => {
+	const toolId = sessionStorage.getItem('pendingOAuthToolId');
+	if (
+		!toolId ||
+		url.pathname !== (chatId ? `/c/${chatId}` : '/') ||
+		sessionStorage.getItem('pendingOAuthToolChatId') !== chatId
+	) {
+		return null;
+	}
+
+	sessionStorage.removeItem('pendingOAuthToolId');
+	sessionStorage.removeItem('pendingOAuthToolChatId');
+	if (sessionStorage.getItem('oauthRedirectInProgressToolId') === toolId) {
+		sessionStorage.removeItem('oauthRedirectInProgressToolId');
+	}
+
+	const connected = chatId
+		? url.searchParams.get('oauth_status') === 'connected'
+		: !url.searchParams.has('error');
+	return connected ? toolId : null;
 };
 
 export const getCodeExecutionConfig = async (token: string) => {

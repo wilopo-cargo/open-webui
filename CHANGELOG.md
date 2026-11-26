@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep the mobile chat composer within the visible viewport when the keyboard reduces only the visual viewport.
+- Link directly to original cited source pages, including URLs found in later chunks of a grouped citation, and to saved code-interpreter downloads.
+- Offer MCP OAuth reconnect for expired grants in tool discovery and saved chats. Return to the same chat, restore the selected tool, and keep explicit retries in their original model column. Temporary chats omit the in-chat reconnect action.
+
 - Scheduled chat/channel automations and channel replies inherit attached tools and model defaults from the requesting owner's scoped model catalog, including subscription-backed presets. Private catalogs remain request-local, and tool permissions, provider authorization and feature gates are unchanged.
 - Full-config imports validate Composio connections before saving any settings; invalid policies return actionable errors without exposing credentials or changing the previous configuration.
 - Empty Composio tool allowlists now accept the provider's uppercase toolkit catalog metadata and match it against configured lowercase toolkit slugs, preventing valid session/catalog responses from incorrectly reporting `Composio is unavailable`. Exact app-tool names, configured toolkit boundaries, and helper exclusions remain enforced.

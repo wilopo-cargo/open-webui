@@ -84,6 +84,7 @@ def app_modules():
     from open_webui.routers import configs, tools
     from open_webui.utils import composio, composio_files, erp_mcp, middleware
     from open_webui.utils import tools as tool_utils
+    from open_webui.models.config import Config
     from open_webui.models.models import Model
     from open_webui.models.oauth_sessions import OAuthSession
 
@@ -98,6 +99,7 @@ def app_modules():
     try:
         # Migrations are disabled: the normal chat overlay reads these tables,
         # but this Composio fixture intentionally has no subscription accounts or presets.
+        Config.__table__.create(db.engine, checkfirst=True)
         OAuthSession.__table__.create(db.engine, checkfirst=True)
         Model.__table__.create(db.engine, checkfirst=True)
         yield SimpleNamespace(
@@ -1954,6 +1956,52 @@ async def test_native_mcp_listing_failure_still_propagates_and_closes_client(app
     assert client_class.sessions == {}
 
 
+@pytest.mark.asyncio
+async def test_missing_mcp_oauth_grant_returns_401_in_discovery_and_offers_chat_reconnect(app_modules, monkeypatch):
+    from fastapi import FastAPI
+
+    client_class = _in_process_mcp_client_class()
+    user = _user('alice')
+    tool_id = 'server:mcp:shared'
+    request, form_data, metadata, model = _prepare_chat_payload(
+        monkeypatch,
+        app_modules,
+        [{**_native_connection(), 'auth_type': 'oauth_2.1'}],
+        user,
+        [tool_id],
+        client_class=client_class,
+    )
+
+    async def get_oauth_token(_user_id, _client_id):
+        return None
+
+    oauth_manager = SimpleNamespace(get_oauth_token=get_oauth_token)
+    request.app.state.oauth_client_manager = oauth_manager
+    app = FastAPI()
+    app.state.oauth_client_manager = oauth_manager
+    app.include_router(app_modules.tools.router, prefix='/api/v1/tools')
+    app.dependency_overrides[app_modules.tools.get_verified_user] = lambda: user
+    async with _HTTPX_ASYNC_CLIENT(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        response = await client.get(f'/api/v1/tools/id/{tool_id}/specs')
+    assert response.status_code == 401
+    assert response.json() == {'detail': 'Auth required'}
+
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    async def get_event_emitter(_metadata):
+        return emit
+
+    monkeypatch.setattr(app_modules.middleware, 'get_event_emitter', get_event_emitter)
+    await app_modules.middleware.process_chat_payload(request, form_data, user, metadata, model)
+    assert [event for event in events if event['type'] == 'chat:tool:connection'] == [
+        {'type': 'chat:tool:connection', 'data': {'status': 'auth_needed', 'server_id': 'shared', 'auth_type': 'mcp'}}
+    ]
+    assert client_class.instances == []
+
+
 @pytest.mark.parametrize('server_type', ['mcp', 'composio'])
 @pytest.mark.asyncio
 async def test_duplicate_specs_within_one_mcp_catalog_fail_without_overwriting(app_modules, monkeypatch, server_type):
@@ -3437,6 +3485,11 @@ async def test_mcp_httpx2_transport_negotiates_legacy_tools_and_blocks_cross_ori
 
         def do_POST(self):
             message = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            if self.path in ('/401', '/403'):
+                self.send_response(int(self.path[1:]))
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
             if self.path == '/redirect':
                 self.send_response(307)
                 self.send_header('Location', f'http://localhost:{self.server.server_port}/collect')
@@ -3519,6 +3572,10 @@ async def test_mcp_httpx2_transport_negotiates_legacy_tools_and_blocks_cross_ori
         with pytest.raises(Exception):
             await client.connect(f'{url}/redirect', headers=headers, auth=auth, httpx_client_factory=factory)
         assert redirected == []
+        for status in (401, 403):
+            with pytest.raises(mcp_client.MCPConnectionHTTPError) as failure:
+                await client.connect(f'{url}/{status}', headers=headers, auth=auth, httpx_client_factory=factory)
+            assert failure.value.status_code == status
     finally:
         await client.disconnect()
         server.shutdown()

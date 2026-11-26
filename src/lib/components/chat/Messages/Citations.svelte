@@ -23,6 +23,14 @@
 	let showCitationModal = false;
 
 	let selectedCitation: any = null;
+	function getV3SourceUrl(document: unknown) {
+		if (typeof document !== 'string') return undefined;
+		const match = document.match(
+			/^\s*#[^\r\n]+\r?\n\r?\nSource:\s*(https:\/\/sites\.google\.com\/wilopocargo\.id\/wilopo-v3-manual\/[^\s<>"']+)\s*(?:\r?\n|$)/
+		);
+		return match?.[1] && isValidHttpUrl(match[1]) ? match[1] : undefined;
+	}
+
 
 	export const showSourceModal = (sourceId) => {
 		let index;
@@ -123,13 +131,30 @@
 					_source = { ..._source, name: metadata.name };
 				}
 
+				const sourceUrl =
+					[
+						metadata?.url,
+						metadata?.source_url,
+						metadata?.sourceUrl,
+						metadata?.source,
+						_source?.url,
+						_source?.source_url
+					].find((url) => typeof url === 'string' && isValidHttpUrl(url)) ??
+					getV3SourceUrl(document);
+				if (sourceUrl) {
+					_source = { ..._source, url: sourceUrl };
+				}
+
+
 				if (id.startsWith('http://') || id.startsWith('https://')) {
 					_source = { ..._source, name: metadata?.external ? _source.name : id, url: id };
 				}
-
 				const existingSource = acc.find((item) => item.id === id);
 
 				if (existingSource) {
+					if (sourceUrl && !isValidHttpUrl(existingSource.source?.url ?? '')) {
+						existingSource.source = { ...existingSource.source, url: sourceUrl };
+					}
 					existingSource.document.push(document);
 					existingSource.metadata.push(metadata);
 					if (distance !== undefined) existingSource.distances.push(distance);
@@ -216,6 +241,16 @@
 				{/if}
 			</div>
 		</button>
+		{#if citations.length === 1 && citations[0].source?.url && isValidHttpUrl(citations[0].source.url)}
+			<a
+				class="inline-flex h-8 items-center rounded-full border border-gray-50 px-3.5 text-xs text-gray-600 transition hover:bg-gray-100 dark:border-gray-850/30 dark:text-gray-300 dark:hover:bg-gray-800"
+				href={citations[0].source.url}
+				target="_blank"
+				rel="noopener noreferrer"
+			>
+				{$i18n.t('Open source')}
+			</a>
+		{/if}
 	</div>
 {/if}
 
@@ -223,26 +258,41 @@
 	<div class="py-1.5">
 		<div class="text-xs gap-2 flex flex-col">
 			{#each citations as citation, idx}
-				<button
-					id={`source-${id}-${idx + 1}`}
-					aria-label={$i18n.t('View source: {{name}}', {
-						name: `${idx + 1} ${decodeString(citation.source.name)}`
-					})}
-					class="no-toggle outline-hidden flex dark:text-gray-300 bg-transparent text-gray-600 rounded-xl gap-1.5 items-center"
-					on:click={() => {
-						showCitationModal = true;
-						selectedCitation = citation;
-					}}
-				>
-					<div class=" font-normal bg-gray-50 dark:bg-gray-850 rounded-md px-1">
-						{idx + 1}
-					</div>
-					<div
-						class="flex-1 truncate hover:text-black dark:text-white/60 dark:hover:text-white transition text-left"
+				<div class="flex min-w-0 items-center gap-2">
+					<button
+						id={`source-${id}-${idx + 1}`}
+						aria-label={$i18n.t('View source: {{name}}', {
+							name: `${idx + 1} ${decodeString(citation.source.name)}`
+						})}
+						class="no-toggle outline-hidden flex min-w-0 flex-1 dark:text-gray-300 bg-transparent text-gray-600 rounded-xl gap-1.5 items-center"
+						on:click={() => {
+							showCitationModal = true;
+							selectedCitation = citation;
+						}}
 					>
-						{decodeString(citation.source.name)}
-					</div>
-				</button>
+						<div class="font-normal bg-gray-50 dark:bg-gray-850 rounded-md px-1">
+							{idx + 1}
+						</div>
+						<div
+							class="flex-1 truncate hover:text-black dark:text-white/60 dark:hover:text-white transition text-left"
+						>
+							{decodeString(citation.source.name)}
+						</div>
+					</button>
+					{#if citations.length > 1 && citation.source?.url && isValidHttpUrl(citation.source.url)}
+						<a
+							class="shrink-0 rounded-full px-2 py-1 text-gray-500 transition hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
+							href={citation.source.url}
+							target="_blank"
+							rel="noopener noreferrer"
+							aria-label={$i18n.t('View source: {{name}}', {
+								name: `${idx + 1} ${decodeString(citation.source.name)}`
+							})}
+						>
+							{$i18n.t('Open source')}
+						</a>
+					{/if}
+				</div>
 			{/each}
 		</div>
 	</div>

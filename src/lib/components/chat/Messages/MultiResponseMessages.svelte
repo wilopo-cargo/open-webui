@@ -61,6 +61,8 @@
 
 	export let topPadding = false;
 	export let onInsertToNote: ((content: string) => void) | null = null;
+	export let onOAuthAuthorize: (serverId: string, messageId: string) => void;
+	export let onOAuthRetry: (messageId: string) => void;
 
 	const dispatch = createEventDispatcher();
 
@@ -314,6 +316,8 @@
 									{compactPreview}
 									{topPadding}
 									{onInsertToNote}
+									{onOAuthAuthorize}
+									{onOAuthRetry}
 									{shareMode}
 								/>
 							{/if}
@@ -381,6 +385,8 @@
 										{editCodeBlock}
 										{topPadding}
 										{onInsertToNote}
+										{onOAuthAuthorize}
+										{onOAuthRetry}
 										{shareMode}
 									/>
 								{/if}

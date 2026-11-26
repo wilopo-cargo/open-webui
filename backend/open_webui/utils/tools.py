@@ -245,16 +245,23 @@ def _validate_erp_mcp_connection(connection: dict, server_id: str) -> None:
         raise ValueError('ERP MCP server configuration has an unsafe MCP URL.') from None
 
 
+class MCPAuthRequiredError(HTTPException):
+    """The saved MCP connection requires a user OAuth grant."""
+
+    def __init__(self, detail: str):
+        super().__init__(status_code=401, detail=detail)
+
+
 async def _require_erp_mcp_oauth_token(request, user, server_id: str) -> None:
     if not ERP_MCP_SERVER_ID or server_id != ERP_MCP_SERVER_ID:
         return
     try:
         token = await request.app.state.oauth_client_manager.get_oauth_token(user.id, f'mcp:{server_id}')
     except Exception:
-        raise ValueError('ERP authorization is unavailable; reconnect the ERP MCP server.') from None
+        raise MCPAuthRequiredError('ERP authorization is unavailable; reconnect the ERP MCP server.') from None
     access_token = token.get('access_token') if isinstance(token, dict) else None
     if not isinstance(access_token, str) or not access_token.strip():
-        raise ValueError('ERP authorization is unavailable; reconnect the ERP MCP server.')
+        raise MCPAuthRequiredError('ERP authorization is unavailable; reconnect the ERP MCP server.')
 
 
 async def connect_mcp_server(
@@ -289,7 +296,7 @@ async def connect_mcp_server(
     headers = {} if auth else await get_headers()
 
     if mcp_server_connection.get('auth_type') in ('oauth_2.1', 'oauth_2.1_static') and not headers.get('Authorization'):
-        raise HTTPException(status_code=401, detail='Auth required')
+        raise MCPAuthRequiredError('Auth required')
 
     client = MCPClient(
         event_caller=extra_params.get('__event_call__') if metadata.get('session_id') else None,

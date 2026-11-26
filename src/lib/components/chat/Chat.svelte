@@ -131,7 +131,11 @@
 	import { uploadFile } from '$lib/apis/files';
 	import { createOpenAITextStream } from '$lib/apis/streaming';
 	import { getFunctions } from '$lib/apis/functions';
-	import { initiateOAuthRedirect } from '$lib/apis/configs';
+	import {
+		getOAuthClientAuthorizationUrl,
+		initiateOAuthRedirect,
+		takePendingOAuthToolId
+	} from '$lib/apis/configs';
 
 	import Banner from '../common/Banner.svelte';
 	import MessageInput from '$lib/components/chat/MessageInput.svelte';
@@ -368,6 +372,145 @@
 	let selectedFilterIds: string[] = [];
 	let pendingOAuthTools: { id: string; name: string; serverId: string; authType: string | null }[] =
 		[];
+
+	const restoreOAuthToolSelection = (chatId: string | null) => {
+		if (embedded) return;
+		const toolId = takePendingOAuthToolId($page.url, chatId);
+		if (
+			toolId &&
+			!selectedToolIds.includes(toolId) &&
+			$tools?.some((tool) => tool.id === toolId && tool.authenticated !== false)
+		) {
+			selectedToolIds = [...selectedToolIds, toolId];
+		}
+	};
+
+	const restoreOAuthRecovery = () => {
+		if (!isShared && !$temporaryChatEnabled) {
+			for (const message of Object.values(history.messages)) {
+				if (message.role !== 'assistant' || !Array.isArray(message.statusHistory)) continue;
+				const status = message.statusHistory.findLast(
+					(entry) => entry.action === 'tool_connection' && entry.mcp_recovery
+				);
+				if (
+					status?.mcp_recovery === 'auth_needed' &&
+					$tools.some((tool) => tool.id === `server:mcp:${status.server_id}`)
+				) {
+					message.oauthRecovery = {
+						status: 'auth_needed',
+						serverId: status.server_id,
+						authType: 'mcp',
+						parentId: message.parentId,
+						modelId: message.model,
+						toolIds: [...selectedToolIds]
+					};
+				}
+			}
+			history = history;
+		}
+		const raw = sessionStorage.getItem('pendingMcpOAuthRecovery');
+		if (!raw) return;
+		sessionStorage.removeItem('pendingMcpOAuthRecovery');
+		try {
+			const pending = JSON.parse(raw);
+			if (pending.chatId !== $chatId || !history.messages[pending.messageId]) return;
+			const status = $page.url.searchParams.get('oauth_status');
+			history.messages[pending.messageId].oauthRecovery = {
+				...pending,
+				authType: 'mcp',
+				status:
+					status === 'connected' ? 'connected' : status === 'denied' ? 'denied' : 'auth_needed'
+			};
+			selectedToolIds = [...new Set([...selectedToolIds, ...(pending.toolIds ?? [])])];
+			history = history;
+		} catch {
+			// Ignore malformed local recovery state.
+		}
+	};
+
+	const onOAuthAuthorize = async (serverId: string, messageId: string) => {
+		const message = history.messages[messageId];
+		const recovery = message?.oauthRecovery;
+		if (
+			!recovery ||
+			recovery.status !== 'auth_needed' ||
+			recovery.authType !== 'mcp' ||
+			recovery.serverId !== serverId ||
+			!$chatId ||
+			$temporaryChatEnabled ||
+			isTemporaryChatId($chatId)
+		)
+			return;
+
+		const returnTo = `/c/${$chatId}`;
+		if (!/^\/c\/[A-Za-z0-9_-]+$/.test(returnTo)) return;
+		sessionStorage.setItem(
+			'pendingMcpOAuthRecovery',
+			JSON.stringify({
+				chatId: $chatId,
+				messageId,
+				parentId: message.parentId,
+				serverId,
+				modelId: message.model,
+				toolIds: recovery.toolIds
+			})
+		);
+		const authorizeUrl = new URL(
+			getOAuthClientAuthorizationUrl(serverId, 'mcp'),
+			window.location.origin
+		);
+		authorizeUrl.searchParams.set('return_to', returnTo);
+		try {
+			const response = await fetch(authorizeUrl, {
+				headers: {
+					Accept: 'application/json',
+					Authorization: `Bearer ${localStorage.token}`
+				}
+			});
+			const { authorization_url } = await response.json();
+			if (!response.ok || typeof authorization_url !== 'string') {
+				throw new Error('Unable to authorize this MCP connection.');
+			}
+			await saveDraft(getChatInputDraft(), getDraftChatId(), false);
+			window.location.assign(authorization_url);
+		} catch (error) {
+			sessionStorage.removeItem('pendingMcpOAuthRecovery');
+			toast.error(`${error}`);
+		}
+	};
+
+	const onOAuthRetry = async (messageId: string) => {
+		const message = history.messages[messageId];
+		const recovery = message?.oauthRecovery;
+		if (recovery?.status !== 'connected' || generating || !recovery.parentId) return;
+		const activeChatId = $chatId;
+		delete message.oauthRecovery;
+		history = history;
+
+		try {
+			const availableTools = await getTools(localStorage.token);
+			if ($chatId !== activeChatId || history.messages[messageId] !== message) return;
+			tools.set(availableTools);
+			const toolId = `server:mcp:${recovery.serverId}`;
+			const tool = availableTools?.find((item) => item.id === toolId);
+			if (tool?.authenticated !== true) {
+				message.oauthRecovery = { ...recovery, status: tool ? 'auth_needed' : 'denied' };
+				history = history;
+				return;
+			}
+			selectedToolIds = [...new Set([...(recovery.toolIds ?? []), toolId])];
+			await sendMessage(history, recovery.parentId, {
+				modelId: recovery.modelId,
+				modelIdx: message.modelIdx
+			});
+		} catch (error) {
+			if ($chatId === activeChatId && history.messages[messageId] === message) {
+				message.oauthRecovery = recovery;
+				history = history;
+			}
+			toast.error(`${error}`);
+		}
+	};
 
 	let imageGenerationEnabled = false;
 	let webSearchEnabled = false;
@@ -1627,7 +1770,23 @@
 				const data = event?.data?.data ?? null;
 
 				queueMicrotask(() => bridge?.update());
-				if (type === 'status') {
+				if (
+					type === 'chat:tool:connection' &&
+					!event.shared &&
+					data?.auth_type === 'mcp' &&
+					['auth_needed', 'denied'].includes(data.status) &&
+					typeof data.server_id === 'string' &&
+					selectedToolIds.includes(`server:mcp:${data.server_id}`)
+				) {
+					message.oauthRecovery = {
+						status: data.status,
+						serverId: data.server_id,
+						authType: 'mcp',
+						parentId: message.parentId,
+						modelId: message.model,
+						toolIds: [...selectedToolIds]
+					};
+				} else if (type === 'status') {
 					if (message?.statusHistory) {
 						message.statusHistory.push(data);
 					} else {
@@ -2940,14 +3099,7 @@
 				.filter((id) => id && ($tools ?? []).find((t) => t.id === id));
 		}
 
-		// Restore tool selection after OAuth redirect
-		const pendingToolId = sessionStorage.getItem('pendingOAuthToolId');
-		if (pendingToolId) {
-			sessionStorage.removeItem('pendingOAuthToolId');
-			if (!selectedToolIds.includes(pendingToolId)) {
-				selectedToolIds = [...selectedToolIds, pendingToolId];
-			}
-		}
+		restoreOAuthToolSelection(null);
 
 		loading = false;
 		await tick();
@@ -3199,6 +3351,8 @@
 					if (signal.aborted) return;
 					await setDefaults(restored);
 					if (signal.aborted) return;
+					if ($chatId === id) restoreOAuthToolSelection(id);
+					restoreOAuthRecovery();
 					loading = false;
 					await tick();
 					if (signal.aborted) return;
@@ -5169,10 +5323,22 @@
 		},
 		draft = getChatInputDraft()
 	) => {
+		const id = $chatId;
+		const signal = chatLoadController.signal;
 		await tick();
+		if (signal.aborted || $chatId !== id) return;
 		saveSessionSelectedModels();
-		await saveDraft(draft, null, false);
-		initiateOAuthRedirect(tool);
+		await saveDraft(draft, getDraftChatId(), false);
+		if (signal.aborted || $chatId !== id) return;
+
+		const returnChatId =
+			id &&
+			!$temporaryChatEnabled &&
+			!isTemporaryChatId(id) &&
+			/^[A-Za-z0-9_-]+$/.test(id)
+				? id
+				: null;
+		initiateOAuthRedirect(tool, returnChatId);
 	};
 
 	const clearDraft = async (chatId: string | null = null) => {
@@ -5612,6 +5778,8 @@
 										topPadding={!embedded && !fullWidthTabs}
 										bottomPadding={files.length > 0}
 										{onSelect}
+										{onOAuthAuthorize}
+										{onOAuthRetry}
 										{onInsertToNote}
 									/>
 								</div>
